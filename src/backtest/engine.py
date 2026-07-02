@@ -77,12 +77,12 @@ class Backtester:
                     hit_stop = current_candle.high >= position.stop_loss
 
                 if hit_stop:
-                    # Fill at stop price (or worse)
                     fill_price = position.stop_loss
                     trade = self._close_position(position, fill_price, "stop_loss", capital)
                     trades.append(trade)
                     capital += trade.pnl
                     position = None
+                    self.strategy.record_loss(current_candle.timestamp)
 
                 # Check take-profit (use high/low)
                 elif position.side == Side.LONG:
@@ -91,12 +91,14 @@ class Backtester:
                         trades.append(trade)
                         capital += trade.pnl
                         position = None
+                        self.strategy.record_win()
                 else:
                     if current_candle.low <= position.take_profit:
                         trade = self._close_position(position, position.take_profit, "take_profit", capital)
                         trades.append(trade)
                         capital += trade.pnl
                         position = None
+                        self.strategy.record_win()
 
                 # Check trailing stop
                 if position and position.should_trailing_stop(current_price):
@@ -104,6 +106,7 @@ class Backtester:
                     trades.append(trade)
                     capital += trade.pnl
                     position = None
+                    self.strategy.record_win()  # Trailing stop = in profit
 
                 # Update trailing stop
                 if position:
