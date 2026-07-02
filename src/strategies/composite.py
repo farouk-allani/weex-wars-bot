@@ -218,7 +218,7 @@ class CompositeStrategy:
                 strength=min(1.0, strength),
                 strategy="mean_reversion",
                 entry_price=current_price,
-                stop_loss=current_price - current_atr * 1.5,
+                stop_loss=current_price - current_atr * 2,
                 take_profit=bb_middle[-1],  # Target: BB middle
                 leverage=self.config.get("trading", {}).get("default_leverage", 5),
                 reason=f"Reversion LONG: RSI={current_rsi:.0f}, BB lower touch",
@@ -243,7 +243,7 @@ class CompositeStrategy:
                 strength=min(1.0, strength),
                 strategy="mean_reversion",
                 entry_price=current_price,
-                stop_loss=current_price + current_atr * 1.5,
+                stop_loss=current_price + current_atr * 2,
                 take_profit=bb_middle[-1],
                 leverage=self.config.get("trading", {}).get("default_leverage", 5),
                 reason=f"Reversion SHORT: RSI={current_rsi:.0f}, BB upper touch",
