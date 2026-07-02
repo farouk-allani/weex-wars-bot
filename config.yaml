@@ -1,6 +1,8 @@
-# WEEX AI Wars II Trading Bot — Competition Config v2
-# Philosophy: Fewer trades, higher quality, bigger winners
-# Only enter when trend + edges align. Skip all chop.
+# WEEX AI Wars II Trading Bot — Competition Config v4: Trend Rider
+# SOL: +$274, 61.5% WR, PF=3.31, Sharpe=3.41, DD=0.8%
+# ETH: +$40, 44.4% WR, PF=1.17, Sharpe=0.33
+# BTC: -$165 (choppy market, low exposure)
+# Combined: +$149 net on $10K (90-day backtest)
 
 trading:
   mode: paper
