@@ -1,0 +1,25 @@
+# WEEX AI Wars II Trading Bot
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.env
+.env.local
+*.log
+logs/
+.DS_Store
+Thumbs.db
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/

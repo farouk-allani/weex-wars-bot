@@ -1,0 +1,60 @@
+# WEEX AI Wars II Trading Bot — Configuration
+
+trading:
+  mode: paper  # paper or live
+  symbols:
+    - BTC/USDT:USDT
+    - ETH/USDT:USDT
+    - SOL/USDT:USDT
+  default_leverage: 5
+  max_leverage: 8
+  timeframe: 1h
+  lookback_periods: 100
+
+risk:
+  max_risk_per_trade: 0.02      # 2% of capital per trade
+  max_drawdown: 0.20            # 20% max drawdown from peak
+  max_open_positions: 3
+  cooldown_after_losses: 5      # trades to wait after consecutive losses
+  max_consecutive_losses: 3
+  daily_loss_limit: 0.05        # 5% daily loss limit
+  trailing_stop_activation: 0.02  # activate trailing stop at 2% profit
+  trailing_stop_distance: 0.01   # 1% trailing distance
+
+strategy:
+  name: composite
+  trend_follow:
+    enabled: true
+    weight: 0.6
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    bb_period: 20
+    bb_std: 2.0
+    adx_threshold: 25
+  mean_reversion:
+    enabled: true
+    weight: 0.4
+    rsi_period: 14
+    rsi_overbought: 75
+    rsi_oversold: 25
+    bb_period: 20
+    bb_std: 2.0
+
+indicators:
+  atr_period: 14
+  vwap_period: 20
+  ema_fast: 9
+  ema_slow: 21
+  adx_period: 14
+
+sizing:
+  method: half_kelly
+  default_win_rate: 0.55
+  min_position_usd: 10
+  max_position_pct: 0.25  # max 25% of capital in one position
+
+logging:
+  level: INFO
+  file: logs/trading.log
+  console: true
