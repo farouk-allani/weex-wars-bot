@@ -1,6 +1,6 @@
-"""WEEX AI Wars II — Multi-Symbol Backtest
+"""WEEX AI Wars II — Multi-Symbol Backtest v5
 
-Run: python run_multi_backtest.py
+Tests: Dynamic allocation, funding filter, chandelier exit, time filter.
 """
 
 import sys
@@ -14,8 +14,8 @@ from rich.table import Table
 
 sys.path.insert(0, ".")
 
-from src.core.models import Candle
-from src.backtest.engine import Backtester, print_backtest_results
+from src.core.models import Candle, Side, Position, AccountState
+from src.backtest.engine import Backtester, BacktestResult, print_backtest_results
 from src.strategies.edges import EdgeStrategies
 
 console = Console()
@@ -88,26 +88,9 @@ def interpolate_funding_rates(candle_timestamps, funding_rates):
     return result
 
 
-def analyze_edges(config, candles, funding_list):
-    edges = EdgeStrategies(config)
-    stats = {"liq": 0, "fund": 0, "vol": 0, "mtf": 0, "sess": 0, "total": 0}
-    lookback = 100
-    for i in range(lookback, len(candles)):
-        window = candles[i - lookback + 1 : i + 1]
-        fr = funding_list[i] if i < len(funding_list) else 0.0
-        result = edges.analyze_all_edges(window, fr)
-        stats["total"] += 1
-        if result.get("liquidation", {}).get("detected"): stats["liq"] += 1
-        if result.get("funding", {}).get("signal"): stats["fund"] += 1
-        if result.get("volume", {}).get("anomaly"): stats["vol"] += 1
-        if result.get("mtf", {}).get("aligned"): stats["mtf"] += 1
-        if result.get("session", {}).get("favorable"): stats["sess"] += 1
-    return stats
-
-
 def run_symbol(symbol: str, config: dict, days: int = 90):
     console.print(f"\n{'='*60}")
-    console.print(f"[bold white on blue]  {symbol}  —  {days}-Day Backtest  [/]")
+    console.print(f"[bold white on blue]  {symbol}  —  {days}-Day Backtest v5  [/]")
     console.print(f"{'='*60}\n")
 
     candles = fetch_historical_data(symbol, "1h", days)
@@ -125,20 +108,33 @@ def run_symbol(symbol: str, config: dict, days: int = 90):
     result = backtester.run(candles, symbol, funding_list)
     print_backtest_results(result)
 
-    edge_stats = analyze_edges(config, candles, funding_list)
+    # Edge analysis
+    edges = EdgeStrategies(config)
+    stats = {"liq": 0, "fund": 0, "vol": 0, "mtf": 0, "sess": 0, "total": 0}
+    lookback = 100
+    for i in range(lookback, len(candles)):
+        window = candles[i - lookback + 1 : i + 1]
+        fr = funding_list[i] if i < len(funding_list) else 0.0
+        result_edges = edges.analyze_all_edges(window, fr)
+        stats["total"] += 1
+        if result_edges.get("liquidation", {}).get("detected"): stats["liq"] += 1
+        if result_edges.get("funding", {}).get("signal"): stats["fund"] += 1
+        if result_edges.get("volume", {}).get("anomaly"): stats["vol"] += 1
+        if result_edges.get("mtf", {}).get("aligned"): stats["mtf"] += 1
+        if result_edges.get("session", {}).get("favorable"): stats["sess"] += 1
 
     console.print(f"\n[bold cyan]🔍 Edge Stats — {symbol}[/]")
-    total = edge_stats["total"]
-    table = Table(show_header=True)
-    table.add_column("Edge", style="cyan")
-    table.add_column("Count", style="white")
-    table.add_column("Freq", style="yellow")
-    table.add_row("🔴 Liquidation", str(edge_stats["liq"]), f"{edge_stats['liq']/total*100:.1f}%")
-    table.add_row("💰 Funding", str(edge_stats["fund"]), f"{edge_stats['fund']/total*100:.1f}%")
-    table.add_row("📊 Volume", str(edge_stats["vol"]), f"{edge_stats['vol']/total*100:.1f}%")
-    table.add_row("📐 MTF Aligned", str(edge_stats["mtf"]), f"{edge_stats['mtf']/total*100:.1f}%")
-    table.add_row("🕐 Session", str(edge_stats["sess"]), f"{edge_stats['sess']/total*100:.1f}%")
-    console.print(table)
+    total = stats["total"]
+    edge_table = Table(show_header=True)
+    edge_table.add_column("Edge", style="cyan")
+    edge_table.add_column("Count", style="white")
+    edge_table.add_column("Freq", style="yellow")
+    edge_table.add_row("🔴 Liquidation", str(stats["liq"]), f"{stats['liq']/total*100:.1f}%")
+    edge_table.add_row("💰 Funding", str(stats["fund"]), f"{stats['fund']/total*100:.1f}%")
+    edge_table.add_row("📊 Volume", str(stats["vol"]), f"{stats['vol']/total*100:.1f}%")
+    edge_table.add_row("📐 MTF Aligned", str(stats["mtf"]), f"{stats['mtf']/total*100:.1f}%")
+    edge_table.add_row("🕐 Session", str(stats["sess"]), f"{stats['sess']/total*100:.1f}%")
+    console.print(edge_table)
 
     return {
         "symbol": symbol,
@@ -150,7 +146,6 @@ def run_symbol(symbol: str, config: dict, days: int = 90):
         "profit_factor": result.profit_factor,
         "avg_win": result.avg_win,
         "avg_loss": result.avg_loss,
-        "edge_stats": edge_stats,
     }
 
 
@@ -162,22 +157,17 @@ def main():
     else:
         config = {}
 
-    symbols = [
-        "BTC/USDT:USDT",
-        "ETH/USDT:USDT",
-        "SOL/USDT:USDT",
-    ]
-
+    symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
     results = []
+
     for symbol in symbols:
         r = run_symbol(symbol, config)
         if r:
             results.append(r)
 
-    # Summary comparison
     if results:
         console.print(f"\n{'='*60}")
-        console.print("[bold white on green]  📊 CROSS-SYMBOL COMPARISON  [/]")
+        console.print("[bold white on green]  📊 CROSS-SYMBOL COMPARISON v5  [/]")
         console.print(f"{'='*60}\n")
 
         table = Table(title="90-Day Backtest Comparison", show_header=True)
@@ -185,38 +175,30 @@ def main():
         for r in results:
             table.add_column(r["symbol"].split("/")[0], style="white")
 
-        table.add_row("Total PnL",
-            *[f"${r['total_pnl']:+,.0f}" for r in results])
-        table.add_row("Win Rate",
-            *[f"{r['win_rate']:.1f}%" for r in results])
-        table.add_row("Total Trades",
-            *[str(r['total_trades']) for r in results])
-        table.add_row("Sharpe Ratio",
-            *[f"{r['sharpe']:.2f}" for r in results])
-        table.add_row("Max Drawdown",
-            *[f"{r['max_dd']:.1f}%" for r in results])
-        table.add_row("Profit Factor",
-            *[f"{r['profit_factor']:.2f}" for r in results])
-        table.add_row("Avg Win",
-            *[f"${r['avg_win']:.0f}" for r in results])
-        table.add_row("Avg Loss",
-            *[f"${r['avg_loss']:.0f}" for r in results])
-        table.add_row("MTF Aligned %",
-            *[f"{r['edge_stats']['mtf']/r['edge_stats']['total']*100:.0f}%" for r in results])
-        table.add_row("Funding Extremes",
-            *[str(r['edge_stats']['fund']) for r in results])
+        table.add_row("Total PnL", *[f"${r['total_pnl']:+,.0f}" for r in results])
+        table.add_row("Win Rate", *[f"{r['win_rate']:.1%}" for r in results])
+        table.add_row("Total Trades", *[str(r['total_trades']) for r in results])
+        table.add_row("Sharpe Ratio", *[f"{r['sharpe']:.2f}" for r in results])
+        table.add_row("Max Drawdown", *[f"{r['max_dd']:.1%}" for r in results])
+        table.add_row("Profit Factor", *[f"{r['profit_factor']:.2f}" for r in results])
+        table.add_row("Avg Win", *[f"${r['avg_win']:.0f}" for r in results])
+        table.add_row("Avg Loss", *[f"${r['avg_loss']:.0f}" for r in results])
 
         console.print(table)
 
-        # Best pair recommendation
+        # Dynamic allocation recommendation
+        console.print("\n[bold cyan]📊 Dynamic Allocation Recommendation[/]")
+        total_sharpe = sum(max(0, r["sharpe"]) for r in results)
+        if total_sharpe > 0:
+            for r in results:
+                weight = max(0.2, r["sharpe"] / total_sharpe) if r["sharpe"] > 0 else 0.2
+                name = r["symbol"].split("/")[0]
+                console.print(f"  {name}: {weight:.0%} allocation (Sharpe: {r['sharpe']:.2f})")
+
+        net_pnl = sum(r["total_pnl"] for r in results)
         best = max(results, key=lambda r: r["sharpe"])
-        console.print(f"\n[bold green]🏆 Best pair by Sharpe: {best['symbol']} ({best['sharpe']:.2f})[/]")
-
-        safest = min(results, key=lambda r: r["max_dd"])
-        console.print(f"[bold blue]🛡️ Safest pair (lowest DD): {safest['symbol']} ({safest['max_dd']:.1f}%)[/]")
-
-        most_trades = max(results, key=lambda r: r["total_trades"])
-        console.print(f"[bold yellow]📈 Most active: {most_trades['symbol']} ({most_trades['total_trades']} trades)[/]")
+        console.print(f"\n[bold green]Net PnL: ${net_pnl:+,.0f}[/]")
+        console.print(f"[bold green]🏆 Best: {best['symbol']} (Sharpe {best['sharpe']:.2f})[/]")
 
 
 if __name__ == "__main__":
