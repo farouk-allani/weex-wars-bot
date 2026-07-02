@@ -9,6 +9,7 @@ from ..indicators.technical import (
     calculate_atr, calculate_adx, calculate_ema, calculate_vwap,
     detect_regime, calculate_stochastic_rsi,
 )
+from .edges import EdgeStrategies
 
 
 class CompositeStrategy:
@@ -17,6 +18,7 @@ class CompositeStrategy:
     - Trend following (MACD + BB breakout) in trending markets
     - Mean reversion (RSI + BB bounce) in ranging markets
     - Regime detection switches between strategies
+    - Edge strategies provide alpha over retail bots
     """
 
     def __init__(self, config: dict):
@@ -24,9 +26,10 @@ class CompositeStrategy:
         self.tf_config = config.get("strategy", {}).get("trend_follow", {})
         self.mr_config = config.get("strategy", {}).get("mean_reversion", {})
         self.ind_config = config.get("indicators", {})
+        self.edges = EdgeStrategies(config)
 
     def analyze(self, symbol: str, candles: list[Candle], funding_rate: float = 0.0) -> Signal | None:
-        """Analyze candles and generate a signal."""
+        """Analyze candles and generate a signal with edge enhancements."""
         if len(candles) < 50:
             return None
 
@@ -62,11 +65,24 @@ class CompositeStrategy:
         best = max(signals, key=lambda x: x[0].strength * x[1])
         signal = best[0]
 
-        # Apply funding rate filter
+        # ---- Apply Edge Strategies ----
+        edges = self.edges.analyze_all_edges(candles, funding_rate)
+        edge_multiplier, edge_direction = self.edges.get_combined_modifier(edges)
+
+        # Apply edge multiplier to signal strength
+        signal.strength *= edge_multiplier
+
+        # If edges strongly suggest opposite direction, skip
+        if edge_direction == "long" and signal.side == Side.SHORT and edge_multiplier > 1.3:
+            return None
+        if edge_direction == "short" and signal.side == Side.LONG and edge_multiplier > 1.3:
+            return None
+
+        # Legacy funding rate filter (superseded by edges but kept as safety)
         if funding_rate > 0.001 and signal.side == Side.LONG:
-            signal.strength *= 0.7  # Reduce long strength when funding is high positive
+            signal.strength *= 0.7
         elif funding_rate < -0.001 and signal.side == Side.SHORT:
-            signal.strength *= 0.7  # Reduce short strength when funding is high negative
+            signal.strength *= 0.7
 
         # Minimum strength threshold
         if signal.strength < 0.4:
