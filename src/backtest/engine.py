@@ -60,7 +60,7 @@ class Backtester:
         equity_curve = [capital]
         peak_equity = capital
 
-        lookback = 50  # Need 50 candles for indicators
+        lookback = 100  # Need 100 candles for EMA100
 
         for i in range(lookback, len(candles)):
             current_candle = candles[i]

@@ -185,11 +185,14 @@ class EdgeStrategies:
         Trade against extreme funding rates.
 
         Logic:
-        - Very high positive funding (>0.1%) = too many longs → short bias
-        - Very negative funding (<-0.1%) = too many shorts → long bias
+        - BTC funding rates typically range -0.01% to +0.01%
+        - High positive funding (>0.005%) = too many longs → short bias
+        - Very negative funding (<-0.005%) = too many shorts → long bias
         - This is a contrarian indicator — crowded trades get squeezed
         """
-        extreme_threshold = 0.001  # 0.1%
+        # BTC funding rates are much smaller than other assets
+        # Typical range: -0.01% to +0.01% (0.0001 to -0.0001)
+        extreme_threshold = 0.00005  # 0.005%
 
         if funding_rate > extreme_threshold:
             return {
@@ -281,7 +284,7 @@ class EdgeStrategies:
         price_change = abs(closes[-1] - closes[-2]) / closes[-2]
 
         # Volume anomaly: high volume + small price = accumulation
-        if vol_ratio > 1.8 and price_change < 0.005:
+        if vol_ratio > 2.5 and price_change < 0.005:
             direction = "accumulation" if closes[-1] > closes[-2] else "distribution"
             return {
                 "anomaly": True,
