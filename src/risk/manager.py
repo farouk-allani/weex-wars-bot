@@ -97,36 +97,33 @@ class RiskManager:
         # Calculate risk in USD
         risk_amount = account.equity * self.max_risk_per_trade
 
-        # Distance from entry to stop-loss as percentage
-        stop_distance = abs(signal.entry_price - signal.stop_loss) / signal.entry_price
-        if stop_distance == 0:
-            stop_distance = 0.02  # Default 2% stop
+        # Stop distance in price units (USD)
+        stop_distance_usd = abs(signal.entry_price - signal.stop_loss)
+        if stop_distance_usd == 0:
+            stop_distance_usd = signal.entry_price * 0.02  # Default 2%
 
-        # Position size = risk / (stop_distance * leverage)
-        position_value = risk_amount / (stop_distance * signal.leverage)
+        # Position size (base currency) = risk_amount / stop_distance
+        # This ensures if stop is hit, we lose exactly risk_amount
+        amount = risk_amount / stop_distance_usd
 
         # Apply Kelly criterion adjustment
         if self.sizing_method == "half_kelly":
             win_rate = self._estimate_win_rate()
             kelly = self._half_kelly(win_rate, signal.risk_reward_ratio)
-            position_value *= kelly
+            amount *= kelly
 
-        # Cap at max position percentage
-        max_value = account.equity * self.max_position_pct
-        position_value = min(position_value, max_value)
+        # Cap at max position percentage (in base currency)
+        max_amount = (account.equity * self.max_position_pct) / signal.entry_price
+        amount = min(amount, max_amount)
 
-        # Cap at available margin
-        position_value = min(position_value, account.available_margin * 0.9)
+        # Cap at available margin (accounting for leverage)
+        max_margin_amount = (account.available_margin * 0.9 * signal.leverage) / signal.entry_price
+        amount = min(amount, max_margin_amount)
 
         # Minimum position check
+        position_value = amount * signal.entry_price
         if position_value < self.min_position_usd:
             return 0
-
-        # Convert to base currency amount
-        if signal.entry_price > 0:
-            amount = position_value / signal.entry_price
-        else:
-            amount = 0
 
         return amount
 

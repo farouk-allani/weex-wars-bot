@@ -93,11 +93,10 @@ class Position:
             self.lowest_price = price
 
     def calculate_pnl(self, current_price: float) -> float:
+        """Calculate PnL in USD. Futures PnL = price_diff * size."""
         if self.side == Side.LONG:
-            pnl = (current_price - self.entry_price) / self.entry_price
-        else:
-            pnl = (self.entry_price - current_price) / self.entry_price
-        return pnl * self.size * self.leverage
+            return (current_price - self.entry_price) * self.size
+        return (self.entry_price - current_price) * self.size
 
     def should_stop_loss(self, current_price: float) -> bool:
         if self.side == Side.LONG:
