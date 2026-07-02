@@ -69,24 +69,37 @@ class Backtester:
             # Update position PnL
             if position:
                 position.update_extremes(current_price)
-                unrealized = position.calculate_pnl(current_price)
 
-                # Check stop-loss
-                if position.should_stop_loss(current_price):
-                    trade = self._close_position(position, current_price, "stop_loss", capital)
+                # Check stop-loss (use high/low for realistic fill)
+                if position.side == Side.LONG:
+                    hit_stop = current_candle.low <= position.stop_loss
+                else:
+                    hit_stop = current_candle.high >= position.stop_loss
+
+                if hit_stop:
+                    # Fill at stop price (or worse)
+                    fill_price = position.stop_loss
+                    trade = self._close_position(position, fill_price, "stop_loss", capital)
                     trades.append(trade)
                     capital += trade.pnl
                     position = None
 
-                # Check take-profit
-                elif position.should_take_profit(current_price):
-                    trade = self._close_position(position, current_price, "take_profit", capital)
-                    trades.append(trade)
-                    capital += trade.pnl
-                    position = None
+                # Check take-profit (use high/low)
+                elif position.side == Side.LONG:
+                    if current_candle.high >= position.take_profit:
+                        trade = self._close_position(position, position.take_profit, "take_profit", capital)
+                        trades.append(trade)
+                        capital += trade.pnl
+                        position = None
+                else:
+                    if current_candle.low <= position.take_profit:
+                        trade = self._close_position(position, position.take_profit, "take_profit", capital)
+                        trades.append(trade)
+                        capital += trade.pnl
+                        position = None
 
                 # Check trailing stop
-                elif position.should_trailing_stop(current_price):
+                if position and position.should_trailing_stop(current_price):
                     trade = self._close_position(position, current_price, "trailing_stop", capital)
                     trades.append(trade)
                     capital += trade.pnl

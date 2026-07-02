@@ -1,6 +1,6 @@
-# WEEX AI Wars II Trading Bot — Optimized Configuration
-# Backtested on 90 days of BTC/USDT 1H data
-# Results: +$76 PnL, 52.2% win rate, 1.39 Sharpe, 0.8% max drawdown
+# WEEX AI Wars II Trading Bot — Competition Config v2
+# Philosophy: Fewer trades, higher quality, bigger winners
+# Only enter when trend + edges align. Skip all chop.
 
 trading:
   mode: paper
@@ -15,13 +15,13 @@ trading:
 
 risk:
   max_risk_per_trade: 0.015
-  max_drawdown: 0.20
-  max_open_positions: 3
-  cooldown_after_losses: 5
+  max_drawdown: 0.15          # Kill at 15% DD (tighter for competition)
+  max_open_positions: 2       # Max 2 positions at once
+  cooldown_after_losses: 3    # Wait 3 trades after 3 losses
   max_consecutive_losses: 3
-  daily_loss_limit: 0.05
-  trailing_stop_activation: 0.015
-  trailing_stop_distance: 0.008
+  daily_loss_limit: 0.03      # 3% daily loss limit
+  trailing_stop_activation: 0.012   # Activate trailing at 1.2% profit
+  trailing_stop_distance: 0.006     # Trail at 0.6%
 
 strategy:
   name: composite
@@ -33,13 +33,13 @@ strategy:
     macd_signal: 5
     bb_period: 20
     bb_std: 1.8
-    adx_threshold: 20
+    adx_threshold: 30         # Strong trends only (was 25)
   mean_reversion:
     enabled: true
     weight: 0.3
     rsi_period: 10
-    rsi_overbought: 80
-    rsi_oversold: 20
+    rsi_overbought: 78        # More extreme (was 80, but now only WITH trend)
+    rsi_oversold: 22
     bb_period: 20
     bb_std: 1.8
 
@@ -52,7 +52,7 @@ indicators:
 
 sizing:
   method: half_kelly
-  default_win_rate: 0.55
+  default_win_rate: 0.50      # Conservative estimate
   min_position_usd: 10
   max_position_pct: 0.20
 

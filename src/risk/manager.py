@@ -150,16 +150,16 @@ class RiskManager:
                 if position.trailing_stop is None or trailing < position.trailing_stop:
                     position.trailing_stop = trailing
 
-        # Move stop to breakeven at 1.5x risk
+        # Move stop to breakeven at 1.0x risk (fast protection)
         risk = abs(position.entry_price - position.stop_loss)
         if position.side == Side.LONG:
-            if current_price >= position.entry_price + risk * 1.5:
+            if current_price >= position.entry_price + risk * 1.0:
                 if position.stop_loss < position.entry_price:
-                    position.stop_loss = position.entry_price + atr * 0.5
+                    position.stop_loss = position.entry_price + atr * 0.3  # Small profit lock
         else:
-            if current_price <= position.entry_price - risk * 1.5:
+            if current_price <= position.entry_price - risk * 1.0:
                 if position.stop_loss > position.entry_price:
-                    position.stop_loss = position.entry_price - atr * 0.5
+                    position.stop_loss = position.entry_price - atr * 0.3
 
         return position
 
