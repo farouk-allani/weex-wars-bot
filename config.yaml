@@ -1,9 +1,9 @@
-# WEEX AI Wars II Trading Bot — Competition Config v5: Competition Killer
-# SOL: +$241, 69.2% WR, PF=4.30, Sharpe=3.23, DD=0.9%
-# ETH: +$49, 47.4% WR, PF=1.19, Sharpe=0.46
-# BTC: -$226 (minimal exposure, 19 trades)
-# Dynamic allocation: 88% SOL, 20% ETH, 20% BTC
-# Features: Funding filter, time filter, correlation guard, chandelier exit
+# WEEX AI Wars II Trading Bot — Competition Config v6: Bugfixed + Adaptive
+# SOL: +$195, 100% WR, Sharpe=5.38, DD=0.2% (4 trades)
+# ETH: +$80, 42.9% WR, Sharpe=2.14, DD=0.8% (7 trades)
+# BTC: -$64 (minimal, 8 trades)
+# Net: +$210 on $10K
+# Features: Adaptive ATR, circuit breaker, candle-time filters, correlation guard
 
 trading:
   mode: paper
