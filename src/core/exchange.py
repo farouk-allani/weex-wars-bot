@@ -1,13 +1,20 @@
-"""WEEX AI Wars II — Exchange Client (ccxt-based)"""
+"""WEEX AI Wars II — Exchange Client (ccxt-based) v8
+
+Fixes:
+- SL/TP stored and applied in paper mode
+- Live SL/TP cached locally when exchange returns none
+- Env passphrase fallback (WEEX_API_PASSPHRASE | WEEX_PASSPHRASE)
+- Exchange stop/TP placement errors surfaced (not silently dropped)
+"""
 
 import ccxt
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 from dotenv import load_dotenv
 
-from .models import Candle, Side, OrderType, OrderStatus, AccountState, Position
+from .models import Candle, Side, OrderType, AccountState, Position
 
 load_dotenv()
 
@@ -19,26 +26,36 @@ class ExchangeClient:
         self.config = config
         self.mode = config.get("trading", {}).get("mode", "paper")
 
-        # Initialize ccxt
+        api_key = os.getenv("WEEX_API_KEY", "")
+        api_secret = os.getenv("WEEX_API_SECRET", "")
+        # Support both env names (common mismatch)
+        api_passphrase = (
+            os.getenv("WEEX_API_PASSPHRASE")
+            or os.getenv("WEEX_PASSPHRASE")
+            or ""
+        )
+
         exchange_config = {
-            "apiKey": os.getenv("WEEX_API_KEY"),
-            "secret": os.getenv("WEEX_API_SECRET"),
-            "password": os.getenv("WEEX_API_PASSPHRASE"),
+            "apiKey": api_key,
+            "secret": api_secret,
+            "password": api_passphrase,
             "enableRateLimit": True,
             "options": {
-                "defaultType": "swap",  # futures
+                "defaultType": "swap",
             },
         }
 
-        if self.mode == "paper":
-            self.exchange = ccxt.weex(exchange_config)
-            self.balance = 10000.0  # Starting paper balance
-            self.paper_positions: dict[str, Position] = {}
-            self.paper_trades: list = []
-        else:
-            self.exchange = ccxt.weex(exchange_config)
+        self.exchange = ccxt.weex(exchange_config)
+        if self.mode != "paper":
             self.exchange.set_sandbox_mode(False)
-            self.balance = 0.0
+
+        # Paper state
+        self.balance = float(config.get("backtest", {}).get("initial_capital", 10000))
+        self.paper_positions: dict[str, Position] = {}
+        self.paper_trades: list = []
+
+        # Live: remember SL/TP we set (exchange position fetch often omits them)
+        self._local_brackets: dict[str, dict] = {}
 
         # Cache
         self._candle_cache: dict[str, list[Candle]] = {}
@@ -51,10 +68,10 @@ class ExchangeClient:
     ) -> list[Candle]:
         """Fetch OHLCV candles from exchange."""
         cache_key = f"{symbol}_{timeframe}"
+        ttl = 30 if timeframe in ("15m", "1h") else 60
 
-        # Cache for 30 seconds to avoid rate limits
         if cache_key in self._last_fetch:
-            if time.time() - self._last_fetch[cache_key] < 30:
+            if time.time() - self._last_fetch[cache_key] < ttl:
                 return self._candle_cache.get(cache_key, [])
 
         try:
@@ -70,17 +87,14 @@ class ExchangeClient:
                 )
                 for row in ohlcv
             ]
-
             self._candle_cache[cache_key] = candles
             self._last_fetch[cache_key] = time.time()
             return candles
-
         except Exception as e:
-            print(f"[Exchange] Error fetching candles for {symbol}: {e}")
+            print(f"[Exchange] Error fetching candles for {symbol} {timeframe}: {e}")
             return self._candle_cache.get(cache_key, [])
 
     def fetch_ticker(self, symbol: str) -> dict:
-        """Fetch current ticker."""
         try:
             return self.exchange.fetch_ticker(symbol)
         except Exception as e:
@@ -88,33 +102,28 @@ class ExchangeClient:
             return {}
 
     def fetch_funding_rate(self, symbol: str) -> float:
-        """Fetch current funding rate."""
         try:
             funding = self.exchange.fetch_funding_rate(symbol)
-            return funding.get("fundingRate", 0.0)
+            return float(funding.get("fundingRate") or 0.0)
         except Exception:
             return 0.0
 
     # ---- Account ----
 
     def get_account_state(self) -> AccountState:
-        """Get current account state."""
         if self.mode == "paper":
-            unrealized = sum(
-                p.unrealized_pnl for p in self.paper_positions.values()
+            self.update_paper_positions()
+            unrealized = sum(p.unrealized_pnl for p in self.paper_positions.values())
+            margin_used = sum(
+                p.size * p.entry_price / max(p.leverage, 1)
+                for p in self.paper_positions.values()
             )
             return AccountState(
                 balance=self.balance,
                 equity=self.balance + unrealized,
                 unrealized_pnl=unrealized,
-                margin_used=sum(
-                    p.size * p.entry_price / p.leverage
-                    for p in self.paper_positions.values()
-                ),
-                available_margin=self.balance - sum(
-                    p.size * p.entry_price / p.leverage
-                    for p in self.paper_positions.values()
-                ),
+                margin_used=margin_used,
+                available_margin=max(0.0, self.balance - margin_used),
                 positions=list(self.paper_positions.values()),
             )
 
@@ -125,29 +134,43 @@ class ExchangeClient:
 
             pos_list = []
             for p in positions:
-                if abs(p.get("contracts", 0)) > 0:
-                    pos_list.append(
-                        Position(
-                            symbol=p["symbol"],
-                            side=Side.LONG if p["side"] == "long" else Side.SHORT,
-                            entry_price=p["entryPrice"],
-                            size=abs(p["contracts"]),
-                            leverage=int(p.get("leverage", 1)),
-                            stop_loss=0,
-                            take_profit=0,
-                            unrealized_pnl=p.get("unrealizedPnl", 0),
-                        )
+                contracts = abs(float(p.get("contracts") or 0))
+                if contracts <= 0:
+                    continue
+                symbol = p["symbol"]
+                bracket = self._local_brackets.get(symbol, {})
+                side = Side.LONG if p.get("side") == "long" else Side.SHORT
+                entry = float(p.get("entryPrice") or 0)
+                pos_list.append(
+                    Position(
+                        symbol=symbol,
+                        side=side,
+                        entry_price=entry,
+                        size=contracts,
+                        leverage=int(p.get("leverage") or 1),
+                        stop_loss=float(bracket.get("stop_loss") or 0),
+                        take_profit=float(bracket.get("take_profit") or 0),
+                        trailing_stop=bracket.get("trailing_stop"),
+                        unrealized_pnl=float(p.get("unrealizedPnl") or 0),
+                        highest_price=float(bracket.get("highest_price") or entry),
+                        lowest_price=float(bracket.get("lowest_price") or entry),
+                        strategy=str(bracket.get("strategy") or ""),
+                        exchange_sl_set=bool(bracket.get("exchange_sl_set")),
+                        exchange_tp_set=bool(bracket.get("exchange_tp_set")),
                     )
+                )
 
+            free = float(usdt.get("free") or 0)
+            total = float(usdt.get("total") or free)
+            used = float(usdt.get("used") or 0)
             return AccountState(
-                balance=usdt.get("free", 0),
-                equity=usdt.get("total", 0),
+                balance=free,
+                equity=total,
                 unrealized_pnl=sum(p.unrealized_pnl for p in pos_list),
-                margin_used=usdt.get("used", 0),
-                available_margin=usdt.get("free", 0),
+                margin_used=used,
+                available_margin=free,
                 positions=pos_list,
             )
-
         except Exception as e:
             print(f"[Exchange] Error fetching account: {e}")
             return AccountState(0, 0, 0, 0, 0)
@@ -155,7 +178,6 @@ class ExchangeClient:
     # ---- Trading ----
 
     def set_leverage(self, symbol: str, leverage: int) -> bool:
-        """Set leverage for a symbol."""
         try:
             self.exchange.set_leverage(leverage, symbol)
             return True
@@ -172,19 +194,20 @@ class ExchangeClient:
         order_type: OrderType = OrderType.MARKET,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
+        strategy: str = "",
+        leverage: Optional[int] = None,
     ) -> dict:
-        """Place an order."""
+        """Place entry + optional SL/TP brackets."""
         if self.mode == "paper":
-            return self._paper_order(symbol, side, amount, price, order_type)
+            return self._paper_order(
+                symbol, side, amount, price, order_type,
+                stop_loss=stop_loss, take_profit=take_profit,
+                strategy=strategy, leverage=leverage,
+            )
 
         try:
             ccxt_side = "buy" if side == Side.LONG else "sell"
-
-            if order_type == OrderType.MARKET:
-                order = self.exchange.create_order(
-                    symbol, "market", ccxt_side, amount
-                )
-            elif order_type == OrderType.LIMIT:
+            if order_type == OrderType.LIMIT and price:
                 order = self.exchange.create_order(
                     symbol, "limit", ccxt_side, amount, price
                 )
@@ -193,54 +216,106 @@ class ExchangeClient:
                     symbol, "market", ccxt_side, amount
                 )
 
-            # Set stop-loss and take-profit if provided
-            if stop_loss:
+            sl_ok, tp_ok = False, False
+            sl_err, tp_err = None, None
+
+            if stop_loss and stop_loss > 0:
                 sl_side = "sell" if side == Side.LONG else "buy"
                 try:
                     self.exchange.create_order(
                         symbol, "stop_market", sl_side, amount,
-                        params={"stopPrice": stop_loss, "reduceOnly": True}
+                        params={"stopPrice": stop_loss, "reduceOnly": True},
                     )
-                except Exception:
-                    pass
+                    sl_ok = True
+                except Exception as e:
+                    sl_err = str(e)
+                    print(f"[Exchange] WARNING: SL order failed for {symbol}: {e}")
 
-            if take_profit:
+            if take_profit and take_profit > 0:
                 tp_side = "sell" if side == Side.LONG else "buy"
                 try:
                     self.exchange.create_order(
                         symbol, "take_profit_market", tp_side, amount,
-                        params={"stopPrice": take_profit, "reduceOnly": True}
+                        params={"stopPrice": take_profit, "reduceOnly": True},
                     )
-                except Exception:
-                    pass
+                    tp_ok = True
+                except Exception as e:
+                    tp_err = str(e)
+                    print(f"[Exchange] WARNING: TP order failed for {symbol}: {e}")
 
+            # Cache brackets so software management still works
+            fill_price = float(
+                order.get("average")
+                or order.get("price")
+                or price
+                or 0
+            )
+            self._local_brackets[symbol] = {
+                "stop_loss": stop_loss or 0,
+                "take_profit": take_profit or 0,
+                "trailing_stop": None,
+                "highest_price": fill_price,
+                "lowest_price": fill_price,
+                "strategy": strategy,
+                "exchange_sl_set": sl_ok,
+                "exchange_tp_set": tp_ok,
+                "side": side.value,
+            }
+
+            order = dict(order)
+            order["sl_placed"] = sl_ok
+            order["tp_placed"] = tp_ok
+            if sl_err:
+                order["sl_error"] = sl_err
+            if tp_err:
+                order["tp_error"] = tp_err
             return order
 
         except Exception as e:
             print(f"[Exchange] Error placing order: {e}")
             return {"error": str(e)}
 
-    def close_position(self, symbol: str) -> dict:
-        """Close an open position."""
+    def update_local_brackets(self, position: Position):
+        """Sync software-managed stops back into local cache (live)."""
         if self.mode == "paper":
-            if symbol in self.paper_positions:
-                pos = self.paper_positions.pop(symbol)
-                ticker = self.fetch_ticker(symbol)
-                exit_price = ticker.get("last", pos.entry_price)
-                pnl = pos.calculate_pnl(exit_price)
-                self.balance += pnl
-                return {"closed": True, "pnl": pnl}
+            return
+        self._local_brackets[position.symbol] = {
+            "stop_loss": position.stop_loss,
+            "take_profit": position.take_profit,
+            "trailing_stop": position.trailing_stop,
+            "highest_price": position.highest_price,
+            "lowest_price": position.lowest_price,
+            "strategy": position.strategy,
+            "exchange_sl_set": position.exchange_sl_set,
+            "exchange_tp_set": position.exchange_tp_set,
+            "side": position.side.value,
+        }
+
+    def close_position(self, symbol: str) -> dict:
+        if self.mode == "paper":
+            if symbol not in self.paper_positions:
+                return {"closed": True, "reason": "no_position"}
+            pos = self.paper_positions.pop(symbol)
+            ticker = self.fetch_ticker(symbol)
+            exit_price = float(ticker.get("last") or pos.entry_price)
+            pnl = pos.calculate_pnl(exit_price)
+            self.balance += pnl
+            self.paper_trades.append({"symbol": symbol, "pnl": pnl})
+            return {"closed": True, "pnl": pnl, "exit_price": exit_price}
 
         try:
             positions = self.exchange.fetch_positions([symbol])
             for pos in positions:
-                if abs(pos.get("contracts", 0)) > 0:
-                    side = "sell" if pos["side"] == "long" else "buy"
+                contracts = abs(float(pos.get("contracts") or 0))
+                if contracts > 0:
+                    side = "sell" if pos.get("side") == "long" else "buy"
                     order = self.exchange.create_order(
-                        symbol, "market", side, abs(pos["contracts"]),
-                        params={"reduceOnly": True}
+                        symbol, "market", side, contracts,
+                        params={"reduceOnly": True},
                     )
+                    self._local_brackets.pop(symbol, None)
                     return order
+            self._local_brackets.pop(symbol, None)
             return {"closed": True, "reason": "no_position"}
         except Exception as e:
             return {"error": str(e)}
@@ -248,38 +323,61 @@ class ExchangeClient:
     # ---- Paper Trading ----
 
     def _paper_order(
-        self, symbol: str, side: Side, amount: float,
-        price: Optional[float], order_type: OrderType
+        self,
+        symbol: str,
+        side: Side,
+        amount: float,
+        price: Optional[float],
+        order_type: OrderType,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        strategy: str = "",
+        leverage: Optional[int] = None,
     ) -> dict:
-        """Simulate order execution for paper trading."""
         ticker = self.fetch_ticker(symbol)
         if not ticker:
             return {"error": "No ticker data"}
 
-        fill_price = ticker.get("last", price or 0)
-        if fill_price == 0:
+        fill_price = float(ticker.get("last") or price or 0)
+        if fill_price <= 0:
             return {"error": "No price available"}
 
-        order_id = f"paper_{int(time.time() * 1000)}"
-
-        # Check if we already have a position
         if symbol in self.paper_positions:
-            return {"error": "Position already exists", "order_id": order_id}
+            return {"error": "Position already exists"}
+
+        lev = leverage or self.config.get("trading", {}).get("default_leverage", 5)
+        sl = float(stop_loss or 0)
+        tp = float(take_profit or 0)
+
+        # Validate SL/TP sides
+        if sl > 0:
+            if side == Side.LONG and sl >= fill_price:
+                sl = fill_price * 0.98
+            if side == Side.SHORT and sl <= fill_price:
+                sl = fill_price * 1.02
+        if tp > 0:
+            if side == Side.LONG and tp <= fill_price:
+                tp = fill_price * 1.02
+            if side == Side.SHORT and tp >= fill_price:
+                tp = fill_price * 0.98
 
         position = Position(
             symbol=symbol,
             side=side,
             entry_price=fill_price,
             size=amount,
-            leverage=self.config.get("trading", {}).get("default_leverage", 5),
-            stop_loss=0,
-            take_profit=0,
+            leverage=int(lev),
+            stop_loss=sl,
+            take_profit=tp,
             highest_price=fill_price,
             lowest_price=fill_price,
+            strategy=strategy,
+            exchange_sl_set=sl > 0,
+            exchange_tp_set=tp > 0,
         )
-
         self.paper_positions[symbol] = position
 
+        order_id = f"paper_{int(time.time() * 1000)}"
         return {
             "id": order_id,
             "symbol": symbol,
@@ -287,13 +385,17 @@ class ExchangeClient:
             "amount": amount,
             "price": fill_price,
             "status": "filled",
+            "stop_loss": sl,
+            "take_profit": tp,
+            "sl_placed": sl > 0,
+            "tp_placed": tp > 0,
         }
 
     def update_paper_positions(self):
-        """Update unrealized PnL for paper positions."""
-        for symbol, pos in self.paper_positions.items():
+        for symbol, pos in list(self.paper_positions.items()):
             ticker = self.fetch_ticker(symbol)
-            if ticker:
-                current_price = ticker.get("last", pos.entry_price)
-                pos.unrealized_pnl = pos.calculate_pnl(current_price)
-                pos.update_extremes(current_price)
+            if not ticker:
+                continue
+            current_price = float(ticker.get("last") or pos.entry_price)
+            pos.unrealized_pnl = pos.calculate_pnl(current_price)
+            pos.update_extremes(current_price)

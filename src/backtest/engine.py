@@ -133,16 +133,21 @@ class Backtester:
                         # Apply slippage
                         entry_price = current_price * (1 + self.slippage_pct if signal.side == Side.LONG else 1 - self.slippage_pct)
 
+                        # Adjust SL/TP relative to slipped entry
+                        sl_delta = signal.stop_loss - signal.entry_price
+                        tp_delta = signal.take_profit - signal.entry_price
+
                         position = Position(
                             symbol=symbol,
                             side=signal.side,
                             entry_price=entry_price,
                             size=size,
                             leverage=signal.leverage,
-                            stop_loss=signal.stop_loss,
-                            take_profit=signal.take_profit,
+                            stop_loss=entry_price + sl_delta,
+                            take_profit=entry_price + tp_delta,
                             highest_price=entry_price,
                             lowest_price=entry_price,
+                            strategy=signal.strategy,
                         )
 
                         # Deduct commission

@@ -55,7 +55,7 @@ class Candle:
 class Signal:
     symbol: str
     side: Side
-    strength: float  # 0.0 to 1.0
+    strength: float  # 0.0 to 1.0 — scales position size
     strategy: str
     entry_price: float
     stop_loss: float
@@ -85,6 +85,9 @@ class Position:
     unrealized_pnl: float = 0.0
     highest_price: float = 0.0
     lowest_price: float = float("inf")
+    strategy: str = ""
+    exchange_sl_set: bool = False
+    exchange_tp_set: bool = False
 
     def update_extremes(self, price: float):
         if price > self.highest_price:
@@ -99,17 +102,22 @@ class Position:
         return (self.entry_price - current_price) * self.size
 
     def should_stop_loss(self, current_price: float) -> bool:
+        # stop_loss <= 0 means not set — never force-close shorts at 0
+        if self.stop_loss is None or self.stop_loss <= 0:
+            return False
         if self.side == Side.LONG:
             return current_price <= self.stop_loss
         return current_price >= self.stop_loss
 
     def should_take_profit(self, current_price: float) -> bool:
+        if self.take_profit is None or self.take_profit <= 0:
+            return False
         if self.side == Side.LONG:
             return current_price >= self.take_profit
         return current_price <= self.take_profit
 
     def should_trailing_stop(self, current_price: float) -> bool:
-        if self.trailing_stop is None:
+        if self.trailing_stop is None or self.trailing_stop <= 0:
             return False
         if self.side == Side.LONG:
             return current_price <= self.trailing_stop
@@ -128,6 +136,7 @@ class TradeResult:
     pnl_pct: float
     duration_seconds: int
     exit_reason: str
+    strategy: str = ""
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
 

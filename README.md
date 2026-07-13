@@ -1,27 +1,24 @@
-# WEEX AI Wars II — Trading Bot
+# WEEX AI Wars II — Trading Bot v8
 
-**Autonomous futures trading bot for the WEEX AI Wars II competition.**
+Autonomous futures trading bot for the **WEEX AI Wars II** competition.
 
-## Strategy
+## Strategy (v8)
 
-Multi-strategy adaptive bot that switches between trend-following and mean-reversion based on market regime.
+Multi-mode adaptive bot:
 
-### Core Components
+1. **High-conviction trend rider** — ADX + EMA stack + ≥2 edge confluence (1h + 4h)
+2. **Mean reversion** — RSI extremes at Bollinger bands in ranging regimes
+3. **SOL keep-alive** — VWAP bounce / BB touch at tiny size for activity rules
+4. **Risk engine** — strength-scaled sizing, half-Kelly, 15% kill-switch, trailing stops
 
-1. **Market Regime Detection** — ADX-based classification (trending vs ranging)
-2. **Trend Following** — MACD + Bollinger Band breakouts in trending markets
-3. **Mean Reversion** — RSI extremes + Bollinger Band bounces in ranging markets
-4. **Risk Management** — Half-Kelly sizing, 2% per-trade risk, 20% max drawdown kill-switch
-5. **Multi-Timeframe Analysis** — 1H for signals, 4H for trend confirmation, 15m for entries
+### Risk controls
 
-### Risk Controls
-
-- Max 2% capital risk per trade
-- Max 20% drawdown from peak (hard stop)
-- Max 8x leverage
-- 5 trade cooldown after consecutive losses
-- Dynamic stop-loss based on ATR
-- Scale-in/out position management
+- Max **1.5%** equity risk per trade (scaled by signal strength)
+- Max **15%** drawdown kill-switch
+- Max **2** open positions, **5–8x** leverage
+- Loss cooldown after 3 consecutive losses
+- Trailing stop activates only after **+1.2%** price move
+- BTC/ETH correlation guard (no same-direction double stack)
 
 ## Setup
 
@@ -32,37 +29,60 @@ cp .env.example .env
 python -m src.main
 ```
 
+### Modes
+
+- `trading.mode: paper` — simulated fills with **real** SL/TP tracking
+- `trading.mode: live` — real orders + exchange brackets + software backup stops
+
 ## Configuration
 
-Edit `config.yaml` for strategy parameters, risk limits, and trading pairs.
+Edit `config.yaml` for pairs, risk limits, and strategy knobs.
+
+Key sections:
+
+| Section | Purpose |
+|--------|---------|
+| `trading` | mode, symbols, 1h/4h timeframes |
+| `risk` | DD kill, daily loss, trailing |
+| `strategy.trend_follow` | ADX threshold, BB |
+| `strategy.mean_reversion` | RSI/BB ranges |
+| `strategy.keepalive` | SOL activity trades |
+| `edges` | funding extremes |
 
 ## Architecture
 
 ```
 src/
 ├── core/
-│   ├── engine.py         # Main trading engine
-│   ├── exchange.py       # WEEX API client
-│   └── models.py         # Data models
+│   ├── engine.py       # Main loop + HTF fetch + position management
+│   ├── exchange.py     # WEEX via ccxt (paper + live SL/TP)
+│   └── models.py       # Signal, Position, AccountState
 ├── strategies/
-│   ├── base.py           # Strategy interface
-│   ├── trend_follow.py   # Trend-following strategy
-│   ├── mean_reversion.py # Mean-reversion strategy
-│   └── composite.py      # Multi-strategy orchestrator
+│   ├── composite.py    # Conviction + MR + keep-alive
+│   └── edges.py        # Funding, volume, MTF, session, cascade
 ├── indicators/
-│   ├── technical.py      # RSI, MACD, BB, ATR, VWAP
-│   └── regime.py         # Market regime detection
+│   └── technical.py    # RSI, MACD, BB, ATR, ADX, VWAP, regime
 ├── risk/
-│   ├── manager.py        # Risk management engine
-│   ├── position_sizer.py # Kelly criterion sizing
-│   └── drawdown.py       # Drawdown monitor
-├── data/
-│   ├── fetcher.py        # Market data fetcher
-│   └── cache.py          # Local data cache
-├── utils/
-│   ├── logger.py         # Structured logging
-│   └── helpers.py        # Utility functions
-└── main.py               # Entry point
+│   └── manager.py      # Sizing, cooldowns, chandelier trail
+├── backtest/
+│   └── engine.py       # Historical simulation
+└── main.py
+```
+
+## Backtest
+
+```bash
+python run_backtest.py
+# or multi-pair:
+python run_multi_backtest.py
+```
+
+Data is fetched via public OHLCV (Binance proxy for history); live trading uses WEEX.
+
+## Smoke test
+
+```bash
+python test_bot.py
 ```
 
 ## Author

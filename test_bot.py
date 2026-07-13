@@ -1,59 +1,50 @@
-"""Quick test to verify all modules work."""
+"""Quick smoke test — modules, risk sizing by strength, SL guards, strategy."""
 
 import numpy as np
 import sys
-sys.path.insert(0, '.')
+from datetime import datetime, timezone
 
-from src.core.models import Candle, Signal, Side, Position, MarketRegime
+sys.path.insert(0, ".")
+
+from src.core.models import Candle, Signal, Side, Position
 from src.indicators.technical import (
     calculate_rsi, calculate_macd, calculate_bollinger_bands,
     calculate_atr, calculate_adx, detect_regime, calculate_vwap,
-    calculate_stochastic_rsi, calculate_ema, calculate_sma,
+    calculate_stochastic_rsi, calculate_ema,
 )
 from src.risk.manager import RiskManager
 from src.strategies.composite import CompositeStrategy
-
-# Generate sample market data
-np.random.seed(42)
-closes = 100 + np.cumsum(np.random.randn(100) * 0.5)
-highs = closes + np.random.rand(100) * 0.5
-lows = closes - np.random.rand(100) * 0.5
-volumes = np.random.rand(100) * 1000000
+from src.strategies.edges import EdgeStrategies
+import yaml
 
 print("=== INDICATOR TESTS ===")
+np.random.seed(42)
+closes = 100 + np.cumsum(np.random.randn(120) * 0.5)
+highs = closes + np.random.rand(120) * 0.5
+lows = closes - np.random.rand(120) * 0.5
+volumes = np.random.rand(120) * 1000000
 
 rsi = calculate_rsi(closes, 14)
-print(f"RSI: last={rsi[-1]:.1f}, range=[{rsi.min():.1f}, {rsi.max():.1f}]")
-
+print(f"RSI: last={rsi[-1]:.1f}")
 macd, signal_line, hist = calculate_macd(closes)
-print(f"MACD: last={macd[-1]:.3f}, signal={signal_line[-1]:.3f}")
-
-bb_upper, bb_mid, bb_lower = calculate_bollinger_bands(closes)
-print(f"BB: upper={bb_upper[-1]:.2f}, mid={bb_mid[-1]:.2f}, lower={bb_lower[-1]:.2f}")
-
+print(f"MACD: last={macd[-1]:.3f}")
+bb_u, bb_m, bb_l = calculate_bollinger_bands(closes)
+print(f"BB mid={bb_m[-1]:.2f}")
 atr = calculate_atr(highs, lows, closes)
-print(f"ATR: last={atr[-1]:.3f}")
-
+print(f"ATR: {atr[-1]:.3f}")
 adx = calculate_adx(highs, lows, closes)
-print(f"ADX: last={adx[-1]:.1f}")
+print(f"ADX: {adx[-1]:.1f}")
+print(f"VWAP: {calculate_vwap(highs, lows, closes, volumes)[-1]:.2f}")
+sk, sd = calculate_stochastic_rsi(closes)
+print(f"StochRSI K={sk[-1]:.1f}")
+print(f"Regime: {detect_regime(highs, lows, closes)}")
 
-vwap = calculate_vwap(highs, lows, closes, volumes)
-print(f"VWAP: last={vwap[-1]:.2f}")
+print("\n=== RISK / STRENGTH SIZING ===")
+with open("config.yaml") as f:
+    config = yaml.safe_load(f)
 
-stoch_k, stoch_d = calculate_stochastic_rsi(closes)
-print(f"StochRSI: K={stoch_k[-1]:.1f}, D={stoch_d[-1]:.1f}")
-
-regime = detect_regime(highs, lows, closes)
-print(f"Regime: {regime}")
-
-print("\n=== RISK MANAGER TEST ===")
-config = {
-    "risk": {"max_risk_per_trade": 0.02, "max_drawdown": 0.20, "max_open_positions": 3, "cooldown_after_losses": 5, "max_consecutive_losses": 3, "daily_loss_limit": 0.05, "trailing_stop_activation": 0.02, "trailing_stop_distance": 0.01},
-    "sizing": {"method": "half_kelly", "default_win_rate": 0.55, "min_position_usd": 10, "max_position_pct": 0.25},
-}
 rm = RiskManager(config)
 
-# Mock account
 class MockAccount:
     equity = 10000
     positions = []
@@ -61,56 +52,90 @@ class MockAccount:
     balance = 10000
 
 can, reason = rm.can_trade(MockAccount())
-print(f"Can trade: {can}, reason: {reason}")
+print(f"Can trade: {can} ({reason})")
 
-# Test position sizing
-sig = Signal(
-    symbol="BTC/USDT:USDT", side=Side.LONG, strength=0.7,
-    strategy="trend_follow", entry_price=50000,
-    stop_loss=49000, take_profit=52000, leverage=5,
-    reason="test"
+full = Signal(
+    symbol="BTC/USDT:USDT", side=Side.LONG, strength=0.8,
+    strategy="trend_rider", entry_price=50000,
+    stop_loss=49000, take_profit=53000, leverage=5, reason="test",
 )
-size = rm.calculate_position_size(sig, MockAccount())
-print(f"Position size: {size:.6f} BTC (${size * 50000:.2f})")
+tiny = Signal(
+    symbol="SOL/USDT:USDT", side=Side.LONG, strength=0.18,
+    strategy="keepalive_vwap", entry_price=150,
+    stop_loss=148, take_profit=154, leverage=5, reason="ka",
+)
+size_full = rm.calculate_position_size(full, MockAccount())
+size_tiny = rm.calculate_position_size(tiny, MockAccount())
+print(f"Full strength size: {size_full:.6f} BTC (${size_full * 50000:.2f})")
+print(f"Keep-alive size: {size_tiny:.4f} SOL (${size_tiny * 150:.2f})")
+assert size_tiny * 150 < size_full * 50000, "Keep-alive should be smaller notionally scaled by strength"
+print("Strength scaling OK")
 
-print("\n=== STRATEGY TEST ===")
-candles = [
-    Candle(timestamp=None, open=float(closes[i]), high=float(highs[i]),
-           low=float(lows[i]), close=float(closes[i]), volume=float(volumes[i]))
-    for i in range(100)
-]
+print("\n=== POSITION SL GUARDS ===")
+pos_short = Position(
+    symbol="BTC/USDT:USDT", side=Side.SHORT, entry_price=50000,
+    size=0.1, leverage=5, stop_loss=0, take_profit=0,
+)
+assert pos_short.should_stop_loss(50000) is False, "zero SL must not trigger short stop"
+assert pos_short.should_take_profit(49000) is False
+pos_short.stop_loss = 51000
+assert pos_short.should_stop_loss(51100) is True
+print("Zero-stop short guard OK")
 
-strategy = CompositeStrategy({
-    "strategy": {
-        "trend_follow": {"enabled": True, "weight": 0.6, "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "bb_period": 20, "bb_std": 2.0, "adx_threshold": 25},
-        "mean_reversion": {"enabled": True, "weight": 0.4, "rsi_period": 14, "rsi_overbought": 75, "rsi_oversold": 25, "bb_period": 20, "bb_std": 2.0},
-    },
-    "indicators": {"adx_period": 14},
-    "trading": {"default_leverage": 5},
-})
+print("\n=== EDGES FUNDING THRESHOLD ===")
+edges = EdgeStrategies(config)
+assert edges.funding_rate_signal(0.00005).get("signal") is not True
+assert edges.funding_rate_signal(0.0004).get("signal") is True
+print("Funding extreme threshold OK (0.03%)")
 
-signal = strategy.analyze("BTC/USDT:USDT", candles, 0.0001)
-if signal:
-    print(f"Signal: {signal.side.value} {signal.symbol}")
-    print(f"Strategy: {signal.strategy}")
-    print(f"Strength: {signal.strength:.2f}")
-    print(f"R:R: {signal.risk_reward_ratio:.1f}")
-    print(f"Entry: ${signal.entry_price:.2f}")
-    print(f"Stop: ${signal.stop_loss:.2f}")
-    print(f"TP: ${signal.take_profit:.2f}")
-    print(f"Reason: {signal.reason}")
+print("\n=== STRATEGY ANALYZE ===")
+# Build mildly trending synthetic series for EU session hour
+base = 100.0
+trend = np.linspace(0, 15, 120)
+noise = np.random.randn(120) * 0.3
+c = base + trend + noise
+h = c + 0.4
+l = c - 0.4
+v = np.random.rand(120) * 1e6 + 1e5
+# Fixed EU session time (14:00 UTC)
+ts0 = datetime(2024, 6, 1, 14, 0, tzinfo=timezone.utc)
+candles = []
+for i in range(120):
+    candles.append(Candle(
+        timestamp=ts0.replace(hour=14),  # same hour is fine for unit test
+        open=float(c[i] - 0.1),
+        high=float(h[i]),
+        low=float(l[i]),
+        close=float(c[i]),
+        volume=float(v[i]),
+    ))
+
+strategy = CompositeStrategy(config)
+sig = strategy.analyze("BTC/USDT:USDT", candles, 0.0001)
+if sig:
+    print(f"Signal: {sig.side.value} {sig.strategy} strength={sig.strength:.2f} R:R={sig.risk_reward_ratio:.1f}")
+    print(f"  Entry={sig.entry_price:.2f} SL={sig.stop_loss:.2f} TP={sig.take_profit:.2f}")
+    assert sig.stop_loss > 0 and sig.take_profit > 0
 else:
-    print("No signal (normal - random data doesn't always trigger)")
+    print("No signal on synthetic data (acceptable)")
 
-print("\n=== POSITION TEST ===")
+# Per-symbol timer independence
+strategy.last_trade_time["BTC/USDT:USDT"] = ts0
+assert strategy._needs_keepalive(ts0, "SOL/USDT:USDT") is True
+print("Per-symbol keep-alive timer OK")
+
+print("\n=== TRAILING ACTIVATION ===")
 pos = Position(
-    symbol="BTC/USDT:USDT", side=Side.LONG, entry_price=50000,
-    size=0.1, leverage=5, stop_loss=49000, take_profit=52000,
-    highest_price=50000, lowest_price=50000,
+    symbol="ETH/USDT:USDT", side=Side.LONG, entry_price=3000,
+    size=1, leverage=5, stop_loss=2940, take_profit=3200,
+    highest_price=3000, lowest_price=3000,
 )
-print(f"PnL at 51000: ${pos.calculate_pnl(51000):.2f}")
-print(f"PnL at 49000: ${pos.calculate_pnl(49000):.2f}")
-print(f"Stop loss at 48900: {pos.should_stop_loss(48900)}")
-print(f"Take profit at 52100: {pos.should_take_profit(52100)}")
+# Small move — trail should not fully activate below threshold
+rm.adjust_stops(pos, 3010, atr=20)
+trail_before = pos.trailing_stop
+# Big move past activation
+rm.adjust_stops(pos, 3060, atr=20)  # +2%
+assert pos.trailing_stop is not None
+print(f"Trailing after activation: {pos.trailing_stop:.2f} (before small move: {trail_before})")
 
 print("\n=== ALL TESTS PASSED ===")

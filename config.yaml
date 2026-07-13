@@ -1,11 +1,9 @@
-# WEEX AI Wars II Trading Bot — Competition Config v7.1
-# SOL: Keep-alive mode (8h trades via VWAP bounce) + high-conviction
-# BTC/ETH: High-conviction only (no forced trades)
-# Net: +$73 on $10K (90-day backtest)
-# SOL handles the 8h trading requirement
+# WEEX AI Wars II Trading Bot — Competition Config v8
+# High-conviction trend + ranging mean-reversion + SOL keep-alive
+# Strength-scaled sizing, real HTF confluence, fixed SL/TP plumbing
 
 trading:
-  mode: paper
+  mode: paper                 # paper | live
   symbols:
     - BTC/USDT:USDT
     - ETH/USDT:USDT
@@ -13,37 +11,52 @@ trading:
   default_leverage: 5
   max_leverage: 8
   timeframe: 1h
-  lookback_periods: 100
+  higher_timeframe: 4h        # Real multi-timeframe confirmation
+  lookback_periods: 120
+  htf_lookback: 80
 
 risk:
-  max_risk_per_trade: 0.015
-  max_drawdown: 0.15          # Kill at 15% DD (tighter for competition)
-  max_open_positions: 2       # Max 2 positions at once
-  cooldown_after_losses: 3    # Wait 3 trades after 3 losses
+  max_risk_per_trade: 0.015   # 1.5% base risk (scaled by signal strength)
+  max_drawdown: 0.15          # Kill at 15% DD
+  max_open_positions: 2
+  cooldown_after_losses: 3
   max_consecutive_losses: 3
   daily_loss_limit: 0.03      # 3% daily loss limit
-  trailing_stop_activation: 0.012   # Activate trailing at 1.2% profit
-  trailing_stop_distance: 0.006     # Trail at 0.6%
+  trailing_stop_activation: 0.012   # Start trail at +1.2% price move
+  trailing_stop_distance: 0.006     # 0.6% trail floor
+  chandelier_atr_mult: 2.5
+  win_streak_cooldown: false  # Competition: do not pause winners
+  max_consecutive_wins: 8
+  cooldown_after_wins: 1
 
 strategy:
   name: composite
   trend_follow:
     enabled: true
-    weight: 0.7
+    weight: 0.65
     macd_fast: 8
     macd_slow: 21
     macd_signal: 5
     bb_period: 20
     bb_std: 1.8
-    adx_threshold: 30         # Strong trends only (was 25)
+    adx_threshold: 28         # Strong trends preferred
   mean_reversion:
     enabled: true
-    weight: 0.3
+    weight: 0.25
     rsi_period: 10
-    rsi_overbought: 78        # More extreme (was 80, but now only WITH trend)
-    rsi_oversold: 22
+    rsi_overbought: 75
+    rsi_oversold: 25
     bb_period: 20
-    bb_std: 1.8
+    bb_std: 2.0
+  keepalive:
+    enabled: true
+    symbol_base: SOL          # Activity pair only
+    interval_hours: 8
+    strength: 0.18            # Tiny size via strength scaling
+
+edges:
+  funding_extreme: 0.0003     # 0.03% — real crowded zone
+  funding_crowded: 0.0005     # Block entries with the crowd
 
 indicators:
   atr_period: 14
@@ -54,9 +67,9 @@ indicators:
 
 sizing:
   method: half_kelly
-  default_win_rate: 0.50      # Conservative estimate
+  default_win_rate: 0.50
   min_position_usd: 10
-  max_position_pct: 0.20
+  max_position_pct: 0.18
 
 backtest:
   initial_capital: 10000
