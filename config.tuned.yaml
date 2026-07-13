@@ -1,23 +1,17 @@
-# WEEX AI Wars II — Competition Config v8.3 (tuned)
-# Winner variant: mr_only_htf (~-$29 / 90d vs ~-$125 on v8 baseline)
-# BTC MR was green (+$11, 67% WR). ETH sized down. SOL keep-alive tiny.
-# Breakouts OFF. HTF directional bias ON.
-
 trading:
-  mode: paper                 # flip to live only after paper is clean
+  mode: paper
   symbols:
-    - BTC/USDT:USDT
-    - ETH/USDT:USDT
-    - SOL/USDT:USDT
+  - BTC/USDT:USDT
+  - ETH/USDT:USDT
+  - SOL/USDT:USDT
   default_leverage: 5
   max_leverage: 8
   timeframe: 1h
   higher_timeframe: 4h
   lookback_periods: 120
   htf_lookback: 80
-
 risk:
-  max_risk_per_trade: 0.012   # 1.2% base (scaled by strength)
+  max_risk_per_trade: 0.012
   max_drawdown: 0.15
   max_open_positions: 2
   cooldown_after_losses: 3
@@ -27,22 +21,19 @@ risk:
   trailing_stop_distance: 0.006
   chandelier_atr_mult: 2.4
   win_streak_cooldown: false
-
 strategy:
   name: composite
   trend_follow:
-    enabled: false            # global off — choppy 90d for pullbacks on BTC/ETH
-    enabled_pairs:            # SOL pullback had a green print in tests
-      - SOL
+    enabled: false
     adx_threshold: 25
     max_extension_atr: 0.55
   breakout:
-    enabled: false            # false breaks dominated losses
+    enabled: false
     lookback: 20
     adx_min: 22
     volume_mult: 1.5
   mean_reversion:
-    enabled: true             # primary edge (BTC especially)
+    enabled: true
     strength: 0.72
     max_adx: 32
     rsi_period: 10
@@ -54,45 +45,40 @@ strategy:
     enabled: true
     symbol_base: SOL
     interval_hours: 8
-    strength: 0.10
-
+    strength: 0.1
 competition:
   min_edges: 1
   min_rr: 1.3
   allow_asia_mr: true
-  skip_asia_trend: true
-  htf_directional_bias: true  # do not fight 4h trend
+  htf_directional_bias: true
   long_only: false
-
 edges:
   funding_extreme: 0.0003
   funding_crowded: 0.0005
-
 indicators:
   atr_period: 14
   vwap_period: 20
   ema_fast: 9
   ema_slow: 21
   adx_period: 14
-
 sizing:
   method: half_kelly
   default_win_rate: 0.52
   min_position_usd: 10
   max_position_pct: 0.15
-
 backtest:
   initial_capital: 10000
   commission_rate: 0.0006
   slippage_pct: 0.0005
   use_kill_switch: false
-
 logging:
   level: INFO
   file: logs/trading.log
   console: true
-
 _tune:
-  variant: mr_only_htf_v83
+  variant: mr_only_htf
   days: 90
-  note: "Improved from -125 (v8) to -29 (v8.3). Survival first; re-tune monthly."
+  net_pnl: -28.83
+  trades: 12
+  worst_dd: 0.004
+  tuned_at: '2026-07-13T13:42:11.655698Z'

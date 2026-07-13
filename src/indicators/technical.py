@@ -25,8 +25,10 @@ def calculate_rsi(closes: np.ndarray, period: int = 14) -> np.ndarray:
         avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gains[i - 1]) / period
         avg_loss[i] = (avg_loss[i - 1] * (period - 1) + losses[i - 1]) / period
 
-    rs = np.where(avg_loss != 0, avg_gain / avg_loss, 100)
-    rsi = 100 - (100 / (1 + rs))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs = np.where(avg_loss != 0, avg_gain / avg_loss, 100.0)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi = np.nan_to_num(rsi, nan=50.0, posinf=100.0, neginf=0.0)
     rsi[:period] = 50  # Fill initial values
     return rsi
 

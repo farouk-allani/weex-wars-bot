@@ -1,88 +1,68 @@
-# WEEX AI Wars II — Trading Bot v8
+# WEEX AI Wars II — Trading Bot v8.3
 
-Autonomous futures trading bot for the **WEEX AI Wars II** competition.
+Competition-oriented futures bot with fixed execution plumbing, multi-timeframe bias, and a tuned mean-reversion core.
 
-## Strategy (v8)
+## What v8.3 learned (90d multi-pair tune)
 
-Multi-mode adaptive bot:
+| Version | Net (BTC+ETH+SOL) | Notes |
+|--------|-------------------|--------|
+| v8 baseline | **-$125** | Late trend entries + false breakouts |
+| v8.2 | **-$102** | Still breakout-heavy |
+| **v8.3 mr_only_htf** | **-$29** | Best; max DD ~0.4% |
+| BTC mean-reversion alone | **+$11** (67% WR) | Strongest pocket |
 
-1. **High-conviction trend rider** — ADX + EMA stack + ≥2 edge confluence (1h + 4h)
-2. **Mean reversion** — RSI extremes at Bollinger bands in ranging regimes
-3. **SOL keep-alive** — VWAP bounce / BB touch at tiny size for activity rules
-4. **Risk engine** — strength-scaled sizing, half-Kelly, 15% kill-switch, trailing stops
+Honest takeaway: last 90 days were hostile to momentum. The bot is now **survival-first** with a real MR edge on BTC, ETH sized down, breakouts off, and 4h bias so we do not fight the higher timeframe.
 
-### Risk controls
+## Strategy stack
 
-- Max **1.5%** equity risk per trade (scaled by signal strength)
-- Max **15%** drawdown kill-switch
-- Max **2** open positions, **5–8x** leverage
-- Loss cooldown after 3 consecutive losses
-- Trailing stop activates only after **+1.2%** price move
-- BTC/ETH correlation guard (no same-direction double stack)
+1. **Mean reversion (primary)** — RSI + Bollinger + Stoch turn, ADX capped, mid-band targets  
+2. **SOL trend pullback** — deep EMA pullback only on SOL (`enabled_pairs`)  
+3. **SOL keep-alive** — tiny VWAP/BB size for activity rules  
+4. **Breakouts** — **disabled** (false breaks bled equity)
+
+## Risk
+
+- 1.2% base risk × signal strength (keep-alive ~0.10 → micro size)  
+- 15% drawdown kill-switch, 2.5% daily loss limit  
+- Max 2 positions, half-Kelly, correlation guard BTC/ETH  
+- Trailing only after +1.2% price move  
+- Software SL/TP always stored (paper + live bracket cache)
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your WEEX API keys
-python -m src.main
+# add WEEX_API_KEY / WEEX_API_SECRET / WEEX_API_PASSPHRASE
+python test_bot.py
+python check_ready.py
+python -m src.main          # paper mode
 ```
 
-### Modes
+### Backtest / tune
 
-- `trading.mode: paper` — simulated fills with **real** SL/TP tracking
-- `trading.mode: live` — real orders + exchange brackets + software backup stops
+```bash
+python run_tune.py --days 90 --apply-best
+python run_multi_backtest.py
+```
 
-## Configuration
+## Paper → live checklist
 
-Edit `config.yaml` for pairs, risk limits, and strategy knobs.
-
-Key sections:
-
-| Section | Purpose |
-|--------|---------|
-| `trading` | mode, symbols, 1h/4h timeframes |
-| `risk` | DD kill, daily loss, trailing |
-| `strategy.trend_follow` | ADX threshold, BB |
-| `strategy.mean_reversion` | RSI/BB ranges |
-| `strategy.keepalive` | SOL activity trades |
-| `edges` | funding extremes |
+1. `trading.mode: paper` in `config.yaml`  
+2. `python test_bot.py` + `python check_ready.py`  
+3. Run `python -m src.main` — every fill must log **Stop** and **TP**  
+4. Fill `.env` keys when going live  
+5. Set `trading.mode: live` only after 24h paper looks clean  
+6. Start leverage **3–5** (max 8)
 
 ## Architecture
 
 ```
-src/
-├── core/
-│   ├── engine.py       # Main loop + HTF fetch + position management
-│   ├── exchange.py     # WEEX via ccxt (paper + live SL/TP)
-│   └── models.py       # Signal, Position, AccountState
-├── strategies/
-│   ├── composite.py    # Conviction + MR + keep-alive
-│   └── edges.py        # Funding, volume, MTF, session, cascade
-├── indicators/
-│   └── technical.py    # RSI, MACD, BB, ATR, ADX, VWAP, regime
-├── risk/
-│   └── manager.py      # Sizing, cooldowns, chandelier trail
-├── backtest/
-│   └── engine.py       # Historical simulation
-└── main.py
-```
-
-## Backtest
-
-```bash
-python run_backtest.py
-# or multi-pair:
-python run_multi_backtest.py
-```
-
-Data is fetched via public OHLCV (Binance proxy for history); live trading uses WEEX.
-
-## Smoke test
-
-```bash
-python test_bot.py
+src/core/       engine, exchange (SL/TP), models
+src/strategies/ composite v8.3, edges (funding/MTF/session)
+src/risk/       strength sizing, trail, kill-switch
+src/backtest/   HTF resample, strategy PnL breakdown
+src/indicators/ RSI, MACD, BB, ATR, ADX, VWAP, regime
 ```
 
 ## Author
