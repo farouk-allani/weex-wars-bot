@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +34,29 @@ app.add_middleware(
 
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
+
+
+@app.get("/sw.js")
+def service_worker():
+    """Serve SW from root so scope covers the whole app (required for PWA)."""
+    path = STATIC / "sw.js"
+    return FileResponse(
+        path,
+        media_type="application/javascript",
+        headers={
+            "Service-Worker-Allowed": "/",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+@app.get("/manifest.webmanifest")
+def manifest_alias():
+    return FileResponse(
+        STATIC / "manifest.webmanifest",
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 def _config_path() -> Path:

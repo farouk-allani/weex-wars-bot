@@ -2,8 +2,18 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>WEEX AI Wars — Command Center</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a1220" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="description" content="WEEX AI Wars trading bot command center — live equity, risk, positions, and logs." />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="WEEX Bot" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <link rel="manifest" href="/static/manifest.webmanifest" />
+  <link rel="icon" href="/static/logo.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png" />
+  <title>WEEX Bot — Command Center</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -11,117 +21,128 @@
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <div class="bg-grid"></div>
-  <div class="bg-glow"></div>
+  <div class="bg-orb orb-a" aria-hidden="true"></div>
+  <div class="bg-orb orb-b" aria-hidden="true"></div>
+  <div class="bg-grid" aria-hidden="true"></div>
 
   <header class="topbar">
     <div class="brand">
-      <div class="logo">W</div>
-      <div>
-        <h1>WEEX AI Wars</h1>
-        <p class="subtitle">Command Center <span id="bot-version">v8.5</span></p>
+      <div class="logo-wrap" aria-hidden="true">
+        <img src="/static/logo.svg" alt="" class="logo-img" width="44" height="44" />
+      </div>
+      <div class="brand-text">
+        <h1>WEEX Wars</h1>
+        <p class="subtitle">Command Center · <span id="bot-version">v8.5</span></p>
       </div>
     </div>
     <div class="top-status">
-      <div class="pill" id="mode-pill">PAPER</div>
-      <div class="pill muted" id="profile-pill">competition</div>
+      <div class="pill paper" id="mode-pill">PAPER</div>
+      <div class="pill muted hide-xs" id="profile-pill">competition</div>
       <div class="live-indicator" id="live-indicator">
         <span class="dot"></span>
-        <span id="live-text">Waiting for bot…</span>
+        <span id="live-text">Connecting…</span>
       </div>
-      <button class="btn ghost" id="refresh-btn" title="Refresh now">↻</button>
+      <button class="btn icon" id="refresh-btn" type="button" title="Refresh" aria-label="Refresh">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.6-6.3"/><path d="M21 3v7h-7"/></svg>
+      </button>
+      <button class="btn icon hide-desktop" id="menu-btn" type="button" title="Menu" aria-label="Menu" aria-expanded="false">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
     </div>
   </header>
 
-  <div id="demo-banner" class="demo-banner hidden">
-    Showing <strong>demo metrics</strong> — start the bot with <code>python -m src.main</code> to stream live state.
+  <div id="demo-banner" class="demo-banner hidden" role="status">
+    <span class="demo-ico">◇</span>
+    <span><strong>Demo data</strong> — start the bot so live state streams in.</span>
   </div>
 
+  <nav class="mobile-nav hidden" id="mobile-nav" aria-label="Quick jump">
+    <a href="#sec-kpis">Overview</a>
+    <a href="#sec-chart">Chart</a>
+    <a href="#sec-positions">Positions</a>
+    <a href="#sec-trades">Trades</a>
+    <a href="#sec-logs">Logs</a>
+  </nav>
+
   <main class="layout">
-    <!-- KPI row -->
-    <section class="kpi-row">
-      <article class="kpi card">
+    <section class="kpi-row" id="sec-kpis">
+      <article class="kpi card glass">
+        <div class="kpi-icon equity">◉</div>
         <span class="kpi-label">Equity</span>
         <span class="kpi-value" id="kpi-equity">$10,000</span>
-        <span class="kpi-sub" id="kpi-equity-sub">vs $10,000 start</span>
+        <span class="kpi-sub" id="kpi-equity-sub">vs start</span>
       </article>
-      <article class="kpi card">
-        <span class="kpi-label">Total PnL</span>
+      <article class="kpi card glass">
+        <div class="kpi-icon pnl">▲</div>
+        <span class="kpi-label">Session PnL</span>
         <span class="kpi-value" id="kpi-pnl">$0.00</span>
         <span class="kpi-sub" id="kpi-pnl-pct">0.00%</span>
       </article>
-      <article class="kpi card">
+      <article class="kpi card glass">
+        <div class="kpi-icon wr">◎</div>
         <span class="kpi-label">Win Rate</span>
         <span class="kpi-value" id="kpi-wr">—</span>
         <span class="kpi-sub" id="kpi-wl">0W / 0L</span>
       </article>
-      <article class="kpi card">
-        <span class="kpi-label">Max Drawdown</span>
+      <article class="kpi card glass">
+        <div class="kpi-icon dd">▽</div>
+        <span class="kpi-label">Max DD</span>
         <span class="kpi-value" id="kpi-dd">0.0%</span>
         <span class="kpi-sub" id="kpi-trades">0 trades</span>
       </article>
-      <article class="kpi card">
+      <article class="kpi card glass">
+        <div class="kpi-icon day">◆</div>
         <span class="kpi-label">Daily PnL</span>
         <span class="kpi-value" id="kpi-daily">$0.00</span>
         <span class="kpi-sub" id="kpi-streak">streak —</span>
       </article>
     </section>
 
-    <!-- Mid grid -->
-    <section class="mid-grid">
-      <article class="card chart-card">
+    <section class="mid-grid" id="sec-chart">
+      <article class="card glass chart-card">
         <div class="card-head">
-          <h2>Equity Curve</h2>
-          <span class="tag" id="chart-tag">closed trades</span>
+          <div>
+            <h2>Equity Curve</h2>
+            <p class="card-desc">Mark-to-market &amp; closed path</p>
+          </div>
+          <span class="tag" id="chart-tag">live</span>
         </div>
         <div class="chart-wrap">
           <canvas id="equity-chart"></canvas>
         </div>
       </article>
 
-      <article class="card risk-card">
+      <article class="card glass risk-card">
         <div class="card-head">
-          <h2>Risk Radar</h2>
+          <div>
+            <h2>Risk Radar</h2>
+            <p class="card-desc">Limits &amp; protections</p>
+          </div>
         </div>
         <div class="gauges">
           <div class="gauge">
-            <div class="gauge-top">
-              <span>Drawdown</span>
-              <span id="g-dd-val">0%</span>
-            </div>
+            <div class="gauge-top"><span>Drawdown</span><span id="g-dd-val">0%</span></div>
             <div class="bar"><div class="fill warn" id="g-dd" style="width:0%"></div></div>
             <div class="gauge-hint">limit <span id="g-dd-limit">15%</span></div>
           </div>
           <div class="gauge">
-            <div class="gauge-top">
-              <span>Daily loss</span>
-              <span id="g-day-val">0%</span>
-            </div>
+            <div class="gauge-top"><span>Daily loss</span><span id="g-day-val">0%</span></div>
             <div class="bar"><div class="fill danger" id="g-day" style="width:0%"></div></div>
             <div class="gauge-hint">limit <span id="g-day-limit">2.5%</span></div>
           </div>
           <div class="gauge">
-            <div class="gauge-top">
-              <span>Risk / trade</span>
-              <span id="g-risk-val">1.2%</span>
-            </div>
+            <div class="gauge-top"><span>Risk / trade</span><span id="g-risk-val">1.2%</span></div>
             <div class="bar"><div class="fill accent" id="g-risk" style="width:60%"></div></div>
             <div class="gauge-hint">configured max risk</div>
           </div>
           <div class="flags">
-            <div class="flag" id="flag-kill">
-              <span class="flag-dot"></span> Kill-switch
-            </div>
-            <div class="flag" id="flag-cd">
-              <span class="flag-dot"></span> Cooldown
-            </div>
-            <div class="flag" id="flag-partial">
-              <span class="flag-dot"></span> Partial TP
-            </div>
+            <div class="flag" id="flag-kill"><span class="flag-dot"></span> Kill-switch</div>
+            <div class="flag" id="flag-cd"><span class="flag-dot"></span> Cooldown</div>
+            <div class="flag" id="flag-partial"><span class="flag-dot"></span> Partial TP</div>
           </div>
           <div class="meta-box">
             <div><span>Leverage</span><strong id="meta-lev">5x</strong></div>
-            <div><span>TF</span><strong id="meta-tf">1h + 4h</strong></div>
+            <div><span>TF</span><strong id="meta-tf">1h+4h</strong></div>
             <div><span>Max pos</span><strong id="meta-pos">2</strong></div>
             <div><span>Cycle</span><strong id="meta-cycle">—</strong></div>
           </div>
@@ -129,14 +150,16 @@
       </article>
     </section>
 
-    <!-- Open positions -->
-    <section class="card">
+    <section class="card glass" id="sec-positions">
       <div class="card-head">
-        <h2>Open Positions</h2>
+        <div>
+          <h2>Open Positions</h2>
+          <p class="card-desc">Live paper / exchange book</p>
+        </div>
         <span class="tag" id="open-count">0</span>
       </div>
-      <div class="table-wrap">
-        <table>
+      <div class="table-scroll">
+        <table class="data-table">
           <thead>
             <tr>
               <th>Pair</th>
@@ -154,22 +177,24 @@
           </tbody>
         </table>
       </div>
-      <div class="footer-note" style="margin-top:0.6rem">
-        Balance <strong id="live-balance">—</strong>
-        · Unrealized <strong id="live-upnl">—</strong>
-        · Closed PnL <strong id="live-closed">—</strong>
+      <div class="stat-strip">
+        <div><span>Balance</span><strong id="live-balance">—</strong></div>
+        <div><span>Unrealized</span><strong id="live-upnl">—</strong></div>
+        <div><span>Closed</span><strong id="live-closed">—</strong></div>
       </div>
     </section>
 
-    <!-- Bottom grid -->
     <section class="bottom-grid">
-      <article class="card">
+      <article class="card glass" id="sec-trades">
         <div class="card-head">
-          <h2>Recent Trades</h2>
+          <div>
+            <h2>Recent Trades</h2>
+            <p class="card-desc">Closed book</p>
+          </div>
           <span class="tag" id="trades-count">0</span>
         </div>
-        <div class="table-wrap">
-          <table>
+        <div class="table-scroll">
+          <table class="data-table">
             <thead>
               <tr>
                 <th>Pair</th>
@@ -186,21 +211,29 @@
         </div>
       </article>
 
-      <article class="card">
+      <article class="card glass">
         <div class="card-head">
-          <h2>By Strategy</h2>
+          <div>
+            <h2>By Strategy</h2>
+            <p class="card-desc">Edge attribution</p>
+          </div>
         </div>
         <div id="strat-list" class="stat-list"></div>
         <div class="card-head sub">
-          <h2>By Pair</h2>
+          <div>
+            <h2>By Pair</h2>
+            <p class="card-desc">Allocation signal</p>
+          </div>
         </div>
         <div id="pair-list" class="stat-list"></div>
       </article>
 
-      <article class="card log-card">
+      <article class="card glass log-card" id="sec-logs">
         <div class="card-head">
-          <h2>Live Log</h2>
-          <span class="tag muted" id="log-path">logs/trading.log</span>
+          <div>
+            <h2>Live Log</h2>
+            <p class="card-desc" id="log-path">trading.log</p>
+          </div>
         </div>
         <div class="log-stream" id="log-stream">
           <div class="log-line muted">Waiting for logs…</div>
@@ -208,18 +241,27 @@
       </article>
     </section>
 
-    <section class="symbols-row card">
+    <section class="card glass symbols-row">
       <div class="card-head">
-        <h2>Universe</h2>
+        <div>
+          <h2>Universe</h2>
+          <p class="card-desc">Watched markets</p>
+        </div>
         <span class="tag" id="symbols-tag">watching</span>
       </div>
       <div class="symbol-chips" id="symbol-chips"></div>
-      <div class="footer-note">
-        Auto-refresh every <strong>5s</strong> · Data from <code>data/bot_state.json</code> + <code>logs/trading.log</code>
-        · Run bot: <code>python -m src.main</code>
-      </div>
+      <p class="footer-note">
+        Auto-refresh <strong>5s</strong> · Install as app on mobile (browser menu → Add to Home Screen)
+      </p>
     </section>
   </main>
+
+  <footer class="site-footer">
+    <img src="/static/logo.svg" alt="" width="20" height="20" />
+    <span>WEEX AI Wars Bot</span>
+    <span class="sep">·</span>
+    <span id="footer-status">offline shell</span>
+  </footer>
 
   <script src="/static/app.js"></script>
 </body>
