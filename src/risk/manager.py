@@ -238,20 +238,22 @@ class RiskManager:
                 if position.stop_loss <= 0 or position.stop_loss > be:
                     position.stop_loss = be
 
-        # Earlier trail activation after partial
-        act = self.trailing_stop_activation * (0.7 if position.partial_taken else 1.0)
+        # Earlier + tighter trail after partial (protect runner)
+        act = self.trailing_stop_activation * (0.55 if position.partial_taken else 1.0)
+        chand_mult = self.chandelier_atr_mult * (0.7 if position.partial_taken else 1.0)
+        trail_dist = self.trailing_stop_distance * (0.75 if position.partial_taken else 1.0)
         if profit_pct >= act:
             if position.side == Side.LONG:
-                chandelier = position.highest_price - atr * self.chandelier_atr_mult
-                pct_trail = current_price * (1 - self.trailing_stop_distance)
+                chandelier = position.highest_price - atr * chand_mult
+                pct_trail = current_price * (1 - trail_dist)
                 trail = max(chandelier, pct_trail)
                 if position.trailing_stop is None or trail > position.trailing_stop:
                     position.trailing_stop = trail
                 if position.trailing_stop > position.stop_loss:
                     position.stop_loss = position.trailing_stop
             else:
-                chandelier = position.lowest_price + atr * self.chandelier_atr_mult
-                pct_trail = current_price * (1 + self.trailing_stop_distance)
+                chandelier = position.lowest_price + atr * chand_mult
+                pct_trail = current_price * (1 + trail_dist)
                 trail = min(chandelier, pct_trail)
                 if position.trailing_stop is None or trail < position.trailing_stop:
                     position.trailing_stop = trail

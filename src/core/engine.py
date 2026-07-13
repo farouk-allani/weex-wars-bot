@@ -65,14 +65,16 @@ class TradingEngine:
         lookback = self.config.get("trading", {}).get("lookback_periods", 100)
         htf_lookback = self.config.get("trading", {}).get("htf_lookback", 80)
 
+        pure = self.config.get("competition", {}).get("pure_edge", False)
         console.print(Panel.fit(
-            "[bold green]WEEX AI Wars II — Trading Bot v8.4[/]\n"
-            f"Mode: [yellow]{self.config['trading']['mode']}[/]\n"
+            "[bold green]WEEX AI Wars II — Trading Bot v8.5[/]\n"
+            f"Mode: [yellow]{self.config['trading']['mode']}[/] | "
+            f"Profile: [cyan]{'pure_edge' if pure else 'competition'}[/]\n"
             f"Symbols: {', '.join(symbols)}\n"
             f"Timeframes: {timeframe} + {htf}\n"
             f"Max Drawdown: {self.risk.max_drawdown:.0%}\n"
             f"Risk/Trade: {self.risk.max_risk_per_trade:.1%}\n"
-            f"Features: portfolio risk, partial TP, adaptive weights, state save",
+            f"Features: wick-MR, partial runners, adaptive weights, state save",
             title="Bot Started",
         ))
         self.logger.info(
@@ -439,7 +441,7 @@ class TradingEngine:
 
 
 def main():
-    console.print("[bold green]WEEX AI Wars II — Trading Bot v8.4[/]")
+    console.print("[bold green]WEEX AI Wars II — Trading Bot v8.5[/]")
     console.print("[dim]Press Ctrl+C to stop[/]\n")
     engine = TradingEngine()
     engine.run()

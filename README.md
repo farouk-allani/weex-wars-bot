@@ -1,64 +1,82 @@
-# WEEX AI Wars II — Trading Bot v8.4
+# WEEX AI Wars II — Trading Bot v8.5
 
-Competition futures bot with portfolio risk, partial take-profit, adaptive weights, and a tuned mean-reversion core.
+Competition futures bot: portfolio risk, partial take-profit runners, walk-forward mode selection, adaptive weights.
 
-## Progress (90d portfolio, shared $10k)
+## Results snapshot
 
-| Stage | Net closed PnL | Max DD | Notes |
-|-------|----------------|--------|--------|
-| v8 baseline (sum pairs) | **-$125** | ~0.9% | Late trends + false breakouts |
-| v8.3 MR focus | **-$29** | ~0.4% | Isolated BTC edge |
-| v8.4 portfolio (KA tax) | **-$38** | 0.3% | Keep-alive over-trading |
-| **v8.4 final** | **+$2.58** | **0.2%** | Sharpe **2.19**, PF **1.18** |
+### 90d portfolio (BTC + SOL, shared $10k) — current config
 
-Final capital ~**$10,031** (partial scale-outs bank extra).  
-**BTC** +$10.9 | **mean_reversion** +$8.2 (57% WR) | keep-alive still a small tax.
+| Metric | Value |
+|--------|-------|
+| Closed PnL | **+$2.13** |
+| Final capital | **~$10,030** |
+| Win rate | **53.6%** |
+| Max DD | **0.2%** |
+| Sharpe | **1.99** |
+| Profit factor | **1.16** |
+| mean_reversion | **+$6.53** |
+| BTC | **+$10.21** |
 
-## Strategy stack
+### Journey
 
-1. **Mean reversion (primary)** — z-score BB stretch + RSI/Stoch turn + volume filter  
-2. **Partial TP at 1R** — bank 50%, stop → breakeven, trail rest  
-3. **HTF 4h bias** — don’t fight the higher timeframe  
-4. **SOL keep-alive** — micro size, max 3/week, only if book is quiet  
-5. **Breakouts OFF**
+| Version | Result | Lesson |
+|---------|--------|--------|
+| v8 | -$125 | Late trends / false breakouts |
+| v8.3 | -$29 | MR pocket on BTC |
+| v8.4 | +$2.58 | Cap keep-alive tax |
+| v8.5 WFO 120d | pick **comp_no_eth** | ETH drag; wick as bonus only |
+| **v8.5.1 90d** | **+$2.13 / 54% WR** | BTC+SOL competition profile |
 
-## Risk & execution
+## Modes
 
-- 1.2% base risk × strength × pair weight × strategy weight  
-- 15% DD kill-switch, 2.5% daily loss, **time-based** 6h loss cooldown  
-- Keep-alive losses **do not** trigger portfolio cooldown  
-- State saved to `data/bot_state.json` (survives restarts)  
-- Logs → `logs/trading.log`  
-- Paper + live SL/TP brackets  
+| Profile | File | Use |
+|---------|------|-----|
+| **Competition** (default) | `config.yaml` | BTC+SOL, tiny KA activity |
+| Pure edge BTC | `config.edge.yaml` | No KA, max edge research |
+
+```bash
+# Competition paper
+python -m src.main
+
+# Pure edge config
+# copy config.edge.yaml → config.yaml  (or pass path when you wire it)
+```
 
 ## Commands
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env          # add WEEX keys for live
 python test_bot.py
-python check_ready.py
+python paper_checklist.py
 python run_portfolio_backtest.py --days 90
-python run_tune.py --days 90 --apply-best
-python -m src.main            # paper by default
+python run_walk_forward.py --days 120 --apply-best
+python -m src.main
 ```
+
+## What’s new in v8.5
+
+- **Walk-forward** mode comparison (`run_walk_forward.py`)
+- **Wick quality** boosts size (not a hard gate)
+- **Tighter runner trail** after partial TP
+- **ETH dropped** (WFO + 90d evidence)
+- **Disk cache** for OHLCV/funding (`data/cache/`)
+- **Paper checklist** (`paper_checklist.py`)
+- State save + file logging (from v8.4)
+
+## Risk
+
+- 1.2% risk × strength × pair × strategy weights  
+- 15% kill-switch, 6h time-based loss cooldown  
+- KA losses do **not** trigger cooldown  
+- Partial TP 50% @ 1R → BE + tight trail  
 
 ## Paper → live
 
-1. `trading.mode: paper`  
-2. Confirm every fill logs **Stop** + **TP** (+ partial TP)  
-3. Fill `.env` keys  
-4. After clean paper, set `mode: live`, leverage 3–5  
-
-## Architecture
-
-```
-src/core/        engine v8.4, exchange, models
-src/strategies/  composite (MR + KA), edges
-src/risk/        adaptive sizing, partial TP, state
-src/backtest/    single + portfolio shared capital
-src/utils/       logger, state persistence
-```
+1. `python paper_checklist.py`  
+2. `python -m src.main` (mode: paper)  
+3. First fill must log Stop + TP + Partial  
+4. Review `logs/trading.log` after 24h  
+5. Live only when clean — leverage 3–5  
 
 ## Author
 

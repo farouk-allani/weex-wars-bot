@@ -1,20 +1,13 @@
-# WEEX AI Wars II — Competition Config v8.5.1
-# Winner from WFO: comp_no_eth (skip ETH)
-# Wick quality = size bonus (not hard gate)
-# Soft 90d green history; 120d still choppy — survival first
-
 trading:
   mode: paper
   symbols:
-    - BTC/USDT:USDT
-    - SOL/USDT:USDT          # ETH disabled (drag in WFO)
+  - BTC/USDT:USDT
   default_leverage: 5
   max_leverage: 8
   timeframe: 1h
   higher_timeframe: 4h
   lookback_periods: 120
   htf_lookback: 80
-
 risk:
   max_risk_per_trade: 0.012
   max_drawdown: 0.15
@@ -29,7 +22,6 @@ risk:
   win_streak_cooldown: false
   partial_tp_enabled: true
   partial_be_buffer_atr: 0.12
-
 strategy:
   name: composite
   trend_follow:
@@ -39,6 +31,9 @@ strategy:
     max_extension_atr: 0.55
   breakout:
     enabled: false
+    lookback: 20
+    adx_min: 22
+    volume_mult: 1.5
   mean_reversion:
     enabled: true
     strength: 0.76
@@ -52,12 +47,11 @@ strategy:
     bb_period: 20
     bb_std: 2.0
   keepalive:
-    enabled: true
+    enabled: false
     symbol_base: SOL
     interval_hours: 16
     strength: 0.04
     max_per_week: 2
-
 competition:
   min_edges: 1
   min_rr: 1.35
@@ -66,39 +60,31 @@ competition:
   htf_directional_bias: true
   long_only: false
   partial_tp: true
-  pure_edge: false
+  pure_edge: true
   disabled_pairs:
-    - ETH
-
+  - ETH
+  - SOL
 edges:
   funding_extreme: 0.0003
   funding_crowded: 0.0005
-
 indicators:
   atr_period: 14
   vwap_period: 20
   ema_fast: 9
   ema_slow: 21
   adx_period: 14
-
 sizing:
   method: half_kelly
   default_win_rate: 0.52
   min_position_usd: 10
   max_position_pct: 0.15
-
 backtest:
   initial_capital: 10000
   commission_rate: 0.0006
   slippage_pct: 0.0005
   use_kill_switch: false
-
 logging:
   level: INFO
   file: logs/trading.log
   console: true
   state_file: data/bot_state.json
-
-_tune:
-  variant: comp_no_eth_v851
-  note: "WFO preferred no-ETH; wick soft; 90d was green on prior KA-capped stack"

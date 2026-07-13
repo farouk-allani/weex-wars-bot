@@ -1,12 +1,10 @@
-"""WEEX AI Wars II — Composite Strategy v8.4
+"""WEEX AI Wars II — Composite Strategy v8.5
 
-Improvements over v8.3:
-- Volume confirmation on mean-reversion
-- Session quality scales strength (EU/US > Asia)
-- Adaptive strategy strength via risk manager feedback hook
-- Partial TP (1R) baked into signals for scale-out
-- Z-score stretch filter (avoid weak band tags)
-- BTC preferred sizing, ETH stricter filters
+v8.5:
+- Wick-rejection quality filter on MR entries
+- Disabled-pairs support (pure-edge / skip toxic pairs)
+- Stronger mid-band targets with optional runner extension
+- Keep-alive book-level activity gate + weekly cap
 """
 
 import numpy as np
@@ -62,6 +60,13 @@ class CompositeStrategy:
         self._htf_bias = bool(comp.get("htf_directional_bias", True))
         self._long_only = bool(comp.get("long_only", False))
         self._use_partial_tp = bool(comp.get("partial_tp", True))
+        self._disabled_pairs = set(
+            p.upper() for p in (comp.get("disabled_pairs") or self.mr_config.get("disabled_pairs") or [])
+        )
+        self._pure_edge = bool(comp.get("pure_edge", False))
+        if self._pure_edge:
+            # Pure edge: no keep-alive tax
+            self.ka_config = {**self.ka_config, "enabled": False}
 
         # Adaptive: strategy name -> recent pnls (fed by engine/risk)
         self._strategy_scores: dict[str, float] = defaultdict(lambda: 1.0)
@@ -437,14 +442,17 @@ class CompositeStrategy:
                     return None
 
         base = symbol.split("/")[0]
+        if base.upper() in self._disabled_pairs:
+            return None
+
         # ETH: stricter — require stronger extreme
         rsi_period = self.mr_config.get("rsi_period", 10)
         ob = self.mr_config.get("rsi_overbought", 68)
         os_ = self.mr_config.get("rsi_oversold", 32)
         if base == "ETH":
-            ob = min(ob, 66)
-            os_ = max(os_, 34)
-            if adx[-1] > max_adx - 4:
+            ob = min(ob, 65)
+            os_ = max(os_, 35)
+            if adx[-1] > max_adx - 5:
                 return None
 
         bb_period = self.mr_config.get("bb_period", 20)
@@ -468,26 +476,33 @@ class CompositeStrategy:
 
         avg_vol = float(np.mean(volumes[-20:]))
         vol_ratio = float(volumes[-1] / avg_vol) if avg_vol > 0 else 1.0
-        # Avoid ultra-dead prints; prefer some participation
         if vol_ratio < float(self.mr_config.get("min_volume_ratio", 0.7)):
             return None
+
+        # Wick rejection quality (hammer / shooting star style)
+        last = candles[-1]
+        rng = max(last.high - last.low, 1e-12)
+        body = abs(last.close - last.open)
+        lower_wick = min(last.open, last.close) - last.low
+        upper_wick = last.high - max(last.open, last.close)
+        close_loc = (last.close - last.low) / rng  # 0=low, 1=high
 
         profile = ATR_PROFILES.get(base, DEFAULT_PROFILE)
         lev = self.config.get("trading", {}).get("default_leverage", 5)
         strength = float(self.mr_config.get("strength", 0.72))
-        pair_mult = {"BTC": 1.15, "ETH": 0.5, "SOL": 0.9}.get(base, 0.8)
+        pair_mult = {"BTC": 1.2, "ETH": 0.45, "SOL": 0.75}.get(base, 0.8)
         strength *= pair_mult
-        # Stronger stretch → higher confidence
-        strength *= min(1.15, 0.9 + abs(z) * 0.15)
+        strength *= min(1.18, 0.88 + abs(z) * 0.18)
+        # Favor EU/US already applied in finalize; bonus for clean rejection
+        runner_ext = float(self.mr_config.get("runner_extension_atr", 0.35))
 
-        # Reject if funding very crowded against us
-        crowded = self.edges.funding_crowded
-        if funding_rate > crowded * 1.5 and z < 0:
-            pass  # long fade while longs crowded is OK (contrarian)
-        if funding_rate < -crowded * 1.5 and z > 0:
-            pass
+        # Wick quality is a BONUS (not hard gate) — hard gate hurt 120d OOS
+        long_reject = lower_wick >= body * 0.5 and close_loc >= 0.5
+        short_reject = upper_wick >= body * 0.5 and close_loc <= 0.5
+        # Extreme stretch can enter without perfect wick
+        extreme = abs(z) >= min_stretch + 0.15
 
-        # LONG
+        # LONG: stretch down + reclaim
         if (
             z <= -min_stretch
             and price <= float(bb_l[-1]) * 1.006
@@ -495,20 +510,26 @@ class CompositeStrategy:
             and rsi[-1] > rsi[-2]
             and closes[-1] > closes[-2]
             and (stoch_k[-1] > stoch_d[-1] or stoch_k[-1] > stoch_k[-2])
+            and (long_reject or extreme)
         ):
-            stop = min(float(bb_l[-1]) - atr_v * 0.4, price - atr_v * profile["stop"])
-            target = float(bb_m[-1])
+            stop = min(float(bb_l[-1]) - atr_v * 0.35, price - atr_v * profile["stop"])
+            target = float(bb_m[-1]) + atr_v * runner_ext
             if target <= price:
-                target = price + atr_v * 1.7
-            target = min(target, price + atr_v * profile["target"])
+                target = price + atr_v * 1.8
+            target = min(target, price + atr_v * (profile["target"] + 0.3))
             if abs(target - price) / max(abs(price - stop), 1e-9) < self._min_rr:
                 return None
+            s = strength
+            if long_reject:
+                s = min(1.0, s * 1.1)
+            elif extreme:
+                s = min(1.0, s * 0.95)  # size down if no wick confirmation
             return Signal(
-                symbol=symbol, side=Side.LONG, strength=min(1.0, strength),
+                symbol=symbol, side=Side.LONG, strength=min(1.0, s),
                 strategy="mean_reversion",
                 entry_price=price, stop_loss=stop, take_profit=target,
                 leverage=lev,
-                reason=f"MR LONG z={z:.2f} RSI={rsi[-1]:.0f} ADX={adx[-1]:.0f} vol={vol_ratio:.1f}x",
+                reason=f"MR LONG z={z:.2f} RSI={rsi[-1]:.0f} wick={long_reject} vol={vol_ratio:.1f}x",
             )
 
         # SHORT
@@ -519,20 +540,26 @@ class CompositeStrategy:
             and rsi[-1] < rsi[-2]
             and closes[-1] < closes[-2]
             and (stoch_k[-1] < stoch_d[-1] or stoch_k[-1] < stoch_k[-2])
+            and (short_reject or extreme)
         ):
-            stop = max(float(bb_u[-1]) + atr_v * 0.4, price + atr_v * profile["stop"])
-            target = float(bb_m[-1])
+            stop = max(float(bb_u[-1]) + atr_v * 0.35, price + atr_v * profile["stop"])
+            target = float(bb_m[-1]) - atr_v * runner_ext
             if target >= price:
-                target = price - atr_v * 1.7
-            target = max(target, price - atr_v * profile["target"])
+                target = price - atr_v * 1.8
+            target = max(target, price - atr_v * (profile["target"] + 0.3))
             if abs(price - target) / max(abs(stop - price), 1e-9) < self._min_rr:
                 return None
+            s = strength
+            if short_reject:
+                s = min(1.0, s * 1.1)
+            elif extreme:
+                s = min(1.0, s * 0.95)
             return Signal(
-                symbol=symbol, side=Side.SHORT, strength=min(1.0, strength),
+                symbol=symbol, side=Side.SHORT, strength=min(1.0, s),
                 strategy="mean_reversion",
                 entry_price=price, stop_loss=stop, take_profit=target,
                 leverage=lev,
-                reason=f"MR SHORT z={z:.2f} RSI={rsi[-1]:.0f} ADX={adx[-1]:.0f} vol={vol_ratio:.1f}x",
+                reason=f"MR SHORT z={z:.2f} RSI={rsi[-1]:.0f} wick={short_reject} vol={vol_ratio:.1f}x",
             )
 
         return None

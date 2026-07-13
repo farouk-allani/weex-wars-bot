@@ -5,6 +5,7 @@ __pycache__/
 logs/
 data/bot_state.json
 data/_test_state.json
+data/cache/
 *.log
 .venv/
 venv/
