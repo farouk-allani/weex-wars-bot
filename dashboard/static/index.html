@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WEEX AI Wars — Command Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div class="bg-glow"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">W</div>
+      <div>
+        <h1>WEEX AI Wars</h1>
+        <p class="subtitle">Command Center <span id="bot-version">v8.5</span></p>
+      </div>
+    </div>
+    <div class="top-status">
+      <div class="pill" id="mode-pill">PAPER</div>
+      <div class="pill muted" id="profile-pill">competition</div>
+      <div class="live-indicator" id="live-indicator">
+        <span class="dot"></span>
+        <span id="live-text">Waiting for bot…</span>
+      </div>
+      <button class="btn ghost" id="refresh-btn" title="Refresh now">↻</button>
+    </div>
+  </header>
+
+  <div id="demo-banner" class="demo-banner hidden">
+    Showing <strong>demo metrics</strong> — start the bot with <code>python -m src.main</code> to stream live state.
+  </div>
+
+  <main class="layout">
+    <!-- KPI row -->
+    <section class="kpi-row">
+      <article class="kpi card">
+        <span class="kpi-label">Equity</span>
+        <span class="kpi-value" id="kpi-equity">$10,000</span>
+        <span class="kpi-sub" id="kpi-equity-sub">vs $10,000 start</span>
+      </article>
+      <article class="kpi card">
+        <span class="kpi-label">Total PnL</span>
+        <span class="kpi-value" id="kpi-pnl">$0.00</span>
+        <span class="kpi-sub" id="kpi-pnl-pct">0.00%</span>
+      </article>
+      <article class="kpi card">
+        <span class="kpi-label">Win Rate</span>
+        <span class="kpi-value" id="kpi-wr">—</span>
+        <span class="kpi-sub" id="kpi-wl">0W / 0L</span>
+      </article>
+      <article class="kpi card">
+        <span class="kpi-label">Max Drawdown</span>
+        <span class="kpi-value" id="kpi-dd">0.0%</span>
+        <span class="kpi-sub" id="kpi-trades">0 trades</span>
+      </article>
+      <article class="kpi card">
+        <span class="kpi-label">Daily PnL</span>
+        <span class="kpi-value" id="kpi-daily">$0.00</span>
+        <span class="kpi-sub" id="kpi-streak">streak —</span>
+      </article>
+    </section>
+
+    <!-- Mid grid -->
+    <section class="mid-grid">
+      <article class="card chart-card">
+        <div class="card-head">
+          <h2>Equity Curve</h2>
+          <span class="tag" id="chart-tag">closed trades</span>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="equity-chart"></canvas>
+        </div>
+      </article>
+
+      <article class="card risk-card">
+        <div class="card-head">
+          <h2>Risk Radar</h2>
+        </div>
+        <div class="gauges">
+          <div class="gauge">
+            <div class="gauge-top">
+              <span>Drawdown</span>
+              <span id="g-dd-val">0%</span>
+            </div>
+            <div class="bar"><div class="fill warn" id="g-dd" style="width:0%"></div></div>
+            <div class="gauge-hint">limit <span id="g-dd-limit">15%</span></div>
+          </div>
+          <div class="gauge">
+            <div class="gauge-top">
+              <span>Daily loss</span>
+              <span id="g-day-val">0%</span>
+            </div>
+            <div class="bar"><div class="fill danger" id="g-day" style="width:0%"></div></div>
+            <div class="gauge-hint">limit <span id="g-day-limit">2.5%</span></div>
+          </div>
+          <div class="gauge">
+            <div class="gauge-top">
+              <span>Risk / trade</span>
+              <span id="g-risk-val">1.2%</span>
+            </div>
+            <div class="bar"><div class="fill accent" id="g-risk" style="width:60%"></div></div>
+            <div class="gauge-hint">configured max risk</div>
+          </div>
+          <div class="flags">
+            <div class="flag" id="flag-kill">
+              <span class="flag-dot"></span> Kill-switch
+            </div>
+            <div class="flag" id="flag-cd">
+              <span class="flag-dot"></span> Cooldown
+            </div>
+            <div class="flag" id="flag-partial">
+              <span class="flag-dot"></span> Partial TP
+            </div>
+          </div>
+          <div class="meta-box">
+            <div><span>Leverage</span><strong id="meta-lev">5x</strong></div>
+            <div><span>TF</span><strong id="meta-tf">1h + 4h</strong></div>
+            <div><span>Max pos</span><strong id="meta-pos">2</strong></div>
+            <div><span>Cycle</span><strong id="meta-cycle">—</strong></div>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <!-- Open positions -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Open Positions</h2>
+        <span class="tag" id="open-count">0</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Pair</th>
+              <th>Side</th>
+              <th>Entry</th>
+              <th>Size</th>
+              <th>uPnL</th>
+              <th>SL</th>
+              <th>TP</th>
+              <th>Strategy</th>
+            </tr>
+          </thead>
+          <tbody id="positions-body">
+            <tr><td colspan="8" class="empty">No open positions</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="footer-note" style="margin-top:0.6rem">
+        Balance <strong id="live-balance">—</strong>
+        · Unrealized <strong id="live-upnl">—</strong>
+        · Closed PnL <strong id="live-closed">—</strong>
+      </div>
+    </section>
+
+    <!-- Bottom grid -->
+    <section class="bottom-grid">
+      <article class="card">
+        <div class="card-head">
+          <h2>Recent Trades</h2>
+          <span class="tag" id="trades-count">0</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Pair</th>
+                <th>Side</th>
+                <th>Strategy</th>
+                <th>PnL</th>
+                <th>Exit</th>
+              </tr>
+            </thead>
+            <tbody id="trades-body">
+              <tr><td colspan="5" class="empty">No trades yet</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h2>By Strategy</h2>
+        </div>
+        <div id="strat-list" class="stat-list"></div>
+        <div class="card-head sub">
+          <h2>By Pair</h2>
+        </div>
+        <div id="pair-list" class="stat-list"></div>
+      </article>
+
+      <article class="card log-card">
+        <div class="card-head">
+          <h2>Live Log</h2>
+          <span class="tag muted" id="log-path">logs/trading.log</span>
+        </div>
+        <div class="log-stream" id="log-stream">
+          <div class="log-line muted">Waiting for logs…</div>
+        </div>
+      </article>
+    </section>
+
+    <section class="symbols-row card">
+      <div class="card-head">
+        <h2>Universe</h2>
+        <span class="tag" id="symbols-tag">watching</span>
+      </div>
+      <div class="symbol-chips" id="symbol-chips"></div>
+      <div class="footer-note">
+        Auto-refresh every <strong>5s</strong> · Data from <code>data/bot_state.json</code> + <code>logs/trading.log</code>
+        · Run bot: <code>python -m src.main</code>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

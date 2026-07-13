@@ -178,6 +178,9 @@ class ExchangeClient:
     # ---- Trading ----
 
     def set_leverage(self, symbol: str, leverage: int) -> bool:
+        # Paper mode is local sim — no API credentials needed
+        if self.mode == "paper":
+            return True
         try:
             self.exchange.set_leverage(leverage, symbol)
             return True
@@ -399,3 +402,34 @@ class ExchangeClient:
             current_price = float(ticker.get("last") or pos.entry_price)
             pos.unrealized_pnl = pos.calculate_pnl(current_price)
             pos.update_extremes(current_price)
+
+    def snapshot_for_dashboard(self) -> dict:
+        """Serializable account snapshot for the monitoring UI."""
+        account = self.get_account_state()
+        positions = []
+        for p in account.positions:
+            positions.append({
+                "symbol": p.symbol,
+                "side": p.side.value if hasattr(p.side, "value") else str(p.side),
+                "entry_price": p.entry_price,
+                "size": p.size,
+                "leverage": p.leverage,
+                "stop_loss": p.stop_loss,
+                "take_profit": p.take_profit,
+                "trailing_stop": p.trailing_stop,
+                "unrealized_pnl": p.unrealized_pnl,
+                "strategy": getattr(p, "strategy", "") or "",
+                "partial_taken": getattr(p, "partial_taken", False),
+                "partial_take_profit": getattr(p, "partial_take_profit", None),
+                "opened_at": p.opened_at.isoformat() if getattr(p, "opened_at", None) else None,
+            })
+        return {
+            "mode": self.mode,
+            "balance": account.balance,
+            "equity": account.equity,
+            "unrealized_pnl": account.unrealized_pnl,
+            "margin_used": account.margin_used,
+            "available_margin": account.available_margin,
+            "open_positions": len(positions),
+            "positions": positions,
+        }

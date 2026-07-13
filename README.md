@@ -53,6 +53,30 @@ python run_walk_forward.py --days 120 --apply-best
 python -m src.main
 ```
 
+## Dashboard (Command Center)
+
+Polished local web UI for paper/live monitoring:
+
+```bash
+pip install -r requirements.txt
+python run_dashboard.py
+# open http://127.0.0.1:8787
+```
+
+In another terminal, run the bot:
+
+```bash
+python -m src.main
+```
+
+The dashboard auto-refreshes every **5s** from:
+
+- `data/bot_state.json` — equity, trades, risk, strategy stats  
+- `logs/trading.log` — live log stream  
+- `config.yaml` — mode, pairs, risk limits  
+
+If the bot hasn’t written state yet, the UI shows **demo metrics** so you can preview the layout.
+
 ## What’s new in v8.5
 
 - **Walk-forward** mode comparison (`run_walk_forward.py`)

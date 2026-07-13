@@ -23,7 +23,7 @@ from ..risk.manager import RiskManager
 from ..indicators.technical import calculate_atr
 from ..utils.logger import setup_logger
 from ..utils.state import save_state, load_state, DEFAULT_STATE_PATH
-import numpy as np
+import numpy as np  # noqa: E402
 
 console = Console()
 
@@ -92,8 +92,8 @@ class TradingEngine:
                 self.cycle_count += 1
                 self._run_cycle(symbols, timeframe, htf, lookback, htf_lookback)
                 self._display_status()
-                if self.cycle_count % 3 == 0:
-                    self._persist_state()
+                # Always snapshot for dashboard (open positions + equity)
+                self._persist_state()
 
                 sleep_time = 60 if timeframe == "1h" else 30
                 for _ in range(sleep_time):
@@ -216,10 +216,18 @@ class TradingEngine:
             self.exchange._local_brackets[signal.symbol] = br
 
         console.print(f"[green]   Order filled: {result.get('id', 'N/A')}[/]")
-        if result.get("sl_placed") is False:
+        self.logger.info(
+            "FILL %s %s size=%.6f id=%s SL=%.4f TP=%.4f",
+            signal.side.value, signal.symbol, size,
+            result.get("id", "N/A"),
+            signal.stop_loss, signal.take_profit,
+        )
+        if result.get("sl_placed") is False and self.exchange.mode != "paper":
             console.print("[yellow]   SL not on exchange — software stop active[/]")
-        if result.get("tp_placed") is False:
+        if result.get("tp_placed") is False and self.exchange.mode != "paper":
             console.print("[yellow]   TP not on exchange — software TP active[/]")
+        # Push open positions to dashboard immediately
+        self._persist_state()
 
     def _manage_positions(self, account):
         candles_cache = {}
@@ -361,12 +369,29 @@ class TradingEngine:
                 k: (v.isoformat() if hasattr(v, "isoformat") else str(v))
                 for k, v in self.strategy.last_trade_time.items()
             }
+            account = self.exchange.snapshot_for_dashboard()
+            # Keep a rolling equity tick for the dashboard curve (live mark-to-market)
+            prev = load_state(self.state_path)
+            ticks = list(prev.get("equity_ticks") or [])
+            ticks.append({
+                "t": datetime.utcnow().isoformat() + "Z",
+                "equity": account.get("equity"),
+                "balance": account.get("balance"),
+                "unrealized": account.get("unrealized_pnl"),
+                "open": account.get("open_positions"),
+            })
+            ticks = ticks[-500:]  # cap
+
             save_state(
                 self.state_path,
                 {
                     "risk": self.risk.to_state(),
+                    "account": account,
+                    "equity_ticks": ticks,
                     "last_trade_time": lt,
                     "cycle_count": self.cycle_count,
+                    "bot_version": "v8.5",
+                    "mode": self.config.get("trading", {}).get("mode", "paper"),
                 },
             )
         except Exception as e:
