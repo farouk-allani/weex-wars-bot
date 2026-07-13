@@ -516,6 +516,89 @@ a:hover { color: #8bbcff; }
   line-height: 1.5;
 }
 
+/* Export panel */
+.export-card { scroll-margin-top: 5rem; }
+.export-period { margin-bottom: 0.9rem; }
+.export-label {
+  display: block;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 0.45rem;
+}
+.period-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.period-chip {
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  font-weight: 500;
+  padding: 0.4rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.04);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.period-chip:hover { color: var(--text); border-color: var(--border-strong); }
+.period-chip.active {
+  color: #041018;
+  background: linear-gradient(135deg, #3d8bfd, #22d3a6);
+  border-color: transparent;
+  font-weight: 600;
+}
+.export-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+.dl-btn {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding: 0.85rem 0.9rem;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.03);
+  color: var(--text);
+  text-decoration: none;
+  transition: border-color 0.15s, background 0.15s, transform 0.1s;
+}
+.dl-btn:hover {
+  border-color: var(--border-strong);
+  background: rgba(61,139,253,0.08);
+}
+.dl-btn:active { transform: scale(0.98); }
+.dl-btn.primary {
+  background: linear-gradient(135deg, rgba(61,139,253,0.18), rgba(34,211,166,0.1));
+  border-color: rgba(61,139,253,0.35);
+}
+.dl-ico {
+  font-size: 1.1rem;
+  line-height: 1.2;
+  opacity: 0.9;
+}
+.dl-btn strong {
+  display: block;
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin-bottom: 0.15rem;
+}
+.dl-btn small {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--faint);
+  line-height: 1.35;
+}
+
+@media (max-width: 720px) {
+  .export-actions { grid-template-columns: 1fr; }
+}
+
 .site-footer {
   display: flex;
   align-items: center;

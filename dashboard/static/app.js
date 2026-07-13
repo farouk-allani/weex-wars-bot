@@ -356,6 +356,7 @@ async function refresh() {
     renderStatList($("pair-list"), m.pair_stats || []);
     updateLogs(logs);
     updateSymbols(bot.symbols || []);
+    await refreshExportInfo();
   } catch (err) {
     console.error(err);
     $("live-text").textContent = "API error";
@@ -382,6 +383,55 @@ if (menuBtn && mobileNav) {
 }
 
 $("refresh-btn").addEventListener("click", refresh);
+
+/* ---------- Export downloads ---------- */
+let exportPeriod = "today";
+
+function setExportPeriod(period) {
+  exportPeriod = period || "today";
+  document.querySelectorAll(".period-chip").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.period === exportPeriod);
+  });
+  const log = $("dl-log");
+  const bundle = $("dl-bundle");
+  if (log) log.href = `/api/export/log?period=${encodeURIComponent(exportPeriod)}`;
+  if (bundle) bundle.href = `/api/export/bundle?period=${encodeURIComponent(exportPeriod)}`;
+  const hint = $("export-hint");
+  if (hint) {
+    hint.innerHTML =
+      "Selected period: <strong>" +
+      exportPeriod +
+      "</strong> · Prefer <strong>Bundle ZIP</strong> when sharing for review.";
+  }
+}
+
+document.querySelectorAll(".period-chip").forEach((btn) => {
+  btn.addEventListener("click", () => setExportPeriod(btn.dataset.period));
+});
+setExportPeriod("today");
+
+async function refreshExportInfo() {
+  try {
+    const info = await fetch("/api/export/info", { cache: "no-store" }).then((r) =>
+      r.json()
+    );
+    const bits = [];
+    if (info.state_exists) bits.push("state " + formatBytes(info.state_size));
+    else bits.push("no state");
+    if (info.log_exists) bits.push("log " + formatBytes(info.log_size));
+    else bits.push("no log");
+    setText("export-meta", bits.join(" · "));
+  } catch {
+    setText("export-meta", "export n/a");
+  }
+}
+
+function formatBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
 
 /* PWA service worker */
 if ("serviceWorker" in navigator) {

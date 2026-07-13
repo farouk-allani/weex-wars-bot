@@ -7,16 +7,18 @@ Run:
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import sys
-from datetime import datetime, timezone
+import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from fastapi import FastAPI, Query, Response
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -455,6 +457,160 @@ def health():
         "state_path": str(st),
         "log_path": str(log),
         "has_trades": bool((state.get("risk") or {}).get("trade_history")),
+    }
+
+
+# ---------- Exports (for iteration / hand logs to AI) ----------
+
+Period = Literal["all", "today", "24h", "7d", "30d"]
+
+_LOG_TS = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*\|"
+)
+
+
+def _period_cutoff(period: str) -> datetime | None:
+    """Naive local timestamps in log file are treated as-is; cutoff uses local now."""
+    now = datetime.now()
+    if period in ("all", "", None):
+        return None
+    if period == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "24h":
+        return now - timedelta(hours=24)
+    if period == "7d":
+        return now - timedelta(days=7)
+    if period == "30d":
+        return now - timedelta(days=30)
+    return None
+
+
+def _filter_log_text(text: str, period: str) -> str:
+    cutoff = _period_cutoff(period)
+    if cutoff is None:
+        return text
+    out: list[str] = []
+    last_kept = False
+    for line in text.splitlines(keepends=True):
+        m = _LOG_TS.match(line)
+        if m:
+            try:
+                ts = datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S")
+                last_kept = ts >= cutoff
+            except ValueError:
+                last_kept = True
+            if last_kept:
+                out.append(line)
+        else:
+            # continuation / plain lines stick to previous decision
+            if last_kept or not out:
+                if last_kept:
+                    out.append(line)
+    return "".join(out) if out else f"# No log lines for period={period}\n"
+
+
+def _export_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+@app.get("/api/export/state")
+def export_state():
+    """Download current bot_state.json."""
+    path = _state_path()
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="bot_state.json not found yet")
+    return FileResponse(
+        path,
+        media_type="application/json",
+        filename=f"bot_state_{_export_stamp()}.json",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/export/log")
+def export_log(period: Period = Query("all", description="all | today | 24h | 7d | 30d")):
+    """Download trading.log (optionally filtered by period)."""
+    path = _log_path()
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="trading.log not found yet")
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    filtered = _filter_log_text(text, period)
+    name = f"trading_{period}_{_export_stamp()}.log"
+    return Response(
+        content=filtered,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{name}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/api/export/bundle")
+def export_bundle(period: Period = Query("7d", description="Log period in the zip")):
+    """ZIP: bot_state.json + filtered trading.log + short README for AI review."""
+    log_path = _log_path()
+    state_path = _state_path()
+    if not log_path.exists() and not state_path.exists():
+        raise HTTPException(status_code=404, detail="No state or log files yet")
+
+    buf = io.BytesIO()
+    stamp = _export_stamp()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if state_path.exists():
+            zf.write(state_path, arcname="bot_state.json")
+        if log_path.exists():
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            filtered = _filter_log_text(text, period)
+            zf.writestr(f"trading_{period}.log", filtered)
+        cfg = load_config()
+        meta = {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "period": period,
+            "mode": cfg.get("trading", {}).get("mode"),
+            "symbols": cfg.get("trading", {}).get("symbols"),
+            "note": "Share this zip for the next bot iteration review.",
+        }
+        zf.writestr("export_meta.json", json.dumps(meta, indent=2))
+        zf.writestr(
+            "README.txt",
+            "WEEX Wars bot export\n"
+            f"period={period}\n"
+            "Files:\n"
+            "  bot_state.json  — trades, risk, account snapshot\n"
+            f"  trading_{period}.log — filtered app log\n"
+            "  export_meta.json — export context\n",
+        )
+    buf.seek(0)
+    filename = f"weex_bot_export_{period}_{stamp}.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/api/export/info")
+def export_info():
+    """Sizes / existence for the download UI."""
+    log_path = _log_path()
+    state_path = _state_path()
+    log_size = log_path.stat().st_size if log_path.exists() else 0
+    state_size = state_path.stat().st_size if state_path.exists() else 0
+    return {
+        "log_exists": log_path.exists(),
+        "state_exists": state_path.exists(),
+        "log_size": log_size,
+        "state_size": state_size,
+        "log_path": str(log_path),
+        "state_path": str(state_path),
+        "periods": ["all", "today", "24h", "7d", "30d"],
     }
 
 

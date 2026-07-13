@@ -62,6 +62,7 @@
     <a href="#sec-positions">Positions</a>
     <a href="#sec-trades">Trades</a>
     <a href="#sec-logs">Logs</a>
+    <a href="#sec-export">Export</a>
   </nav>
 
   <main class="layout">
@@ -250,8 +251,54 @@
         <span class="tag" id="symbols-tag">watching</span>
       </div>
       <div class="symbol-chips" id="symbol-chips"></div>
-      <p class="footer-note">
-        Auto-refresh <strong>5s</strong> · Install as app on mobile (browser menu → Add to Home Screen)
+    </section>
+
+    <!-- Export for next iteration -->
+    <section class="card glass export-card" id="sec-export">
+      <div class="card-head">
+        <div>
+          <h2>Export logs</h2>
+          <p class="card-desc">Download files to review / share for the next improvement pass</p>
+        </div>
+        <span class="tag muted" id="export-meta">—</span>
+      </div>
+
+      <div class="export-period">
+        <span class="export-label">Log period</span>
+        <div class="period-chips" role="group" aria-label="Log period">
+          <button type="button" class="period-chip active" data-period="today">Today</button>
+          <button type="button" class="period-chip" data-period="24h">24h</button>
+          <button type="button" class="period-chip" data-period="7d">7 days</button>
+          <button type="button" class="period-chip" data-period="30d">30 days</button>
+          <button type="button" class="period-chip" data-period="all">All</button>
+        </div>
+      </div>
+
+      <div class="export-actions">
+        <a class="dl-btn primary" id="dl-bundle" href="/api/export/bundle?period=today">
+          <span class="dl-ico">⬇</span>
+          <span>
+            <strong>Bundle ZIP</strong>
+            <small>state + log (best for AI review)</small>
+          </span>
+        </a>
+        <a class="dl-btn" id="dl-log" href="/api/export/log?period=today">
+          <span class="dl-ico">📄</span>
+          <span>
+            <strong>trading.log</strong>
+            <small>filtered by period</small>
+          </span>
+        </a>
+        <a class="dl-btn" id="dl-state" href="/api/export/state">
+          <span class="dl-ico">{ }</span>
+          <span>
+            <strong>bot_state.json</strong>
+            <small>trades, risk, account</small>
+          </span>
+        </a>
+      </div>
+      <p class="footer-note" id="export-hint">
+        Tip: use <strong>Bundle ZIP</strong> and share that file for the next iteration.
       </p>
     </section>
   </main>
