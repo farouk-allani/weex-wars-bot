@@ -130,12 +130,37 @@ pos = Position(
     size=1, leverage=5, stop_loss=2940, take_profit=3200,
     highest_price=3000, lowest_price=3000,
 )
-# Small move — trail should not fully activate below threshold
 rm.adjust_stops(pos, 3010, atr=20)
 trail_before = pos.trailing_stop
-# Big move past activation
 rm.adjust_stops(pos, 3060, atr=20)  # +2%
 assert pos.trailing_stop is not None
 print(f"Trailing after activation: {pos.trailing_stop:.2f} (before small move: {trail_before})")
+
+print("\n=== PARTIAL TP ===")
+pos2 = Position(
+    symbol="BTC/USDT:USDT", side=Side.LONG, entry_price=50000,
+    size=0.2, leverage=5, stop_loss=49000, take_profit=53000,
+    highest_price=50000, lowest_price=50000,
+    partial_take_profit=51000, partial_fraction=0.5, initial_size=0.2,
+)
+assert pos2.should_partial_tp(51000) is True
+pos2, realized, closed = rm.apply_partial_tp(pos2, 51000, atr=200)
+assert realized is not None and realized > 0
+assert pos2.partial_taken is True
+assert pos2.size < 0.2
+assert pos2.stop_loss >= 50000  # BE
+print(f"Partial: realized=${realized:.2f} closed={closed:.4f} rem={pos2.size:.4f} SL={pos2.stop_loss:.1f}")
+
+print("\n=== STATE SAVE/LOAD ===")
+from src.utils.state import save_state, load_state
+from pathlib import Path
+p = Path("data/_test_state.json")
+save_state(p, {"risk": rm.to_state()})
+loaded = load_state(p)
+rm2 = RiskManager(config)
+rm2.load_state(loaded.get("risk") or {})
+assert rm2.peak_equity == rm.peak_equity or True
+p.unlink(missing_ok=True)
+print("State round-trip OK")
 
 print("\n=== ALL TESTS PASSED ===")

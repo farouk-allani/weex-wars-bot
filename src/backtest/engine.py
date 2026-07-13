@@ -115,52 +115,80 @@ class Backtester:
                 position.update_extremes(current_price)
 
                 atr = self._calculate_atr(candles, i, 14)
-                # Mid-bar approx: adjust trail using close (conservative)
-                risk_manager.adjust_stops(position, current_price, atr)
 
-                hit_stop = False
-                hit_tp = False
-                hit_trail = False
-                fill_price = current_price
-                reason = ""
+                # Partial scale-out at 1R
+                if (
+                    risk_manager.partial_tp_enabled
+                    and position.partial_take_profit
+                    and not position.partial_taken
+                ):
+                    hit_p = False
+                    pfill = position.partial_take_profit
+                    if position.side == Side.LONG and current_candle.high >= pfill:
+                        hit_p = True
+                    elif position.side == Side.SHORT and current_candle.low <= pfill:
+                        hit_p = True
+                    if hit_p:
+                        position, realized, closed = risk_manager.apply_partial_tp(
+                            position, pfill, atr
+                        )
+                        if realized is not None:
+                            realized -= closed * pfill * self.commission_rate
+                            capital += realized
+                            risk_manager.daily_pnl += realized
+                            risk_manager.update_strategy_performance(position.strategy, realized)
+                            risk_manager.update_pair_performance(symbol, realized)
+                        if position.size <= 1e-12:
+                            position = None
 
-                if position.side == Side.LONG:
-                    if position.stop_loss > 0 and current_candle.low <= position.stop_loss:
-                        hit_stop = True
-                        fill_price = position.stop_loss
-                        reason = "stop_loss"
-                    elif position.take_profit > 0 and current_candle.high >= position.take_profit:
-                        hit_tp = True
-                        fill_price = position.take_profit
-                        reason = "take_profit"
-                    elif position.trailing_stop and current_candle.low <= position.trailing_stop:
-                        hit_trail = True
-                        fill_price = position.trailing_stop
-                        reason = "trailing_stop"
-                else:
-                    if position.stop_loss > 0 and current_candle.high >= position.stop_loss:
-                        hit_stop = True
-                        fill_price = position.stop_loss
-                        reason = "stop_loss"
-                    elif position.take_profit > 0 and current_candle.low <= position.take_profit:
-                        hit_tp = True
-                        fill_price = position.take_profit
-                        reason = "take_profit"
-                    elif position.trailing_stop and current_candle.high >= position.trailing_stop:
-                        hit_trail = True
-                        fill_price = position.trailing_stop
-                        reason = "trailing_stop"
+                if position:
+                    risk_manager.adjust_stops(position, current_price, atr)
 
-                if hit_stop or hit_tp or hit_trail:
-                    trade = self._close_position(position, fill_price, reason, capital)
-                    trades.append(trade)
-                    capital += trade.pnl
-                    risk_manager.record_trade(trade)
-                    if trade.pnl < 0:
-                        self.strategy.record_loss(current_candle.timestamp)
+                    hit_stop = False
+                    hit_tp = False
+                    hit_trail = False
+                    fill_price = current_price
+                    reason = ""
+
+                    if position.side == Side.LONG:
+                        if position.stop_loss > 0 and current_candle.low <= position.stop_loss:
+                            hit_stop = True
+                            fill_price = position.stop_loss
+                            reason = "stop_loss"
+                        elif position.take_profit > 0 and current_candle.high >= position.take_profit:
+                            hit_tp = True
+                            fill_price = position.take_profit
+                            reason = "take_profit"
+                        elif position.trailing_stop and current_candle.low <= position.trailing_stop:
+                            hit_trail = True
+                            fill_price = position.trailing_stop
+                            reason = "trailing_stop"
                     else:
-                        self.strategy.record_win()
-                    position = None
+                        if position.stop_loss > 0 and current_candle.high >= position.stop_loss:
+                            hit_stop = True
+                            fill_price = position.stop_loss
+                            reason = "stop_loss"
+                        elif position.take_profit > 0 and current_candle.low <= position.take_profit:
+                            hit_tp = True
+                            fill_price = position.take_profit
+                            reason = "take_profit"
+                        elif position.trailing_stop and current_candle.high >= position.trailing_stop:
+                            hit_trail = True
+                            fill_price = position.trailing_stop
+                            reason = "trailing_stop"
+
+                    if hit_stop or hit_tp or hit_trail:
+                        trade = self._close_position(position, fill_price, reason, capital)
+                        trades.append(trade)
+                        capital += trade.pnl
+                        risk_manager.record_trade(
+                            trade, now=current_candle.timestamp
+                        )
+                        if trade.pnl < 0:
+                            self.strategy.record_loss(current_candle.timestamp)
+                        else:
+                            self.strategy.record_win()
+                        position = None
 
             if position is None and i < len(candles) - 1:
                 # Optional competition risk gate
@@ -170,7 +198,9 @@ class Backtester:
                     available_margin = capital
                     balance = capital
 
-                can, _ = risk_manager.can_trade(MockAccount())
+                can, _ = risk_manager.can_trade(
+                    MockAccount(), now=current_candle.timestamp
+                )
                 if can:
                     window = candles[i - lookback + 1 : i + 1]
                     fr = funding_rates[i] if funding_rates else 0.0
@@ -190,6 +220,11 @@ class Backtester:
 
                             sl_delta = signal.stop_loss - signal.entry_price
                             tp_delta = signal.take_profit - signal.entry_price
+                            ptp = None
+                            if signal.partial_take_profit:
+                                ptp = entry_price + (
+                                    signal.partial_take_profit - signal.entry_price
+                                )
 
                             position = Position(
                                 symbol=symbol,
@@ -202,6 +237,9 @@ class Backtester:
                                 highest_price=entry_price,
                                 lowest_price=entry_price,
                                 strategy=signal.strategy,
+                                partial_take_profit=ptp,
+                                partial_fraction=signal.partial_fraction,
+                                initial_size=size,
                             )
                             commission = size * entry_price * self.commission_rate
                             capital -= commission

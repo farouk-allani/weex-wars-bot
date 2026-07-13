@@ -1,38 +1,37 @@
-"""WEEX AI Wars II — Composite Strategy v8.3
+"""WEEX AI Wars II — Composite Strategy v8.4
 
-90d diagnose:
-- momentum_breakout: false breaks → disabled by default
-- late trend entries: only deep pullbacks (≤0.55 ATR from EMA)
-- fees eat micro targets → wider stops, mid-band MR targets
-- crypto beta: optional HTF long-bias (skip shorts when 4h bullish)
-
-Modes:
-1. trend_pullback (deep pullback only)
-2. mean_reversion / range_fade
-3. keepalive (SOL, tiny)
+Improvements over v8.3:
+- Volume confirmation on mean-reversion
+- Session quality scales strength (EU/US > Asia)
+- Adaptive strategy strength via risk manager feedback hook
+- Partial TP (1R) baked into signals for scale-out
+- Z-score stretch filter (avoid weak band tags)
+- BTC preferred sizing, ETH stricter filters
 """
 
 import numpy as np
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+from typing import Optional
 
-from ..core.models import Candle, Signal, Side, MarketRegime
+from ..core.models import Candle, Signal, Side
 from ..indicators.technical import (
     calculate_rsi, calculate_macd, calculate_bollinger_bands,
     calculate_atr, calculate_adx, calculate_ema, calculate_vwap,
-    detect_regime, calculate_stochastic_rsi,
+    calculate_stochastic_rsi,
 )
 from .edges import EdgeStrategies
 
 
 ATR_PROFILES = {
-    "BTC": {"stop": 1.4, "target": 2.4, "breakeven": 0.85},
-    "ETH": {"stop": 1.5, "target": 2.5, "breakeven": 0.9},
-    "SOL": {"stop": 1.7, "target": 2.8, "breakeven": 1.0},
+    "BTC": {"stop": 1.35, "target": 2.5, "breakeven": 0.8},
+    "ETH": {"stop": 1.45, "target": 2.4, "breakeven": 0.85},
+    "SOL": {"stop": 1.65, "target": 2.7, "breakeven": 0.95},
 }
-DEFAULT_PROFILE = {"stop": 1.5, "target": 2.5, "breakeven": 0.9}
+DEFAULT_PROFILE = {"stop": 1.45, "target": 2.5, "breakeven": 0.85}
 
 KEEPALIVE_STOP = 1.0
-KEEPALIVE_TARGET = 1.8
+KEEPALIVE_TARGET = 1.7
 
 
 class CompositeStrategy:
@@ -47,19 +46,35 @@ class CompositeStrategy:
         self.consecutive_losses = 0
         self.circuit_breaker_until = None
         self.last_trade_time: dict[str, datetime] = {}
+        self.last_any_trade_time: Optional[datetime] = None
         self.mandatory_interval = timedelta(
-            hours=self.ka_config.get("interval_hours", 8)
+            hours=self.ka_config.get("interval_hours", 12)
         )
         self.keepalive_symbol = self.ka_config.get("symbol_base", "SOL")
+        self._ka_max_per_week = int(self.ka_config.get("max_per_week", 3))
+        self._ka_timestamps: list[datetime] = []
 
         comp = config.get("competition", {})
         self._min_edges = int(comp.get("min_edges", 1))
         self._allow_asia_mr = bool(comp.get("allow_asia_mr", True))
-        self._min_rr = float(comp.get("min_rr", 1.4))
+        self._min_rr = float(comp.get("min_rr", 1.35))
         self._skip_asia_trend = bool(comp.get("skip_asia_trend", True))
-        # When 4h bullish, skip shorts (and vice versa if short_bias)
         self._htf_bias = bool(comp.get("htf_directional_bias", True))
         self._long_only = bool(comp.get("long_only", False))
+        self._use_partial_tp = bool(comp.get("partial_tp", True))
+
+        # Adaptive: strategy name -> recent pnls (fed by engine/risk)
+        self._strategy_scores: dict[str, float] = defaultdict(lambda: 1.0)
+
+    def set_strategy_score(self, strategy: str, score: float):
+        self._strategy_scores[strategy] = max(0.5, min(1.35, score))
+
+    def sync_scores_from_risk(self, risk_manager):
+        if not risk_manager:
+            return
+        for name in ("mean_reversion", "trend_pullback", "keepalive_vwap",
+                     "keepalive_bb", "momentum_breakout"):
+            self._strategy_scores[name] = risk_manager.get_strategy_weight(name)
 
     def analyze(
         self,
@@ -74,9 +89,8 @@ class CompositeStrategy:
 
         candle_time = candles[-1].timestamp
         htf_dir = self._htf_direction(higher_tf_candles)
-
         base = symbol.split("/")[0]
-        # Global trend flag OR per-pair allowlist (SOL pullbacks tested green)
+
         trend_pairs = set(self.tf_config.get("enabled_pairs", []) or [])
         trend_on = self.tf_config.get("enabled", True) or base in trend_pairs
         if trend_on:
@@ -85,8 +99,8 @@ class CompositeStrategy:
                 higher_tf_candles, htf_dir,
             )
             if signal and self._passes_bias(signal, htf_dir):
-                self.last_trade_time[symbol] = candle_time
-                return signal
+                self._mark_trade(symbol, candle_time)
+                return self._finalize(signal, candle_time)
 
         if self.bo_config.get("enabled", False):
             signal = self._momentum_breakout(
@@ -94,8 +108,8 @@ class CompositeStrategy:
                 higher_tf_candles, htf_dir,
             )
             if signal and self._passes_bias(signal, htf_dir):
-                self.last_trade_time[symbol] = candle_time
-                return signal
+                self._mark_trade(symbol, candle_time)
+                return self._finalize(signal, candle_time)
 
         if self.mr_config.get("enabled", True):
             signal = self._mean_reversion(
@@ -103,16 +117,58 @@ class CompositeStrategy:
                 higher_tf_candles, htf_dir,
             )
             if signal and self._passes_bias(signal, htf_dir):
-                self.last_trade_time[symbol] = candle_time
-                return signal
+                self._mark_trade(symbol, candle_time)
+                return self._finalize(signal, candle_time)
 
         if self._needs_keepalive(candle_time, symbol):
             signal = self._keepalive_vwap(symbol, candles, existing_positions, htf_dir)
             if signal and self._passes_bias(signal, htf_dir):
-                self.last_trade_time[symbol] = candle_time
-                return signal
+                self._mark_trade(symbol, candle_time)
+                self._ka_timestamps.append(candle_time)
+                return self._finalize(signal, candle_time)
 
         return None
+
+    def _mark_trade(self, symbol: str, candle_time):
+        self.last_trade_time[symbol] = candle_time
+        self.last_any_trade_time = candle_time
+
+    def _finalize(self, signal: Signal, candle_time) -> Signal:
+        # Adaptive strength
+        score = self._strategy_scores.get(signal.strategy, 1.0)
+        signal.strength = min(1.0, max(0.05, signal.strength * score))
+
+        # Session quality
+        sess = self._session_mult(candle_time)
+        signal.strength = min(1.0, signal.strength * sess)
+
+        # Partial TP at ~1R
+        if self._use_partial_tp and signal.stop_loss > 0:
+            risk = abs(signal.entry_price - signal.stop_loss)
+            if signal.side == Side.LONG:
+                ptp = signal.entry_price + risk * 1.0
+                # Don't set partial beyond full TP
+                if ptp < signal.take_profit:
+                    signal.partial_take_profit = ptp
+                    signal.partial_fraction = 0.5
+            else:
+                ptp = signal.entry_price - risk * 1.0
+                if ptp > signal.take_profit:
+                    signal.partial_take_profit = ptp
+                    signal.partial_fraction = 0.5
+        return signal
+
+    def _session_mult(self, t) -> float:
+        if t is None:
+            return 1.0
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        h = t.hour
+        if 13 <= h <= 16:
+            return 1.12
+        if 8 <= h <= 21:
+            return 1.0
+        return 0.85  # Asia — smaller
 
     def _htf_direction(self, higher_tf_candles) -> str:
         if not higher_tf_candles or len(higher_tf_candles) < 55:
@@ -141,17 +197,21 @@ class CompositeStrategy:
         return True
 
     def _needs_keepalive(self, candle_time, symbol):
+        """Only force activity if NOTHING traded recently across the book."""
         if not self.ka_config.get("enabled", True):
             return False
         base = symbol.split("/")[0]
         if base != self.keepalive_symbol:
             return False
-        last = self.last_trade_time.get(symbol)
+        # Weekly cap — keep-alive is a tax, not an edge
+        week_ago = candle_time - timedelta(days=7)
+        recent = [t for t in self._ka_timestamps if t >= week_ago]
+        self._ka_timestamps = recent
+        if len(recent) >= self._ka_max_per_week:
+            return False
+        last = self.last_any_trade_time
         if last is None:
-            for k, v in self.last_trade_time.items():
-                if k.startswith(self.keepalive_symbol):
-                    last = v
-                    break
+            last = self.last_trade_time.get(symbol)
         if last is None:
             return True
         return (candle_time - last) >= self.mandatory_interval
@@ -177,6 +237,7 @@ class CompositeStrategy:
         closes = np.array([c.close for c in candles], dtype=float)
         highs = np.array([c.high for c in candles], dtype=float)
         lows = np.array([c.low for c in candles], dtype=float)
+        volumes = np.array([c.volume for c in candles], dtype=float)
         candle_time = candles[-1].timestamp
 
         if self._skip_asia_trend and self._is_asia_session(candle_time):
@@ -225,21 +286,20 @@ class CompositeStrategy:
         lev = self.config.get("trading", {}).get("default_leverage", 5)
         max_ext = float(self.tf_config.get("max_extension_atr", 0.55))
         dist = (price - ema_val) / atr_v
+        avg_vol = float(np.mean(volumes[-20:]))
+        vol_ok = volumes[-1] >= avg_vol * 0.75
 
         if bullish:
-            # Deep pullback toward EMA, then reclaim
             near = -0.35 <= dist <= max_ext
             reclaim = closes[-1] > closes[-2] and price >= ema_val * 0.997
             macd_ok = macd_hist[-1] >= macd_hist[-2]
             stoch_ok = stoch_k[-1] > stoch_d[-1] or stoch_k[-1] > stoch_k[-2]
             rsi_ok = 32 < rsi[-1] < 58
-            if not (near and reclaim and macd_ok and stoch_ok and rsi_ok):
+            if not (near and reclaim and macd_ok and stoch_ok and rsi_ok and vol_ok):
                 return None
             stop = min(price - atr_v * profile["stop"], ema_val - atr_v * 0.5)
             target = price + atr_v * profile["target"]
-            strength = 0.7 + (0.12 if adx[-1] > 30 else 0)
-            if htf_dir == "long":
-                strength += 0.08
+            strength = 0.7 + (0.1 if adx[-1] > 30 else 0) + (0.08 if htf_dir == "long" else 0)
             signal = Signal(
                 symbol=symbol, side=Side.LONG, strength=min(1.0, strength * mult),
                 strategy="trend_pullback", entry_price=price,
@@ -252,13 +312,11 @@ class CompositeStrategy:
             macd_ok = macd_hist[-1] <= macd_hist[-2]
             stoch_ok = stoch_k[-1] < stoch_d[-1] or stoch_k[-1] < stoch_k[-2]
             rsi_ok = 42 < rsi[-1] < 68
-            if not (near and reclaim and macd_ok and stoch_ok and rsi_ok):
+            if not (near and reclaim and macd_ok and stoch_ok and rsi_ok and vol_ok):
                 return None
             stop = max(price + atr_v * profile["stop"], ema_val + atr_v * 0.5)
             target = price - atr_v * profile["target"]
-            strength = 0.7 + (0.12 if adx[-1] > 30 else 0)
-            if htf_dir == "short":
-                strength += 0.08
+            strength = 0.7 + (0.1 if adx[-1] > 30 else 0) + (0.08 if htf_dir == "short" else 0)
             signal = Signal(
                 symbol=symbol, side=Side.SHORT, strength=min(1.0, strength * mult),
                 strategy="trend_pullback", entry_price=price,
@@ -274,7 +332,7 @@ class CompositeStrategy:
             return None
         return signal if signal.strength >= 0.5 else None
 
-    # ---- Breakout (optional, off by default) ----
+    # ---- Breakout (off by default) ----
 
     def _momentum_breakout(
         self, symbol, candles, funding_rate, existing_positions,
@@ -314,7 +372,7 @@ class CompositeStrategy:
         ema_21 = calculate_ema(closes, 21)
         ema_50 = calculate_ema(closes, 50)
         lev = self.config.get("trading", {}).get("default_leverage", 5)
-        mult, direction = self.edges.get_combined_modifier(
+        mult, _ = self.edges.get_combined_modifier(
             self.edges.analyze_all_edges(candles, funding_rate, higher_tf_candles)
         )
         crowded = self.edges.funding_crowded
@@ -332,8 +390,7 @@ class CompositeStrategy:
                 strategy="momentum_breakout", entry_price=price,
                 stop_loss=price - atr_v * profile["stop"],
                 take_profit=price + atr_v * profile["target"],
-                leverage=lev,
-                reason=f"Breakout LONG ADX={adx[-1]:.0f}",
+                leverage=lev, reason=f"Breakout LONG ADX={adx[-1]:.0f}",
             )
         if (
             price < prior_low
@@ -348,12 +405,11 @@ class CompositeStrategy:
                 strategy="momentum_breakout", entry_price=price,
                 stop_loss=price + atr_v * profile["stop"],
                 take_profit=price - atr_v * profile["target"],
-                leverage=lev,
-                reason=f"Breakout SHORT ADX={adx[-1]:.0f}",
+                leverage=lev, reason=f"Breakout SHORT ADX={adx[-1]:.0f}",
             )
         return None
 
-    # ---- Mean reversion / range fade ----
+    # ---- Mean reversion (primary edge) ----
 
     def _mean_reversion(
         self, symbol, candles, funding_rate, existing_positions,
@@ -362,6 +418,7 @@ class CompositeStrategy:
         closes = np.array([c.close for c in candles], dtype=float)
         highs = np.array([c.high for c in candles], dtype=float)
         lows = np.array([c.low for c in candles], dtype=float)
+        volumes = np.array([c.volume for c in candles], dtype=float)
         candle_time = candles[-1].timestamp
 
         if self._is_asia_session(candle_time) and not self._allow_asia_mr:
@@ -370,7 +427,6 @@ class CompositeStrategy:
             return None
 
         adx = calculate_adx(highs, lows, closes, 14)
-        # Prefer ranging; allow mild trend extremes only
         max_adx = float(self.mr_config.get("max_adx", 30))
         if adx[-1] > max_adx:
             return None
@@ -380,9 +436,17 @@ class CompositeStrategy:
                 if ps == symbol:
                     return None
 
+        base = symbol.split("/")[0]
+        # ETH: stricter — require stronger extreme
         rsi_period = self.mr_config.get("rsi_period", 10)
-        ob = self.mr_config.get("rsi_overbought", 70)
-        os_ = self.mr_config.get("rsi_oversold", 30)
+        ob = self.mr_config.get("rsi_overbought", 68)
+        os_ = self.mr_config.get("rsi_oversold", 32)
+        if base == "ETH":
+            ob = min(ob, 66)
+            os_ = max(os_, 34)
+            if adx[-1] > max_adx - 4:
+                return None
+
         bb_period = self.mr_config.get("bb_period", 20)
         bb_std = self.mr_config.get("bb_std", 2.0)
 
@@ -395,59 +459,80 @@ class CompositeStrategy:
         if atr_v <= 0 or np.isnan(bb_l[-1]) or np.isnan(bb_m[-1]):
             return None
 
-        base = symbol.split("/")[0]
+        # Z-score stretch: how many std from mid
+        band_half = float(bb_u[-1] - bb_m[-1])
+        if band_half <= 0:
+            return None
+        z = (price - float(bb_m[-1])) / band_half  # ~±1 at bands
+        min_stretch = float(self.mr_config.get("min_z", 0.92))
+
+        avg_vol = float(np.mean(volumes[-20:]))
+        vol_ratio = float(volumes[-1] / avg_vol) if avg_vol > 0 else 1.0
+        # Avoid ultra-dead prints; prefer some participation
+        if vol_ratio < float(self.mr_config.get("min_volume_ratio", 0.7)):
+            return None
+
         profile = ATR_PROFILES.get(base, DEFAULT_PROFILE)
         lev = self.config.get("trading", {}).get("default_leverage", 5)
-        strength = float(self.mr_config.get("strength", 0.65))
-        # Pair quality: ETH mean-reversion underperformed in 90d — size down
-        pair_mult = {"BTC": 1.0, "ETH": 0.55, "SOL": 0.85}.get(base, 0.8)
+        strength = float(self.mr_config.get("strength", 0.72))
+        pair_mult = {"BTC": 1.15, "ETH": 0.5, "SOL": 0.9}.get(base, 0.8)
         strength *= pair_mult
+        # Stronger stretch → higher confidence
+        strength *= min(1.15, 0.9 + abs(z) * 0.15)
 
-        # LONG fade: lower band + oversold + turn up
+        # Reject if funding very crowded against us
+        crowded = self.edges.funding_crowded
+        if funding_rate > crowded * 1.5 and z < 0:
+            pass  # long fade while longs crowded is OK (contrarian)
+        if funding_rate < -crowded * 1.5 and z > 0:
+            pass
+
+        # LONG
         if (
-            price <= float(bb_l[-1]) * 1.004
+            z <= -min_stretch
+            and price <= float(bb_l[-1]) * 1.006
             and rsi[-1] <= os_
             and rsi[-1] > rsi[-2]
             and closes[-1] > closes[-2]
             and (stoch_k[-1] > stoch_d[-1] or stoch_k[-1] > stoch_k[-2])
         ):
-            stop = min(float(bb_l[-1]) - atr_v * 0.35, price - atr_v * profile["stop"])
+            stop = min(float(bb_l[-1]) - atr_v * 0.4, price - atr_v * profile["stop"])
             target = float(bb_m[-1])
             if target <= price:
-                target = price + atr_v * 1.6
-            max_tp = price + atr_v * profile["target"]
-            target = min(target, max_tp)
+                target = price + atr_v * 1.7
+            target = min(target, price + atr_v * profile["target"])
             if abs(target - price) / max(abs(price - stop), 1e-9) < self._min_rr:
                 return None
             return Signal(
-                symbol=symbol, side=Side.LONG, strength=strength,
+                symbol=symbol, side=Side.LONG, strength=min(1.0, strength),
                 strategy="mean_reversion",
                 entry_price=price, stop_loss=stop, take_profit=target,
                 leverage=lev,
-                reason=f"MR LONG RSI={rsi[-1]:.0f} ADX={adx[-1]:.0f}",
+                reason=f"MR LONG z={z:.2f} RSI={rsi[-1]:.0f} ADX={adx[-1]:.0f} vol={vol_ratio:.1f}x",
             )
 
+        # SHORT
         if (
-            price >= float(bb_u[-1]) * 0.996
+            z >= min_stretch
+            and price >= float(bb_u[-1]) * 0.994
             and rsi[-1] >= ob
             and rsi[-1] < rsi[-2]
             and closes[-1] < closes[-2]
             and (stoch_k[-1] < stoch_d[-1] or stoch_k[-1] < stoch_k[-2])
         ):
-            stop = max(float(bb_u[-1]) + atr_v * 0.35, price + atr_v * profile["stop"])
+            stop = max(float(bb_u[-1]) + atr_v * 0.4, price + atr_v * profile["stop"])
             target = float(bb_m[-1])
             if target >= price:
-                target = price - atr_v * 1.6
-            min_tp = price - atr_v * profile["target"]
-            target = max(target, min_tp)
+                target = price - atr_v * 1.7
+            target = max(target, price - atr_v * profile["target"])
             if abs(price - target) / max(abs(stop - price), 1e-9) < self._min_rr:
                 return None
             return Signal(
-                symbol=symbol, side=Side.SHORT, strength=strength,
+                symbol=symbol, side=Side.SHORT, strength=min(1.0, strength),
                 strategy="mean_reversion",
                 entry_price=price, stop_loss=stop, take_profit=target,
                 leverage=lev,
-                reason=f"MR SHORT RSI={rsi[-1]:.0f} ADX={adx[-1]:.0f}",
+                reason=f"MR SHORT z={z:.2f} RSI={rsi[-1]:.0f} ADX={adx[-1]:.0f} vol={vol_ratio:.1f}x",
             )
 
         return None
@@ -475,7 +560,6 @@ class CompositeStrategy:
         ema_21 = calculate_ema(closes, 21)
         is_bullish = ema_9[-1] > ema_21[-1]
         is_bearish = ema_9[-1] < ema_21[-1]
-        # Prefer HTF direction for keep-alive
         if htf_dir == "long":
             is_bearish = False
         elif htf_dir == "short":
@@ -498,8 +582,8 @@ class CompositeStrategy:
         lev = self.config.get("trading", {}).get("default_leverage", 5)
         ka_strength = float(self.ka_config.get("strength", 0.10))
 
-        if is_bullish and 0 <= (price - vwap_val) / atr_v <= 0.9:
-            if closes[-1] > closes[-2] and 35 < rsi[-1] < 60:
+        if is_bullish and 0 <= (price - vwap_val) / atr_v <= 0.85:
+            if closes[-1] > closes[-2] and 35 < rsi[-1] < 58:
                 return Signal(
                     symbol=symbol, side=Side.LONG, strength=ka_strength,
                     strategy="keepalive_vwap", entry_price=price,
@@ -507,8 +591,8 @@ class CompositeStrategy:
                     take_profit=price + atr_v * KEEPALIVE_TARGET,
                     leverage=lev, reason=f"KA LONG ADX={adx[-1]:.0f}",
                 )
-        if is_bearish and 0 <= (vwap_val - price) / atr_v <= 0.9:
-            if closes[-1] < closes[-2] and 40 < rsi[-1] < 65:
+        if is_bearish and 0 <= (vwap_val - price) / atr_v <= 0.85:
+            if closes[-1] < closes[-2] and 42 < rsi[-1] < 65:
                 return Signal(
                     symbol=symbol, side=Side.SHORT, strength=ka_strength,
                     strategy="keepalive_vwap", entry_price=price,
@@ -519,7 +603,7 @@ class CompositeStrategy:
 
         bb_u, _, bb_l = calculate_bollinger_bands(closes, 20, 1.8)
         bb_s = max(0.07, ka_strength * 0.7)
-        if is_bullish and price <= float(bb_l[-1]) * 1.004 and rsi[-1] < 42:
+        if is_bullish and price <= float(bb_l[-1]) * 1.004 and rsi[-1] < 40:
             return Signal(
                 symbol=symbol, side=Side.LONG, strength=bb_s,
                 strategy="keepalive_bb", entry_price=price,
@@ -527,7 +611,7 @@ class CompositeStrategy:
                 take_profit=price + atr_v * KEEPALIVE_TARGET,
                 leverage=lev, reason="KA BB LONG",
             )
-        if is_bearish and price >= float(bb_u[-1]) * 0.996 and rsi[-1] > 58:
+        if is_bearish and price >= float(bb_u[-1]) * 0.996 and rsi[-1] > 60:
             return Signal(
                 symbol=symbol, side=Side.SHORT, strength=bb_s,
                 strategy="keepalive_bb", entry_price=price,

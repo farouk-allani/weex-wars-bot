@@ -1,23 +1,19 @@
-"""WEEX AI Wars II — Risk Management Engine v8
+"""WEEX AI Wars II — Risk Management Engine v8.4
 
-Improvements:
-1. Signal.strength scales position size (keep-alive stays small)
-2. Trailing stop only activates after configured profit threshold
-3. Win-streak cooldown disabled by default (competition mode)
-4. Safer zero-stop handling
-5. Dynamic pair weights from recent Sharpe
+- Strength + pair + strategy adaptive sizing
+- Partial take-profit support
+- State serialize/restore for restarts
+- Strategy-level performance weights
 """
 
 import numpy as np
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Optional, Any
 
 from ..core.models import Signal, Side, Position, AccountState, TradeResult
 
 
 class RiskManager:
-    """Multi-layered risk management for competition trading."""
-
     def __init__(self, config: dict):
         risk_config = config.get("risk", {})
         self.max_risk_per_trade = risk_config.get("max_risk_per_trade", 0.015)
@@ -25,14 +21,17 @@ class RiskManager:
         self.max_open_positions = risk_config.get("max_open_positions", 2)
         self.cooldown_after_losses = risk_config.get("cooldown_after_losses", 3)
         self.max_consecutive_losses = risk_config.get("max_consecutive_losses", 3)
+        # Time-based cooldown (hours) — avoids deadlock of "need trades to resume"
+        self.cooldown_hours = float(risk_config.get("cooldown_hours", 6))
         self.daily_loss_limit = risk_config.get("daily_loss_limit", 0.03)
         self.trailing_stop_activation = risk_config.get("trailing_stop_activation", 0.012)
         self.trailing_stop_distance = risk_config.get("trailing_stop_distance", 0.006)
         self.chandelier_atr_mult = risk_config.get("chandelier_atr_mult", 2.5)
-        # Competition: do not pause winners unless explicitly enabled
         self.win_streak_cooldown = risk_config.get("win_streak_cooldown", False)
         self.max_consecutive_wins = risk_config.get("max_consecutive_wins", 8)
         self.cooldown_after_wins = risk_config.get("cooldown_after_wins", 1)
+        self.partial_tp_enabled = risk_config.get("partial_tp_enabled", True)
+        self.partial_be_buffer_atr = risk_config.get("partial_be_buffer_atr", 0.1)
 
         sizing_config = config.get("sizing", {})
         self.sizing_method = sizing_config.get("method", "half_kelly")
@@ -42,6 +41,7 @@ class RiskManager:
 
         self.pair_weights: dict[str, float] = {}
         self.pair_sharpes: dict[str, list[float]] = {}
+        self.strategy_pnls: dict[str, list[float]] = {}
 
         self.peak_equity = 0.0
         self.consecutive_losses = 0
@@ -52,9 +52,15 @@ class RiskManager:
         self.daily_reset_date = datetime.utcnow().date()
         self.trade_history: list[TradeResult] = []
         self.is_killed = False
+        self.cooldown_until: Optional[datetime] = None
 
-    def can_trade(self, account: AccountState) -> tuple[bool, str]:
-        today = datetime.utcnow().date()
+    def can_trade(
+        self,
+        account: AccountState,
+        now: Optional[datetime] = None,
+    ) -> tuple[bool, str]:
+        now = now or datetime.utcnow()
+        today = now.date() if hasattr(now, "date") else datetime.utcnow().date()
         if today != self.daily_reset_date:
             self.daily_pnl = 0.0
             self.daily_reset_date = today
@@ -76,13 +82,11 @@ class RiskManager:
             if self.daily_pnl < 0 and daily_loss_pct >= self.daily_loss_limit:
                 return False, f"Daily loss limit reached: {daily_loss_pct:.1%}"
 
-        if self.consecutive_losses >= self.max_consecutive_losses:
-            if self.trades_since_loss < self.cooldown_after_losses:
-                return (
-                    False,
-                    f"Cooldown: {self.trades_since_loss}/{self.cooldown_after_losses} "
-                    f"after {self.consecutive_losses} losses",
-                )
+        # Time-based loss cooldown (fixed deadlock: old logic needed wins to resume)
+        if self.cooldown_until is not None:
+            if now < self.cooldown_until:
+                return False, f"Loss cooldown until {self.cooldown_until.isoformat()}"
+            self.cooldown_until = None
             self.consecutive_losses = 0
 
         if self.win_streak_cooldown and self.consecutive_wins >= self.max_consecutive_wins:
@@ -98,6 +102,23 @@ class RiskManager:
 
         return True, "OK"
 
+    def get_strategy_weight(self, strategy: str) -> float:
+        """Adaptive weight 0.5–1.4 from recent strategy PnL."""
+        if not strategy or strategy not in self.strategy_pnls:
+            return 1.0
+        pnls = self.strategy_pnls[strategy]
+        if len(pnls) < 3:
+            return 1.0
+        recent = pnls[-12:]
+        total = sum(recent)
+        wins = sum(1 for p in recent if p > 0)
+        wr = wins / len(recent)
+        if total > 0 and wr >= 0.5:
+            return min(1.4, 1.0 + total / (abs(total) + 50) * 0.5)
+        if total < 0 and wr < 0.4:
+            return max(0.5, 0.75 + wr * 0.3)
+        return 1.0
+
     def calculate_position_size(
         self,
         signal: Signal,
@@ -107,9 +128,15 @@ class RiskManager:
         if account.available_margin <= 0 or account.equity <= 0:
             return 0
 
-        # Strength scales risk (keep-alive ~0.1–0.2 → small size)
         strength = max(0.05, min(1.0, signal.strength if signal.strength else 0.5))
-        risk_amount = account.equity * self.max_risk_per_trade * strength * pair_weight
+        strat_w = self.get_strategy_weight(signal.strategy)
+        risk_amount = (
+            account.equity
+            * self.max_risk_per_trade
+            * strength
+            * pair_weight
+            * strat_w
+        )
 
         stop_distance_usd = abs(signal.entry_price - signal.stop_loss)
         if stop_distance_usd <= 0:
@@ -118,11 +145,13 @@ class RiskManager:
         amount = risk_amount / stop_distance_usd
 
         if self.sizing_method == "half_kelly":
-            win_rate = self._estimate_win_rate()
+            win_rate = self._estimate_win_rate(signal.strategy)
             kelly = self._half_kelly(win_rate, signal.risk_reward_ratio)
             amount *= kelly
 
-        max_amount = (account.equity * self.max_position_pct * strength) / signal.entry_price
+        max_amount = (
+            account.equity * self.max_position_pct * strength * strat_w
+        ) / signal.entry_price
         amount = min(amount, max_amount)
 
         max_margin_amount = (
@@ -135,40 +164,84 @@ class RiskManager:
 
         return amount
 
+    def apply_partial_tp(
+        self,
+        position: Position,
+        current_price: float,
+        atr: float = 0.0,
+    ) -> tuple[Position, Optional[float], float]:
+        """
+        If partial TP hit, reduce size and bank PnL on closed fraction.
+        Returns (position, realized_pnl_or_None, closed_size).
+        """
+        if not self.partial_tp_enabled or not position.should_partial_tp(current_price):
+            return position, None, 0.0
+
+        frac = max(0.1, min(0.8, position.partial_fraction or 0.5))
+        base_size = position.initial_size or position.size
+        close_size = base_size * frac
+        if close_size <= 0 or close_size >= position.size:
+            close_size = position.size * frac
+
+        # Realized on closed slice
+        if position.side == Side.LONG:
+            realized = (current_price - position.entry_price) * close_size
+        else:
+            realized = (position.entry_price - current_price) * close_size
+
+        position.size = max(0.0, position.size - close_size)
+        position.partial_taken = True
+
+        # Move stop to breakeven (+ tiny buffer)
+        buf = (atr or position.entry_price * 0.001) * self.partial_be_buffer_atr
+        if position.side == Side.LONG:
+            be = position.entry_price + buf
+            if position.stop_loss < be:
+                position.stop_loss = be
+        else:
+            be = position.entry_price - buf
+            if position.stop_loss <= 0 or position.stop_loss > be:
+                position.stop_loss = be
+
+        return position, realized, close_size
+
     def adjust_stops(
         self,
         position: Position,
         current_price: float,
         atr: float,
     ) -> Position:
-        """Breakeven + activation-gated chandelier trailing stop."""
         position.update_extremes(current_price)
         atr = atr if atr and atr > 0 else current_price * 0.01
 
-        # Profit as fraction of entry (not leveraged)
         if position.side == Side.LONG:
             profit_pct = (current_price - position.entry_price) / position.entry_price
         else:
             profit_pct = (position.entry_price - current_price) / position.entry_price
 
-        risk = abs(position.entry_price - position.stop_loss) if position.stop_loss > 0 else atr * 1.5
+        risk = (
+            abs(position.entry_price - position.stop_loss)
+            if position.stop_loss > 0
+            else atr * 1.5
+        )
 
-        # Breakeven once 1R in profit
+        # Faster BE after partial taken
+        be_trigger = 0.7 if position.partial_taken else 1.0
         if position.side == Side.LONG:
-            if current_price >= position.entry_price + risk * 1.0:
-                be = position.entry_price + atr * 0.15
+            if current_price >= position.entry_price + risk * be_trigger:
+                be = position.entry_price + atr * 0.12
                 if position.stop_loss <= 0 or position.stop_loss < be:
                     position.stop_loss = be
         else:
-            if current_price <= position.entry_price - risk * 1.0:
-                be = position.entry_price - atr * 0.15
+            if current_price <= position.entry_price - risk * be_trigger:
+                be = position.entry_price - atr * 0.12
                 if position.stop_loss <= 0 or position.stop_loss > be:
                     position.stop_loss = be
 
-        # Trailing only after activation threshold
-        if profit_pct >= self.trailing_stop_activation:
+        # Earlier trail activation after partial
+        act = self.trailing_stop_activation * (0.7 if position.partial_taken else 1.0)
+        if profit_pct >= act:
             if position.side == Side.LONG:
-                # Prefer ATR chandelier; also respect fixed distance floor
                 chandelier = position.highest_price - atr * self.chandelier_atr_mult
                 pct_trail = current_price * (1 - self.trailing_stop_distance)
                 trail = max(chandelier, pct_trail)
@@ -194,33 +267,58 @@ class RiskManager:
         if len(self.pair_sharpes[symbol]) > 20:
             self.pair_sharpes[symbol] = self.pair_sharpes[symbol][-20:]
 
+    def update_strategy_performance(self, strategy: str, pnl: float):
+        if not strategy:
+            return
+        if strategy not in self.strategy_pnls:
+            self.strategy_pnls[strategy] = []
+        self.strategy_pnls[strategy].append(pnl)
+        if len(self.strategy_pnls[strategy]) > 30:
+            self.strategy_pnls[strategy] = self.strategy_pnls[strategy][-30:]
+
     def get_pair_weight(self, symbol: str) -> float:
-        if symbol not in self.pair_sharpes or len(self.pair_sharpes[symbol]) < 5:
-            return 1.0
+        base = symbol.split("/")[0] if "/" in symbol else symbol
+        # Prior from backtests until enough live samples
+        prior = {"BTC": 1.15, "ETH": 0.6, "SOL": 0.9}.get(base, 1.0)
+
+        if symbol not in self.pair_sharpes or len(self.pair_sharpes[symbol]) < 4:
+            return prior
         pnls = np.array(self.pair_sharpes[symbol])
         if np.std(pnls) == 0:
-            return 1.0
+            return prior
         sharpe = float(np.mean(pnls) / np.std(pnls))
         if sharpe > 1.0:
-            return min(1.8, 1.0 + sharpe * 0.4)
+            return min(1.9, prior * (1.0 + sharpe * 0.25))
         if sharpe < 0:
-            return max(0.45, 1.0 + sharpe * 0.35)
-        return 1.0
+            return max(0.35, prior * (0.7 + sharpe * 0.15))
+        return prior
 
-    def record_trade(self, result: TradeResult):
+    def record_trade(self, result: TradeResult, now: Optional[datetime] = None):
         self.trade_history.append(result)
         self.update_pair_performance(result.symbol, result.pnl)
+        self.update_strategy_performance(result.strategy, result.pnl)
+        now = now or datetime.utcnow()
+
+        is_keepalive = (result.strategy or "").startswith("keepalive")
 
         if result.pnl < 0:
-            self.consecutive_losses += 1
-            self.consecutive_wins = 0
-            self.trades_since_loss = 0
-            self.trades_since_win += 1
+            # Keep-alive losses should not trigger full portfolio cooldown
+            if not is_keepalive:
+                self.consecutive_losses += 1
+                self.consecutive_wins = 0
+                self.trades_since_loss = 0
+                self.trades_since_win += 1
+                if self.consecutive_losses >= self.max_consecutive_losses:
+                    self.cooldown_until = now + timedelta(hours=self.cooldown_hours)
+                    self.consecutive_losses = 0
+            else:
+                self.trades_since_win += 1
         else:
             self.consecutive_wins += 1
             self.consecutive_losses = 0
             self.trades_since_win = 0
             self.trades_since_loss += 1
+            self.cooldown_until = None
 
         self.daily_pnl += result.pnl
 
@@ -233,6 +331,7 @@ class RiskManager:
                 "consecutive_wins": self.consecutive_wins,
                 "total_pnl": 0, "wins": 0, "losses": 0,
                 "daily_pnl": self.daily_pnl, "pair_stats": {},
+                "strategy_stats": {},
             }
 
         pnls = [t.pnl for t in self.trade_history]
@@ -264,6 +363,14 @@ class RiskManager:
                     "weight": self.get_pair_weight(symbol),
                 }
 
+        strategy_stats = {}
+        for name, sp in self.strategy_pnls.items():
+            strategy_stats[name] = {
+                "trades": len(sp),
+                "total_pnl": sum(sp),
+                "weight": self.get_strategy_weight(name),
+            }
+
         return {
             "total_trades": len(pnls),
             "wins": len(wins),
@@ -279,12 +386,89 @@ class RiskManager:
             "consecutive_wins": self.consecutive_wins,
             "daily_pnl": self.daily_pnl,
             "pair_stats": pair_stats,
+            "strategy_stats": strategy_stats,
         }
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "peak_equity": self.peak_equity,
+            "consecutive_losses": self.consecutive_losses,
+            "consecutive_wins": self.consecutive_wins,
+            "trades_since_loss": self.trades_since_loss,
+            "trades_since_win": self.trades_since_win,
+            "daily_pnl": self.daily_pnl,
+            "daily_reset_date": str(self.daily_reset_date),
+            "is_killed": self.is_killed,
+            "cooldown_until": self.cooldown_until.isoformat() if self.cooldown_until else None,
+            "pair_sharpes": self.pair_sharpes,
+            "strategy_pnls": self.strategy_pnls,
+            "trade_history": [
+                {
+                    "symbol": t.symbol,
+                    "side": t.side.value,
+                    "entry_price": t.entry_price,
+                    "exit_price": t.exit_price,
+                    "size": t.size,
+                    "leverage": t.leverage,
+                    "pnl": t.pnl,
+                    "pnl_pct": t.pnl_pct,
+                    "duration_seconds": t.duration_seconds,
+                    "exit_reason": t.exit_reason,
+                    "strategy": t.strategy,
+                }
+                for t in self.trade_history[-200:]
+            ],
+        }
+
+    def load_state(self, state: dict[str, Any]):
+        if not state:
+            return
+        self.peak_equity = float(state.get("peak_equity") or 0)
+        self.consecutive_losses = int(state.get("consecutive_losses") or 0)
+        self.consecutive_wins = int(state.get("consecutive_wins") or 0)
+        self.trades_since_loss = int(state.get("trades_since_loss") or 0)
+        self.trades_since_win = int(state.get("trades_since_win") or 0)
+        self.daily_pnl = float(state.get("daily_pnl") or 0)
+        self.is_killed = bool(state.get("is_killed") or False)
+        self.pair_sharpes = state.get("pair_sharpes") or {}
+        self.strategy_pnls = state.get("strategy_pnls") or {}
+        cu = state.get("cooldown_until")
+        if cu:
+            try:
+                self.cooldown_until = datetime.fromisoformat(str(cu).replace("Z", ""))
+            except Exception:
+                self.cooldown_until = None
+        else:
+            self.cooldown_until = None
+        # Rebuild minimal trade history for win-rate estimates
+        self.trade_history = []
+        for raw in state.get("trade_history") or []:
+            try:
+                self.trade_history.append(
+                    TradeResult(
+                        symbol=raw["symbol"],
+                        side=Side(raw["side"]),
+                        entry_price=float(raw["entry_price"]),
+                        exit_price=float(raw["exit_price"]),
+                        size=float(raw["size"]),
+                        leverage=int(raw["leverage"]),
+                        pnl=float(raw["pnl"]),
+                        pnl_pct=float(raw.get("pnl_pct") or 0),
+                        duration_seconds=int(raw.get("duration_seconds") or 0),
+                        exit_reason=raw.get("exit_reason") or "",
+                        strategy=raw.get("strategy") or "",
+                    )
+                )
+            except Exception:
+                continue
 
     def reset_kill_switch(self):
         self.is_killed = False
 
-    def _estimate_win_rate(self) -> float:
+    def _estimate_win_rate(self, strategy: str = "") -> float:
+        if strategy and strategy in self.strategy_pnls and len(self.strategy_pnls[strategy]) >= 5:
+            recent = self.strategy_pnls[strategy][-30:]
+            return sum(1 for p in recent if p > 0) / len(recent)
         if len(self.trade_history) < 10:
             return self.default_win_rate
         recent = self.trade_history[-50:]

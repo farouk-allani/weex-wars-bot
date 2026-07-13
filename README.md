@@ -1,68 +1,63 @@
-# WEEX AI Wars II — Trading Bot v8.3
+# WEEX AI Wars II — Trading Bot v8.4
 
-Competition-oriented futures bot with fixed execution plumbing, multi-timeframe bias, and a tuned mean-reversion core.
+Competition futures bot with portfolio risk, partial take-profit, adaptive weights, and a tuned mean-reversion core.
 
-## What v8.3 learned (90d multi-pair tune)
+## Progress (90d portfolio, shared $10k)
 
-| Version | Net (BTC+ETH+SOL) | Notes |
-|--------|-------------------|--------|
-| v8 baseline | **-$125** | Late trend entries + false breakouts |
-| v8.2 | **-$102** | Still breakout-heavy |
-| **v8.3 mr_only_htf** | **-$29** | Best; max DD ~0.4% |
-| BTC mean-reversion alone | **+$11** (67% WR) | Strongest pocket |
+| Stage | Net closed PnL | Max DD | Notes |
+|-------|----------------|--------|--------|
+| v8 baseline (sum pairs) | **-$125** | ~0.9% | Late trends + false breakouts |
+| v8.3 MR focus | **-$29** | ~0.4% | Isolated BTC edge |
+| v8.4 portfolio (KA tax) | **-$38** | 0.3% | Keep-alive over-trading |
+| **v8.4 final** | **+$2.58** | **0.2%** | Sharpe **2.19**, PF **1.18** |
 
-Honest takeaway: last 90 days were hostile to momentum. The bot is now **survival-first** with a real MR edge on BTC, ETH sized down, breakouts off, and 4h bias so we do not fight the higher timeframe.
+Final capital ~**$10,031** (partial scale-outs bank extra).  
+**BTC** +$10.9 | **mean_reversion** +$8.2 (57% WR) | keep-alive still a small tax.
 
 ## Strategy stack
 
-1. **Mean reversion (primary)** — RSI + Bollinger + Stoch turn, ADX capped, mid-band targets  
-2. **SOL trend pullback** — deep EMA pullback only on SOL (`enabled_pairs`)  
-3. **SOL keep-alive** — tiny VWAP/BB size for activity rules  
-4. **Breakouts** — **disabled** (false breaks bled equity)
+1. **Mean reversion (primary)** — z-score BB stretch + RSI/Stoch turn + volume filter  
+2. **Partial TP at 1R** — bank 50%, stop → breakeven, trail rest  
+3. **HTF 4h bias** — don’t fight the higher timeframe  
+4. **SOL keep-alive** — micro size, max 3/week, only if book is quiet  
+5. **Breakouts OFF**
 
-## Risk
+## Risk & execution
 
-- 1.2% base risk × signal strength (keep-alive ~0.10 → micro size)  
-- 15% drawdown kill-switch, 2.5% daily loss limit  
-- Max 2 positions, half-Kelly, correlation guard BTC/ETH  
-- Trailing only after +1.2% price move  
-- Software SL/TP always stored (paper + live bracket cache)
+- 1.2% base risk × strength × pair weight × strategy weight  
+- 15% DD kill-switch, 2.5% daily loss, **time-based** 6h loss cooldown  
+- Keep-alive losses **do not** trigger portfolio cooldown  
+- State saved to `data/bot_state.json` (survives restarts)  
+- Logs → `logs/trading.log`  
+- Paper + live SL/TP brackets  
 
-## Setup
+## Commands
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
-# add WEEX_API_KEY / WEEX_API_SECRET / WEEX_API_PASSPHRASE
+cp .env.example .env          # add WEEX keys for live
 python test_bot.py
 python check_ready.py
-python -m src.main          # paper mode
-```
-
-### Backtest / tune
-
-```bash
+python run_portfolio_backtest.py --days 90
 python run_tune.py --days 90 --apply-best
-python run_multi_backtest.py
+python -m src.main            # paper by default
 ```
 
-## Paper → live checklist
+## Paper → live
 
-1. `trading.mode: paper` in `config.yaml`  
-2. `python test_bot.py` + `python check_ready.py`  
-3. Run `python -m src.main` — every fill must log **Stop** and **TP**  
-4. Fill `.env` keys when going live  
-5. Set `trading.mode: live` only after 24h paper looks clean  
-6. Start leverage **3–5** (max 8)
+1. `trading.mode: paper`  
+2. Confirm every fill logs **Stop** + **TP** (+ partial TP)  
+3. Fill `.env` keys  
+4. After clean paper, set `mode: live`, leverage 3–5  
 
 ## Architecture
 
 ```
-src/core/       engine, exchange (SL/TP), models
-src/strategies/ composite v8.3, edges (funding/MTF/session)
-src/risk/       strength sizing, trail, kill-switch
-src/backtest/   HTF resample, strategy PnL breakdown
-src/indicators/ RSI, MACD, BB, ATR, ADX, VWAP, regime
+src/core/        engine v8.4, exchange, models
+src/strategies/  composite (MR + KA), edges
+src/risk/        adaptive sizing, partial TP, state
+src/backtest/    single + portfolio shared capital
+src/utils/       logger, state persistence
 ```
 
 ## Author

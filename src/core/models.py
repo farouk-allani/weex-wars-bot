@@ -63,6 +63,9 @@ class Signal:
     leverage: int
     reason: str
     timestamp: datetime = field(default_factory=datetime.utcnow)
+    # Optional scale-out level (e.g. 1R) — bank partial, trail rest
+    partial_take_profit: Optional[float] = None
+    partial_fraction: float = 0.5
 
     @property
     def risk_reward_ratio(self) -> float:
@@ -88,6 +91,10 @@ class Position:
     strategy: str = ""
     exchange_sl_set: bool = False
     exchange_tp_set: bool = False
+    partial_take_profit: Optional[float] = None
+    partial_fraction: float = 0.5
+    partial_taken: bool = False
+    initial_size: float = 0.0
 
     def update_extremes(self, price: float):
         if price > self.highest_price:
@@ -122,6 +129,13 @@ class Position:
         if self.side == Side.LONG:
             return current_price <= self.trailing_stop
         return current_price >= self.trailing_stop
+
+    def should_partial_tp(self, current_price: float) -> bool:
+        if self.partial_taken or not self.partial_take_profit or self.partial_take_profit <= 0:
+            return False
+        if self.side == Side.LONG:
+            return current_price >= self.partial_take_profit
+        return current_price <= self.partial_take_profit
 
 
 @dataclass
