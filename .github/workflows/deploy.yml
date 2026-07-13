@@ -1,0 +1,101 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    # Manual redeploy from GitHub Actions UI
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    # Wait for CI on same commit when possible
+    needs: []
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Fallbacks if secrets not set (repo VPS)
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          SSH_HOST="${SSH_HOST:-45.88.191.129}"
+          SSH_USER="${SSH_USER:-farouk}"
+          if [ -z "$SSH_PRIVATE_KEY" ]; then
+            echo "Missing DEPLOY_SSH_KEY secret (private key for user farouk)."
+            echo "See DEPLOY.md for setup."
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "SSH configured for $SSH_USER@$SSH_HOST"
+
+      - name: Deploy over SSH
+        env:
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          # Defaults match this project VPS (override via GitHub secrets)
+          SSH_HOST="${SSH_HOST:-45.88.191.129}"
+          SSH_USER="${SSH_USER:-farouk}"
+          DEPLOY_PATH="${DEPLOY_PATH:-/home/farouk/weex-wars-bot}"
+          echo "Deploy target: $SSH_USER@$SSH_HOST:$DEPLOY_PATH"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            "$SSH_USER@$SSH_HOST" \
+            "DEPLOY_PATH='$DEPLOY_PATH' bash -s" << 'REMOTE'
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+
+          echo "==> Pulling latest main"
+          git fetch origin main
+          git reset --hard origin/main
+
+          echo "==> Building & restarting stack"
+          docker compose pull 2>/dev/null || true
+          docker compose build --pull
+          docker compose up -d --remove-orphans
+
+          echo "==> Pruning old images"
+          docker image prune -f
+
+          echo "==> Status"
+          docker compose ps
+          echo "Deploy OK at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          REMOTE
+
+      - name: Smoke healthcheck (dashboard)
+        env:
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          DASHBOARD_PUBLIC_URL: ${{ secrets.DASHBOARD_PUBLIC_URL }}
+        run: |
+          SSH_HOST="${SSH_HOST:-45.88.191.129}"
+          SSH_USER="${SSH_USER:-farouk}"
+          DASHBOARD_PUBLIC_URL="${DASHBOARD_PUBLIC_URL:-http://45.88.191.129:8787}"
+          # Prefer public URL if set; else curl via SSH localhost
+          if [ -n "${DASHBOARD_PUBLIC_URL:-}" ]; then
+            echo "Checking $DASHBOARD_PUBLIC_URL/api/health"
+            for i in 1 2 3 4 5; do
+              if curl -fsS "$DASHBOARD_PUBLIC_URL/api/health" | grep -q '"ok"'; then
+                echo "Dashboard healthy"
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "Dashboard healthcheck failed"
+            exit 1
+          fi
+          ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" \
+            "curl -fsS http://127.0.0.1:8787/api/health"

@@ -1,4 +1,7 @@
 .env
+deploy_key
+deploy_key.pub
+DEPLOY.md
 __pycache__/
 *.pyc
 .pytest_cache/

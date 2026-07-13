@@ -77,6 +77,25 @@ The dashboard auto-refreshes every **5s** from:
 
 If the bot hasn’t written state yet, the UI shows **demo metrics** so you can preview the layout.
 
+## Deploy & CI/CD (push → live)
+
+**Recommended:** Docker Compose on a VPS + GitHub Actions.
+
+```bash
+# local
+git push origin main   # CI tests + auto-deploy to VPS
+```
+
+Deploy notes live in local **`DEPLOY.md`** (gitignored — not pushed to GitHub).
+
+Quick local prod-like stack:
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+# bot + dashboard on :8787
+```
+
 ## What’s new in v8.5
 
 - **Walk-forward** mode comparison (`run_walk_forward.py`)

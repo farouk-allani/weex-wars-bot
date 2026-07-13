@@ -1,0 +1,87 @@
+# WEEX AI Wars — production stack
+# Usage:
+#   cp .env.example .env   # fill secrets
+#   docker compose up -d
+#
+# Services:
+#   bot       — trading engine (paper/live)
+#   dashboard — monitoring UI on :8787
+
+services:
+  bot:
+    build: .
+    image: weex-wars-bot:latest
+    container_name: weex-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Persist state + logs across deploys
+      - bot-data:/app/data
+      - bot-logs:/app/logs
+      # Optional: mount config so you can tweak without rebuild
+      - ./config.yaml:/app/config.yaml:ro
+    command: ["python", "-m", "src.main"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from pathlib import Path; import time, json; p=Path('data/bot_state.json'); exit(0 if p.exists() and time.time()-p.stat().st_mtime < 600 else 1)",
+        ]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 2m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  dashboard:
+    build: .
+    image: weex-wars-bot:latest
+    container_name: weex-dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${DASHBOARD_PORT:-8787}:8787"
+    volumes:
+      # Read same state/logs the bot writes
+      - bot-data:/app/data:ro
+      - bot-logs:/app/logs:ro
+      - ./config.yaml:/app/config.yaml:ro
+    command:
+      [
+        "python",
+        "-c",
+        "from dashboard.app import main; main(['--host','0.0.0.0','--port','8787','--no-auto-port'])",
+      ]
+    depends_on:
+      - bot
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  bot-data:
+  bot-logs:
