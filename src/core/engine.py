@@ -45,13 +45,24 @@ class TradingEngine:
         state = load_state(self.state_path)
         if state:
             self.risk.load_state(state.get("risk") or {})
+            paper_state = state.get("paper") or {}
+            if not paper_state and (state.get("account") or {}).get("mode") == "paper":
+                # State written before the paper ledger was persisted: the dashboard
+                # snapshot is the only record of the balance, so seed from it.
+                paper_state = {"balance": (state.get("account") or {}).get("balance")}
+            self.exchange.load_state(paper_state)
             lt = state.get("last_trade_time") or {}
             for k, v in lt.items():
                 try:
                     self.strategy.last_trade_time[k] = datetime.fromisoformat(v.replace("Z", ""))
                 except Exception:
                     pass
-            self.logger.info("Restored bot state from %s", self.state_path)
+            self.logger.info(
+                "Restored bot state from %s (balance=%.2f open=%d)",
+                self.state_path,
+                self.exchange.balance,
+                len(self.exchange.paper_positions),
+            )
 
         self.strategy.sync_scores_from_risk(self.risk)
         sig.signal(sig.SIGINT, self._shutdown)
@@ -261,27 +272,23 @@ class TradingEngine:
                 else:
                     atr = current_price * 0.015
 
-                # Partial take-profit
+                # Partial take-profit. apply_partial_tp() mutates the position, so
+                # remember what to roll back to if the venue rejects the reduction.
+                stop_before = position.stop_loss
                 position, realized, closed = self.risk.apply_partial_tp(
                     position, current_price, atr
                 )
                 if realized is not None and closed > 0:
-                    console.print(
-                        f"[green]Partial TP: {position.symbol} closed {closed:.6f} "
-                        f"PnL=${realized:.2f} — stop→BE[/]"
-                    )
-                    self.logger.info(
-                        "PARTIAL_TP %s closed=%.6f pnl=%.2f remaining=%.6f",
-                        position.symbol, closed, realized, position.size,
-                    )
-                    # Paper: reduce size in place; live would need reduce-only order
+                    fee = closed * current_price * self.exchange.commission_rate
+                    net = realized - fee
+                    scaled_out = True
+
                     if self.exchange.mode == "paper":
-                        if position.symbol in self.exchange.paper_positions:
-                            if position.size <= 1e-12:
-                                self.exchange.paper_positions.pop(position.symbol, None)
-                            else:
-                                self.exchange.paper_positions[position.symbol] = position
-                                self.exchange.balance += realized
+                        self.exchange.balance += net
+                        if position.size <= 1e-12:
+                            self.exchange.paper_positions.pop(position.symbol, None)
+                        else:
+                            self.exchange.paper_positions[position.symbol] = position
                     else:
                         try:
                             side = "sell" if position.side == Side.LONG else "buy"
@@ -289,14 +296,34 @@ class TradingEngine:
                                 position.symbol, "market", side, closed,
                                 params={"reduceOnly": True},
                             )
-                            br = self.exchange._local_brackets.get(position.symbol, {})
-                            br["partial_taken"] = True
-                            br["stop_loss"] = position.stop_loss
-                            self.exchange._local_brackets[position.symbol] = br
                         except Exception as e:
-                            self.logger.error("Partial close failed: %s", e)
-                    if position.size <= 1e-12:
-                        continue
+                            # The exchange still holds the full position. Booking the
+                            # PnL now would leave the bot managing a phantom size and
+                            # a stop it never actually earned.
+                            self.logger.error(
+                                "Partial close failed, rolling back: %s", e
+                            )
+                            console.print(f"[red]Partial close failed: {e}[/]")
+                            position.size += closed
+                            position.partial_taken = False
+                            position.stop_loss = stop_before
+                            scaled_out = False
+
+                    if scaled_out:
+                        position.realized_pnl += net
+                        position.fees_paid += fee
+                        # Cash is banked now, so the daily loss limit must see it now.
+                        self.risk.record_partial(net)
+                        console.print(
+                            f"[green]Partial TP: {position.symbol} closed {closed:.6f} "
+                            f"PnL=${net:.2f} - stop to BE[/]"
+                        )
+                        self.logger.info(
+                            "PARTIAL_TP %s closed=%.6f pnl=%.2f fee=%.4f remaining=%.6f",
+                            position.symbol, closed, net, fee, position.size,
+                        )
+                        if position.size <= 1e-12:
+                            continue
 
                 position = self.risk.adjust_stops(position, current_price, atr)
                 self.exchange.update_local_brackets(position)
@@ -305,8 +332,12 @@ class TradingEngine:
                     self.exchange.paper_positions[position.symbol] = position
 
                 if position.should_stop_loss(current_price):
-                    console.print(f"[red]Stop-loss: {position.symbol}[/]")
-                    self._close_position(position, current_price, "stop_loss")
+                    # A stop that has been trailed past entry is a protected exit,
+                    # not a loss — labelling both "stop_loss" poisons exit analysis.
+                    reason = position.stop_exit_reason()
+                    color = "yellow" if reason == "be_stop" else "red"
+                    console.print(f"[{color}]{reason}: {position.symbol}[/]")
+                    self._close_position(position, current_price, reason)
                 elif position.should_take_profit(current_price):
                     console.print(f"[green]Take-profit: {position.symbol}[/]")
                     self._close_position(position, current_price, "take_profit")
@@ -329,8 +360,25 @@ class TradingEngine:
             if isinstance(result, dict)
             else current_price
         )
-        pnl = position.calculate_pnl(exit_price)
-        notional_margin = position.size * position.entry_price / max(position.leverage, 1)
+        # Paper reports the net figure it actually booked; live has no per-trade
+        # PnL in the close order, so charge the exit fee at the configured rate.
+        if isinstance(result, dict) and result.get("pnl") is not None:
+            final_leg = float(result["pnl"])
+            exit_fee = float(result.get("fee") or 0.0)
+        else:
+            exit_fee = position.size * exit_price * self.exchange.commission_rate
+            final_leg = position.calculate_pnl(exit_price) - exit_fee
+
+        # Round trip = partial legs already banked + this leg, net of every fee
+        # including entry. Win/loss and Kelly are driven off this number, so a
+        # trade that only cleared the spread must not read as a winner.
+        pnl = final_leg + position.realized_pnl - position.entry_fee
+        fees = position.fees_paid + exit_fee
+
+        # Margin is measured on the position as originally opened, otherwise a
+        # scaled-out trade reports an inflated return on a shrunken base.
+        sized_for_margin = position.initial_size or position.size
+        notional_margin = sized_for_margin * position.entry_price / max(position.leverage, 1)
         pnl_pct = (pnl / notional_margin) * 100 if notional_margin else 0
         duration = int((datetime.utcnow() - position.opened_at).total_seconds())
 
@@ -339,13 +387,15 @@ class TradingEngine:
             side=position.side,
             entry_price=position.entry_price,
             exit_price=exit_price,
-            size=position.size,
+            size=sized_for_margin,
             leverage=position.leverage,
             pnl=pnl,
             pnl_pct=pnl_pct,
             duration_seconds=duration,
             exit_reason=reason,
             strategy=position.strategy,
+            banked_pnl=position.realized_pnl,
+            fees=fees,
         )
         self.risk.record_trade(trade_result)
         self.strategy.sync_scores_from_risk(self.risk)
@@ -358,8 +408,9 @@ class TradingEngine:
         color = "green" if pnl >= 0 else "red"
         console.print(f"[{color}]   PnL: ${pnl:.2f} ({pnl_pct:.1f}%) — {reason}[/]")
         self.logger.info(
-            "CLOSE %s %s pnl=%.2f reason=%s strategy=%s",
-            position.symbol, position.side.value, pnl, reason, position.strategy,
+            "CLOSE %s %s pnl=%.2f banked=%.2f fees=%.4f reason=%s strategy=%s",
+            position.symbol, position.side.value, pnl,
+            position.realized_pnl, fees, reason, position.strategy,
         )
         self._persist_state()
 
@@ -380,12 +431,13 @@ class TradingEngine:
                 "unrealized": account.get("unrealized_pnl"),
                 "open": account.get("open_positions"),
             })
-            ticks = ticks[-500:]  # cap
+            ticks = self._compact_ticks(ticks)
 
             save_state(
                 self.state_path,
                 {
                     "risk": self.risk.to_state(),
+                    "paper": self.exchange.to_state(),
                     "account": account,
                     "equity_ticks": ticks,
                     "last_trade_time": lt,
@@ -396,6 +448,40 @@ class TradingEngine:
             )
         except Exception as e:
             self.logger.warning("State save failed: %s", e)
+
+    # Fine detail for the recent window, thinned history behind it. A flat
+    # last-N cap at 60s/tick could only ever show ~8h, so a multi-day
+    # competition curve lost its own trades off the left edge.
+    RECENT_WINDOW_MINUTES = 120
+    OLD_BUCKET_MINUTES = 15
+    MAX_TICKS = 2000
+
+    @classmethod
+    def _compact_ticks(cls, ticks: list[dict]) -> list[dict]:
+        if len(ticks) <= 2:
+            return ticks
+
+        def parsed(tick):
+            try:
+                return datetime.fromisoformat(str(tick.get("t", "")).replace("Z", ""))
+            except Exception:
+                return None
+
+        now = datetime.utcnow()
+        recent, buckets = [], {}
+        for tick in ticks:
+            t = parsed(tick)
+            if t is None:
+                continue
+            if (now - t).total_seconds() <= cls.RECENT_WINDOW_MINUTES * 60:
+                recent.append(tick)
+            else:
+                # Last tick in each bucket wins, so an exit is never averaged away.
+                key = int(t.timestamp() // (cls.OLD_BUCKET_MINUTES * 60))
+                buckets[key] = tick
+
+        compacted = [buckets[k] for k in sorted(buckets)] + recent
+        return compacted[-cls.MAX_TICKS:]
 
     def _display_status(self):
         if self.cycle_count % 5 != 0:

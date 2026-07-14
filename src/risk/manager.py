@@ -295,13 +295,30 @@ class RiskManager:
             return max(0.35, prior * (0.7 + sharpe * 0.15))
         return prior
 
+    @staticmethod
+    def is_keepalive(strategy: str) -> bool:
+        return (strategy or "").startswith("keepalive")
+
+    def record_partial(self, pnl: float):
+        """Bank a partial scale-out immediately.
+
+        Only daily_pnl moves here: it gates the daily loss limit and must reflect
+        cash that is already realized. Pair/strategy performance is credited once,
+        at close, from the full round-trip PnL.
+        """
+        self.daily_pnl += pnl
+
     def record_trade(self, result: TradeResult, now: Optional[datetime] = None):
         self.trade_history.append(result)
-        self.update_pair_performance(result.symbol, result.pnl)
-        self.update_strategy_performance(result.strategy, result.pnl)
         now = now or datetime.utcnow()
 
-        is_keepalive = (result.strategy or "").startswith("keepalive")
+        is_keepalive = self.is_keepalive(result.strategy)
+
+        # Keep-alive trades are token-sized heartbeats, not signals. Letting them
+        # steer pair weights or Kelly win-rate would size real trades off noise.
+        if not is_keepalive:
+            self.update_pair_performance(result.symbol, result.pnl)
+        self.update_strategy_performance(result.strategy, result.pnl)
 
         if result.pnl < 0:
             # Keep-alive losses should not trigger full portfolio cooldown
@@ -322,7 +339,8 @@ class RiskManager:
             self.trades_since_loss += 1
             self.cooldown_until = None
 
-        self.daily_pnl += result.pnl
+        # banked_pnl already hit daily_pnl via record_partial()
+        self.daily_pnl += result.pnl - result.banked_pnl
 
     def get_stats(self) -> dict:
         if not self.trade_history:
@@ -417,6 +435,8 @@ class RiskManager:
                     "duration_seconds": t.duration_seconds,
                     "exit_reason": t.exit_reason,
                     "strategy": t.strategy,
+                    "banked_pnl": t.banked_pnl,
+                    "fees": t.fees,
                 }
                 for t in self.trade_history[-200:]
             ],
@@ -432,6 +452,21 @@ class RiskManager:
         self.trades_since_win = int(state.get("trades_since_win") or 0)
         self.daily_pnl = float(state.get("daily_pnl") or 0)
         self.is_killed = bool(state.get("is_killed") or False)
+
+        # daily_pnl is only meaningful together with the day it belongs to. Without
+        # this, a restart adopts today's date while keeping yesterday's PnL, and a
+        # losing yesterday keeps eating into today's loss limit.
+        saved_day = state.get("daily_reset_date")
+        today = datetime.utcnow().date()
+        try:
+            self.daily_reset_date = (
+                datetime.fromisoformat(str(saved_day)).date() if saved_day else today
+            )
+        except Exception:
+            self.daily_reset_date = today
+        if self.daily_reset_date != today:
+            self.daily_pnl = 0.0
+            self.daily_reset_date = today
         self.pair_sharpes = state.get("pair_sharpes") or {}
         self.strategy_pnls = state.get("strategy_pnls") or {}
         cu = state.get("cooldown_until")
@@ -459,6 +494,8 @@ class RiskManager:
                         duration_seconds=int(raw.get("duration_seconds") or 0),
                         exit_reason=raw.get("exit_reason") or "",
                         strategy=raw.get("strategy") or "",
+                        banked_pnl=float(raw.get("banked_pnl") or 0),
+                        fees=float(raw.get("fees") or 0),
                     )
                 )
             except Exception:
@@ -471,9 +508,10 @@ class RiskManager:
         if strategy and strategy in self.strategy_pnls and len(self.strategy_pnls[strategy]) >= 5:
             recent = self.strategy_pnls[strategy][-30:]
             return sum(1 for p in recent if p > 0) / len(recent)
-        if len(self.trade_history) < 10:
+        real = [t for t in self.trade_history if not self.is_keepalive(t.strategy)]
+        if len(real) < 10:
             return self.default_win_rate
-        recent = self.trade_history[-50:]
+        recent = real[-50:]
         wins = sum(1 for t in recent if t.pnl > 0)
         return wins / len(recent)
 

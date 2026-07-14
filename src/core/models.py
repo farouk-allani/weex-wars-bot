@@ -95,6 +95,10 @@ class Position:
     partial_fraction: float = 0.5
     partial_taken: bool = False
     initial_size: float = 0.0
+    # PnL already banked by partial scale-outs (net of their fees)
+    realized_pnl: float = 0.0
+    entry_fee: float = 0.0
+    fees_paid: float = 0.0  # running total: entry + any partial exits
 
     def update_extremes(self, price: float):
         if price > self.highest_price:
@@ -137,6 +141,17 @@ class Position:
             return current_price >= self.partial_take_profit
         return current_price <= self.partial_take_profit
 
+    def stop_in_profit(self) -> bool:
+        """True when the stop sits on the winning side of entry (breakeven/trail)."""
+        if self.stop_loss is None or self.stop_loss <= 0:
+            return False
+        if self.side == Side.LONG:
+            return self.stop_loss > self.entry_price
+        return self.stop_loss < self.entry_price
+
+    def stop_exit_reason(self) -> str:
+        return "be_stop" if self.stop_in_profit() else "stop_loss"
+
 
 @dataclass
 class TradeResult:
@@ -152,6 +167,11 @@ class TradeResult:
     exit_reason: str
     strategy: str = ""
     timestamp: datetime = field(default_factory=datetime.utcnow)
+    # pnl is the full round trip (partial legs + final leg, net of fees).
+    # banked_pnl is the portion already realized by partial TP, so callers that
+    # credited it at scale-out time don't count it twice.
+    banked_pnl: float = 0.0
+    fees: float = 0.0
 
 
 @dataclass

@@ -133,11 +133,14 @@ class Backtester:
                             position, pfill, atr
                         )
                         if realized is not None:
-                            realized -= closed * pfill * self.commission_rate
+                            fee = closed * pfill * self.commission_rate
+                            realized -= fee
+                            position.realized_pnl += realized
+                            position.fees_paid += fee
                             capital += realized
-                            risk_manager.daily_pnl += realized
-                            risk_manager.update_strategy_performance(position.strategy, realized)
-                            risk_manager.update_pair_performance(symbol, realized)
+                            # Credited to pair/strategy once, at close, from the
+                            # full round trip — same as the live engine.
+                            risk_manager.record_partial(realized)
                         if position.size <= 1e-12:
                             position = None
 
@@ -154,7 +157,7 @@ class Backtester:
                         if position.stop_loss > 0 and current_candle.low <= position.stop_loss:
                             hit_stop = True
                             fill_price = position.stop_loss
-                            reason = "stop_loss"
+                            reason = position.stop_exit_reason()
                         elif position.take_profit > 0 and current_candle.high >= position.take_profit:
                             hit_tp = True
                             fill_price = position.take_profit
@@ -167,7 +170,7 @@ class Backtester:
                         if position.stop_loss > 0 and current_candle.high >= position.stop_loss:
                             hit_stop = True
                             fill_price = position.stop_loss
-                            reason = "stop_loss"
+                            reason = position.stop_exit_reason()
                         elif position.take_profit > 0 and current_candle.low <= position.take_profit:
                             hit_tp = True
                             fill_price = position.take_profit
@@ -180,7 +183,8 @@ class Backtester:
                     if hit_stop or hit_tp or hit_trail:
                         trade = self._close_position(position, fill_price, reason, capital)
                         trades.append(trade)
-                        capital += trade.pnl
+                        # banked_pnl already hit capital at scale-out time
+                        capital += trade.pnl - trade.banked_pnl
                         risk_manager.record_trade(
                             trade, now=current_candle.timestamp
                         )
@@ -226,6 +230,7 @@ class Backtester:
                                     signal.partial_take_profit - signal.entry_price
                                 )
 
+                            commission = size * entry_price * self.commission_rate
                             position = Position(
                                 symbol=symbol,
                                 side=signal.side,
@@ -240,9 +245,11 @@ class Backtester:
                                 partial_take_profit=ptp,
                                 partial_fraction=signal.partial_fraction,
                                 initial_size=size,
+                                entry_fee=commission,
+                                fees_paid=commission,
                             )
-                            commission = size * entry_price * self.commission_rate
-                            capital -= commission
+                            # Entry fee is charged through trade.pnl at close, not
+                            # here, so it is never taken from capital twice.
 
             unrealized = position.calculate_pnl(current_price) if position else 0
             equity = capital + unrealized
@@ -253,7 +260,7 @@ class Backtester:
         if position:
             trade = self._close_position(position, candles[-1].close, "end_of_backtest", capital)
             trades.append(trade)
-            capital += trade.pnl
+            capital += trade.pnl - trade.banked_pnl
             risk_manager.record_trade(trade)
 
         result = self._calculate_stats(trades, equity_curve)
@@ -268,11 +275,16 @@ class Backtester:
         else:
             actual_exit = exit_price * (1 + self.slippage_pct)
 
-        pnl = position.calculate_pnl(actual_exit)
         commission = position.size * actual_exit * self.commission_rate
-        pnl -= commission
+        pnl = (
+            position.calculate_pnl(actual_exit)
+            - commission
+            - position.entry_fee
+            + position.realized_pnl
+        )
 
-        margin = position.size * position.entry_price / max(position.leverage, 1)
+        sized_for_margin = position.initial_size or position.size
+        margin = sized_for_margin * position.entry_price / max(position.leverage, 1)
         pnl_pct = (pnl / margin) * 100 if margin else 0
 
         return TradeResult(
@@ -280,13 +292,15 @@ class Backtester:
             side=position.side,
             entry_price=position.entry_price,
             exit_price=actual_exit,
-            size=position.size,
+            size=sized_for_margin,
             leverage=position.leverage,
             pnl=pnl,
             pnl_pct=pnl_pct,
             duration_seconds=3600,
             exit_reason=reason,
             strategy=position.strategy or "",
+            banked_pnl=position.realized_pnl,
+            fees=position.fees_paid + commission,
         )
 
     def _calculate_atr(self, candles: list[Candle], index: int, period: int) -> float:

@@ -49,8 +49,12 @@ class ExchangeClient:
         if self.mode != "paper":
             self.exchange.set_sandbox_mode(False)
 
-        # Paper state
-        self.balance = float(config.get("backtest", {}).get("initial_capital", 10000))
+        # Paper state — same cost model as the backtest, otherwise paper results
+        # are optimistic and can't be compared against the WFO that tuned them.
+        bt = config.get("backtest", {})
+        self.commission_rate = float(bt.get("commission_rate", 0.0006))
+        self.slippage_pct = float(bt.get("slippage_pct", 0.0005))
+        self.balance = float(bt.get("initial_capital", 10000))
         self.paper_positions: dict[str, Position] = {}
         self.paper_trades: list = []
 
@@ -157,6 +161,16 @@ class ExchangeClient:
                         strategy=str(bracket.get("strategy") or ""),
                         exchange_sl_set=bool(bracket.get("exchange_sl_set")),
                         exchange_tp_set=bool(bracket.get("exchange_tp_set")),
+                        # Live positions are rebuilt from the API every cycle, so
+                        # anything the exchange doesn't know has to survive here —
+                        # otherwise a banked partial is forgotten before the close.
+                        partial_take_profit=bracket.get("partial_take_profit"),
+                        partial_fraction=float(bracket.get("partial_fraction") or 0.5),
+                        partial_taken=bool(bracket.get("partial_taken")),
+                        initial_size=float(bracket.get("initial_size") or contracts),
+                        realized_pnl=float(bracket.get("realized_pnl") or 0),
+                        entry_fee=float(bracket.get("entry_fee") or 0),
+                        fees_paid=float(bracket.get("fees_paid") or 0),
                     )
                 )
 
@@ -263,6 +277,10 @@ class ExchangeClient:
                 "exchange_sl_set": sl_ok,
                 "exchange_tp_set": tp_ok,
                 "side": side.value,
+                "initial_size": amount,
+                "entry_fee": amount * fill_price * self.commission_rate,
+                "fees_paid": amount * fill_price * self.commission_rate,
+                "realized_pnl": 0.0,
             }
 
             order = dict(order)
@@ -292,6 +310,13 @@ class ExchangeClient:
             "exchange_sl_set": position.exchange_sl_set,
             "exchange_tp_set": position.exchange_tp_set,
             "side": position.side.value,
+            "partial_take_profit": position.partial_take_profit,
+            "partial_fraction": position.partial_fraction,
+            "partial_taken": position.partial_taken,
+            "initial_size": position.initial_size or position.size,
+            "realized_pnl": position.realized_pnl,
+            "entry_fee": position.entry_fee,
+            "fees_paid": position.fees_paid,
         }
 
     def close_position(self, symbol: str) -> dict:
@@ -300,11 +325,18 @@ class ExchangeClient:
                 return {"closed": True, "reason": "no_position"}
             pos = self.paper_positions.pop(symbol)
             ticker = self.fetch_ticker(symbol)
-            exit_price = float(ticker.get("last") or pos.entry_price)
-            pnl = pos.calculate_pnl(exit_price)
+            mark = float(ticker.get("last") or pos.entry_price)
+            exit_price = self.apply_slippage(mark, pos.side, is_exit=True)
+            fee = pos.size * exit_price * self.commission_rate
+            pnl = pos.calculate_pnl(exit_price) - fee
             self.balance += pnl
             self.paper_trades.append({"symbol": symbol, "pnl": pnl})
-            return {"closed": True, "pnl": pnl, "exit_price": exit_price}
+            return {
+                "closed": True,
+                "pnl": pnl,
+                "exit_price": exit_price,
+                "fee": fee,
+            }
 
         try:
             positions = self.exchange.fetch_positions([symbol])
@@ -325,6 +357,11 @@ class ExchangeClient:
 
     # ---- Paper Trading ----
 
+    def apply_slippage(self, price: float, side: Side, is_exit: bool = False) -> float:
+        """Fill against us: buys fill higher, sells fill lower."""
+        buying = (side == Side.LONG) != is_exit
+        return price * (1 + self.slippage_pct) if buying else price * (1 - self.slippage_pct)
+
     def _paper_order(
         self,
         symbol: str,
@@ -341,12 +378,16 @@ class ExchangeClient:
         if not ticker:
             return {"error": "No ticker data"}
 
-        fill_price = float(ticker.get("last") or price or 0)
-        if fill_price <= 0:
+        mark = float(ticker.get("last") or price or 0)
+        if mark <= 0:
             return {"error": "No price available"}
 
         if symbol in self.paper_positions:
             return {"error": "Position already exists"}
+
+        fill_price = self.apply_slippage(mark, side)
+        entry_fee = amount * fill_price * self.commission_rate
+        self.balance -= entry_fee
 
         lev = leverage or self.config.get("trading", {}).get("default_leverage", 5)
         sl = float(stop_loss or 0)
@@ -377,6 +418,9 @@ class ExchangeClient:
             strategy=strategy,
             exchange_sl_set=sl > 0,
             exchange_tp_set=tp > 0,
+            initial_size=amount,
+            entry_fee=entry_fee,
+            fees_paid=entry_fee,
         )
         self.paper_positions[symbol] = position
 
@@ -392,6 +436,7 @@ class ExchangeClient:
             "take_profit": tp,
             "sl_placed": sl > 0,
             "tp_placed": tp > 0,
+            "entry_fee": entry_fee,
         }
 
     def update_paper_positions(self):
@@ -402,6 +447,71 @@ class ExchangeClient:
             current_price = float(ticker.get("last") or pos.entry_price)
             pos.unrealized_pnl = pos.calculate_pnl(current_price)
             pos.update_extremes(current_price)
+
+    def to_state(self) -> dict:
+        """Paper ledger for restart recovery (live mode reads truth from the API)."""
+        if self.mode != "paper":
+            return {}
+        return {
+            "balance": self.balance,
+            "positions": [
+                {
+                    "symbol": p.symbol,
+                    "side": p.side.value,
+                    "entry_price": p.entry_price,
+                    "size": p.size,
+                    "leverage": p.leverage,
+                    "stop_loss": p.stop_loss,
+                    "take_profit": p.take_profit,
+                    "trailing_stop": p.trailing_stop,
+                    "opened_at": p.opened_at.isoformat(),
+                    "highest_price": p.highest_price,
+                    "lowest_price": p.lowest_price,
+                    "strategy": p.strategy,
+                    "partial_take_profit": p.partial_take_profit,
+                    "partial_fraction": p.partial_fraction,
+                    "partial_taken": p.partial_taken,
+                    "initial_size": p.initial_size,
+                    "realized_pnl": p.realized_pnl,
+                    "entry_fee": p.entry_fee,
+                    "fees_paid": p.fees_paid,
+                }
+                for p in self.paper_positions.values()
+            ],
+        }
+
+    def load_state(self, state: dict) -> None:
+        if self.mode != "paper" or not state:
+            return
+        if state.get("balance") is not None:
+            self.balance = float(state["balance"])
+        for raw in state.get("positions") or []:
+            try:
+                self.paper_positions[raw["symbol"]] = Position(
+                    symbol=raw["symbol"],
+                    side=Side(raw["side"]),
+                    entry_price=float(raw["entry_price"]),
+                    size=float(raw["size"]),
+                    leverage=int(raw["leverage"]),
+                    stop_loss=float(raw.get("stop_loss") or 0),
+                    take_profit=float(raw.get("take_profit") or 0),
+                    trailing_stop=raw.get("trailing_stop"),
+                    opened_at=datetime.fromisoformat(
+                        str(raw["opened_at"]).replace("Z", "")
+                    ),
+                    highest_price=float(raw.get("highest_price") or 0),
+                    lowest_price=float(raw.get("lowest_price") or float("inf")),
+                    strategy=raw.get("strategy") or "",
+                    partial_take_profit=raw.get("partial_take_profit"),
+                    partial_fraction=float(raw.get("partial_fraction") or 0.5),
+                    partial_taken=bool(raw.get("partial_taken")),
+                    initial_size=float(raw.get("initial_size") or 0),
+                    realized_pnl=float(raw.get("realized_pnl") or 0),
+                    entry_fee=float(raw.get("entry_fee") or 0),
+                    fees_paid=float(raw.get("fees_paid") or 0),
+                )
+            except Exception as e:
+                print(f"[Exchange] Could not restore paper position: {e}")
 
     def snapshot_for_dashboard(self) -> dict:
         """Serializable account snapshot for the monitoring UI."""
