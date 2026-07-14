@@ -20,10 +20,13 @@ from rich.panel import Panel
 from .exchange import ExchangeClient
 from .models import Side, Signal, Position, TradeResult
 from ..strategies.composite import CompositeStrategy
+from ..strategies.edges import EdgeStrategies
 from ..risk.manager import RiskManager
 from ..indicators.technical import calculate_atr
 from ..utils.logger import setup_logger
 from ..utils.state import save_state, load_state, DEFAULT_STATE_PATH
+from ..ai import AITrader, DecisionLog, DeepSeekClient, build_context
+from ..ai.context import symbol_snapshot
 import numpy as np  # noqa: E402
 
 console = Console()
@@ -66,6 +69,25 @@ class TradingEngine:
             )
 
         self.strategy.sync_scores_from_risk(self.risk)
+
+        # --- AI decision layer ---
+        ai_cfg = self.config.get("ai", {}) or {}
+        self.ai: AITrader | None = None
+        self.decision_log: DecisionLog | None = None
+        self.edges = EdgeStrategies(self.config)
+        # Which AI decision opened which position, so outcomes link back to reasoning.
+        self.position_decisions: dict[str, str] = (state or {}).get("position_decisions") or {}
+        self._last_ai_call: datetime | None = None
+        self.ai_interval_min = float(ai_cfg.get("decision_interval_minutes", 60))
+
+        if ai_cfg.get("enabled", False):
+            self.decision_log = DecisionLog(ai_cfg.get("log_file", "logs/ai_decisions.jsonl"))
+            self.ai = AITrader(self.config, DeepSeekClient(self.config), self.decision_log)
+            self.logger.info(
+                "AI decision layer active: model=%s interval=%smin",
+                self.ai.client.model, self.ai_interval_min,
+            )
+
         sig.signal(sig.SIGINT, self._shutdown)
         sig.signal(sig.SIGTERM, self._shutdown)
 
@@ -123,6 +145,11 @@ class TradingEngine:
         self._cleanup()
 
     def _run_cycle(self, symbols, timeframe, htf, lookback, htf_lookback):
+        if self.ai:
+            return self._run_ai_cycle(symbols, timeframe, htf, lookback, htf_lookback)
+        return self._run_rules_cycle(symbols, timeframe, htf, lookback, htf_lookback)
+
+    def _run_rules_cycle(self, symbols, timeframe, htf, lookback, htf_lookback):
         account = self.exchange.get_account_state()
         self.strategy.sync_scores_from_risk(self.risk)
 
@@ -186,7 +213,159 @@ class TradingEngine:
                 console.print(f"[red]Error analyzing {symbol}: {e}[/]")
                 self.logger.exception("Analyze %s: %s", symbol, e)
 
-    def _execute_trade(self, signal: Signal, size: float, pair_weight: float = 1.0):
+    def _run_ai_cycle(self, symbols, timeframe, htf, lookback, htf_lookback):
+        account = self.exchange.get_account_state()
+
+        # Stops never wait on the model. Position management runs every cycle (60s);
+        # the model is consulted on its own, much slower, cadence.
+        self._manage_positions(account)
+        account = self.exchange.get_account_state()
+
+        if not self._ai_due():
+            return
+
+        can_trade, reason = self.risk.can_trade(account)
+
+        market = []
+        atrs: dict[str, float] = {}
+        prices: dict[str, float] = {}
+        for symbol in symbols:
+            try:
+                candles = self.exchange.fetch_candles(symbol, timeframe, lookback)
+                if len(candles) < 100:
+                    continue
+                htf_candles = self.exchange.fetch_candles(symbol, htf, htf_lookback)
+                funding = self.exchange.fetch_funding_rate(symbol)
+
+                highs = np.array([c.high for c in candles])
+                lows = np.array([c.low for c in candles])
+                closes = np.array([c.close for c in candles])
+                atrs[symbol] = float(calculate_atr(highs, lows, closes)[-1])
+                prices[symbol] = float(closes[-1])
+
+                edges = self.edges.analyze_all_edges(
+                    symbol, candles, funding, higher_tf_candles=htf_candles or None
+                )
+                market.append(
+                    symbol_snapshot(symbol, candles, funding, htf_candles or None, edges)
+                )
+            except Exception as e:
+                self.logger.exception("AI context build failed for %s: %s", symbol, e)
+
+        if not market:
+            self.logger.warning("AI cycle skipped: no market data")
+            return
+
+        context = build_context(
+            symbols_data=market,
+            account=account,
+            risk=self.risk,
+            recent_trades=self.risk.trade_history,
+            competition=self._competition_context(),
+        )
+        # Tell the model plainly when it may not open anything, so it reasons about
+        # exits and holds instead of proposing entries that will be thrown away.
+        if not can_trade:
+            context["hard_limits"]["entries_blocked"] = reason
+
+        console.print(f"[cyan]Consulting {self.ai.client.model}...[/]")
+        decisions, assessment, decision_id = self.ai.decide(context)
+        self._last_ai_call = datetime.utcnow()
+
+        if assessment:
+            console.print(f"[dim]{assessment}[/]")
+        self.logger.info("AI decision_id=%s assessment=%s", decision_id, assessment[:200])
+
+        allowed = set(symbols)
+        # Exits first: closing frees a slot that an entry below may want.
+        for d in decisions:
+            if str(d.get("action", "")).lower() != "close":
+                continue
+            sym = d.get("symbol")
+            pos = next((p for p in account.positions if p.symbol == sym), None)
+            if not pos:
+                continue
+            price = prices.get(sym) or pos.entry_price
+            console.print(f"[yellow]AI closing {sym}: {d.get('rationale', '')[:100]}[/]")
+            self.logger.info("AI_CLOSE %s reason=%s", sym, str(d.get("rationale"))[:200])
+            self._close_position(pos, price, "ai_close")
+
+        if not can_trade:
+            console.print(f"[yellow]Entries blocked: {reason}[/]")
+            self.logger.info("AI entries blocked: %s", reason)
+            return
+
+        account = self.exchange.get_account_state()
+        for d in decisions:
+            if str(d.get("action", "")).lower() not in ("long", "short"):
+                continue
+            sym = str(d.get("symbol") or "")
+            if sym not in prices:
+                continue
+            if any(p.symbol == sym for p in account.positions):
+                continue
+            if len(account.positions) >= self.risk.max_open_positions:
+                break
+
+            signal, why = self.ai.to_signal(
+                d, sym, prices[sym], atrs.get(sym, 0.0), allowed
+            )
+            if signal is None:
+                # A rejected proposal is signal about the model, so keep it visible.
+                console.print(f"[dim]AI {sym} rejected: {why}[/]")
+                self.logger.info("AI_REJECT %s: %s", sym, why)
+                continue
+
+            ok, why = self.risk.can_open(signal, account)
+            if not ok:
+                console.print(f"[yellow]AI {sym} vetoed: {why}[/]")
+                self.logger.info("AI_VETO %s: %s", sym, why)
+                continue
+
+            pair_weight = self.risk.get_pair_weight(sym)
+            size = self.risk.calculate_position_size(signal, account, pair_weight)
+            if size <= 0:
+                self.logger.info("AI_VETO %s: size below minimum", sym)
+                continue
+
+            self._execute_trade(signal, size, pair_weight, decision_id=decision_id)
+            account = self.exchange.get_account_state()
+
+    def _ai_due(self) -> bool:
+        if self._last_ai_call is None:
+            return True
+        elapsed_min = (datetime.utcnow() - self._last_ai_call).total_seconds() / 60
+        return elapsed_min >= self.ai_interval_min
+
+    def _competition_context(self) -> dict:
+        """Trade count and clock — the model should know it needs 10 trades to qualify."""
+        comp = self.config.get("competition", {}) or {}
+        real = [t for t in self.risk.trade_history if not self.risk.is_keepalive(t.strategy)]
+        ctx = {
+            "ranking_metric": "cumulative PnL",
+            "trades_executed": len(real),
+            "minimum_trades_required": comp.get("min_trades", 10),
+            "note": (
+                "Fewer than the minimum trades means disqualification, but forcing "
+                "low-quality trades to hit a count is a losing play. Take good ones."
+            ),
+        }
+        ends_at = comp.get("ends_at")
+        if ends_at:
+            try:
+                remaining = datetime.fromisoformat(str(ends_at)) - datetime.utcnow()
+                ctx["hours_remaining"] = round(remaining.total_seconds() / 3600, 1)
+            except Exception:
+                pass
+        return ctx
+
+    def _execute_trade(
+        self,
+        signal: Signal,
+        size: float,
+        pair_weight: float = 1.0,
+        decision_id: str | None = None,
+    ):
         console.print(f"\n[bold cyan]Signal: {signal.side.value.upper()} {signal.symbol}[/]")
         console.print(f"   Strategy: {signal.strategy}")
         console.print(f"   Entry: ${signal.entry_price:.4f}")
@@ -239,13 +418,29 @@ class TradingEngine:
             br["strategy"] = signal.strategy
             self.exchange._local_brackets[signal.symbol] = br
 
-        console.print(f"[green]   Order filled: {result.get('id', 'N/A')}[/]")
+        order_id = str(result.get("id", "N/A"))
+        console.print(f"[green]   Order filled: {order_id}[/]")
         self.logger.info(
             "FILL %s %s size=%.6f id=%s SL=%.4f TP=%.4f",
-            signal.side.value, signal.symbol, size,
-            result.get("id", "N/A"),
+            signal.side.value, signal.symbol, size, order_id,
             signal.stop_loss, signal.take_profit,
         )
+
+        # OrderId <-> decision linkage. WEEX requires the submitted AI logs to match
+        # decisions to the orders they caused; reconstructing this after the fact is
+        # guesswork, so bind it at the moment of the fill.
+        if decision_id and self.decision_log:
+            self.decision_log.link_order(
+                decision_id,
+                symbol=signal.symbol,
+                order_id=order_id,
+                side=signal.side.value,
+                size=size,
+                entry_price=signal.entry_price,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+            )
+            self.position_decisions[signal.symbol] = decision_id
         if result.get("sl_placed") is False and self.exchange.mode != "paper":
             console.print("[yellow]   SL not on exchange — software stop active[/]")
         if result.get("tp_placed") is False and self.exchange.mode != "paper":
@@ -413,6 +608,19 @@ class TradingEngine:
         self.risk.record_trade(trade_result)
         self.strategy.sync_scores_from_risk(self.risk)
 
+        # Write the realised result back against the decision that opened it, so the
+        # log shows not just what the model thought but what it actually earned.
+        decision_id = self.position_decisions.pop(position.symbol, None)
+        if decision_id and self.decision_log:
+            self.decision_log.record_outcome(
+                decision_id,
+                symbol=position.symbol,
+                order_id=str(result.get("id", "")) if isinstance(result, dict) else "",
+                pnl=pnl,
+                exit_price=exit_price,
+                exit_reason=reason,
+            )
+
         if pnl < 0:
             self.strategy.record_loss(datetime.utcnow())
         else:
@@ -454,6 +662,8 @@ class TradingEngine:
                     "account": account,
                     "equity_ticks": ticks,
                     "last_trade_time": lt,
+                    # Survives restart so an open position keeps its provenance.
+                    "position_decisions": self.position_decisions,
                     "cycle_count": self.cycle_count,
                     "bot_version": "v8.5",
                     "mode": self.config.get("trading", {}).get("mode", "paper"),

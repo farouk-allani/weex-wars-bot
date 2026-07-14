@@ -32,9 +32,6 @@ strategy:
     max_extension_atr: 0.55
   breakout:
     enabled: false
-    lookback: 20
-    adx_min: 22
-    volume_mult: 1.5
   mean_reversion:
     enabled: true
     strength: 0.76
@@ -89,3 +86,6 @@ logging:
   file: logs/trading.log
   console: true
   state_file: data/bot_state.json
+_tune:
+  variant: comp_no_eth_v851
+  note: WFO preferred no-ETH; wick soft; 90d was green on prior KA-capped stack

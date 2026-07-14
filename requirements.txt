@@ -1,6 +1,10 @@
 # WEEX AI Wars II Trading Bot
 
 ccxt>=4.0.0
+
+# AI decision layer (DeepSeek via OpenAI-compatible endpoint)
+openai>=1.40.0
+
 pandas>=2.0.0
 numpy>=1.24.0
 ta>=0.10.0

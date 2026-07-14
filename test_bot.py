@@ -1,5 +1,6 @@
 """Quick smoke test — modules, risk sizing by strength, SL guards, strategy."""
 
+import copy
 import numpy as np
 import sys
 from datetime import datetime, timezone
@@ -119,9 +120,15 @@ if sig:
 else:
     print("No signal on synthetic data (acceptable)")
 
-# Per-symbol timer independence
-strategy.last_trade_time["BTC/USDT:USDT"] = ts0
-assert strategy._needs_keepalive(ts0, "SOL/USDT:USDT") is True
+# Per-symbol timer independence. Keep-alive is off in the shipped config — the AI
+# decision log is the heartbeat now — so test it against a config that enables it,
+# rather than coupling the test to a deployment choice.
+ka_config = copy.deepcopy(config)
+ka_config["strategy"]["keepalive"]["enabled"] = True
+ka_config["competition"]["pure_edge"] = False  # pure_edge force-disables keep-alive
+ka_strategy = CompositeStrategy(ka_config)
+ka_strategy.last_trade_time["BTC/USDT:USDT"] = ts0
+assert ka_strategy._needs_keepalive(ts0, "SOL/USDT:USDT") is True
 print("Per-symbol keep-alive timer OK")
 
 print("\n=== TRAILING ACTIVATION ===")

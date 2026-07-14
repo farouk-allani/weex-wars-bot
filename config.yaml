@@ -1,26 +1,50 @@
-# WEEX AI Wars II — Competition Config v8.5.1
-# Winner from WFO: comp_no_eth (skip ETH)
-# Wick quality = size bonus (not hard gate)
-# Soft 90d green history; 120d still choppy — survival first
+# WEEX AI Wars — AI-driven config.
+# DeepSeek is the primary decision-maker; the risk block below is a hard veto layer
+# it cannot override. Rules: ranking by cumulative PnL, min 10 trades, max 20x
+# leverage, >8h without AI logs is non-compliant.
+
+# AI decision layer
+ai:
+  enabled: true
+  provider: deepseek
+  model: deepseek-chat          # deepseek-reasoner logs full chain-of-thought (richer
+                                # compliance artifact, slower + pricier per call)
+  base_url: https://api.deepseek.com
+  temperature: 0.3
+  max_tokens: 2000
+  timeout_seconds: 90
+  max_retries: 2
+  # Every call writes an AI log entry, trade or no trade. 60min keeps us far inside
+  # the 8h inactivity rule even if several calls fail in a row.
+  decision_interval_minutes: 60
+  min_conviction: 0.35          # below this, the model's own doubt vetoes the trade
+  min_stop_atr: 0.5             # tighter than this is noise-stopped
+  max_stop_atr: 4.0             # wider than this is not a trade
+  log_file: logs/ai_decisions.jsonl
 
 trading:
   mode: paper
+  # The 8 pairs WEEX permits. Anything else is disqualified.
   symbols:
-    - BTC/USDT:USDT
-    - SOL/USDT:USDT          # ETH disabled (drag in WFO)
+  - BTC/USDT:USDT
+  - ETH/USDT:USDT
+  - SOL/USDT:USDT
+  - BNB/USDT:USDT
+  - XRP/USDT:USDT
+  - DOGE/USDT:USDT
+  - ADA/USDT:USDT
+  - LTC/USDT:USDT
   default_leverage: 5
-  max_leverage: 8
+  max_leverage: 20              # competition ceiling
   timeframe: 1h
   higher_timeframe: 4h
   lookback_periods: 120
   htf_lookback: 80
-
 risk:
   max_risk_per_trade: 0.012
   max_drawdown: 0.15
-  max_open_positions: 2
-  # BTC/SOL are ~0.8 correlated: 2 shorts is one bet at 2x size, not 2 positions.
-  max_same_side_positions: 1
+  max_open_positions: 3
+  max_same_side_positions: 2
   cooldown_after_losses: 3
   max_consecutive_losses: 3
   cooldown_hours: 6
@@ -31,7 +55,6 @@ risk:
   win_streak_cooldown: false
   partial_tp_enabled: true
   partial_be_buffer_atr: 0.12
-
 strategy:
   name: composite
   trend_follow:
@@ -54,13 +77,14 @@ strategy:
     bb_period: 20
     bb_std: 2.0
   keepalive:
-    enabled: true
+    enabled: false
     symbol_base: SOL
     interval_hours: 16
     strength: 0.04
     max_per_week: 2
-
 competition:
+  min_trades: 10                # below this = disqualified
+  # ends_at: "2026-07-28T12:00:00"   # set this so the AI knows its clock
   min_edges: 1
   min_rr: 1.35
   allow_asia_mr: true
@@ -68,46 +92,37 @@ competition:
   htf_directional_bias: true
   long_only: false
   partial_tp: true
-  pure_edge: false
-  disabled_pairs:
-    - ETH
-
+  pure_edge: true
+  disabled_pairs: []
 edges:
   funding_extreme: 0.0003
   funding_crowded: 0.0005
-
 indicators:
   atr_period: 14
   vwap_period: 20
   ema_fast: 9
   ema_slow: 21
   adx_period: 14
-
 sizing:
-  # Fixed-fractional: risk_amount / stop_distance already IS the 1.2% risk budget.
-  # Multiplying that by half-Kelly on top double-shrinks it — and at a 0.52 default
-  # win rate Kelly pins to its 0.15 floor for any R:R under ~2.5, so every trade was
-  # sized at ~1/8 of the stated budget until a strategy accumulated 5+ closed trades.
   method: fixed_fractional
   default_win_rate: 0.52
   min_position_usd: 10
-  # Notional ceiling as a fraction of equity (x strength). At a typical ~2% stop the
-  # risk formula wants ~0.6x equity notional, so 0.15 was the real binding cap, not
-  # the risk budget. This now only catches pathologically tight stops.
   max_position_pct: 0.75
-
 backtest:
-  initial_capital: 10000
+  # WEEX resets every account to 1,000 USDT at the start. Sizing off 10,000 would
+  # propose positions the real account cannot margin.
+  initial_capital: 1000
   commission_rate: 0.0006
   slippage_pct: 0.0005
   use_kill_switch: false
-
 logging:
   level: INFO
   file: logs/trading.log
   console: true
   state_file: data/bot_state.json
-
 _tune:
-  variant: comp_no_eth_v851
-  note: "WFO preferred no-ETH; wick soft; 90d was green on prior KA-capped stack"
+  variant: pure_edge_multi
+  full_pnl: 157.31
+  oos_pnl: 12.85
+  days: 120
+  version: v8.5
