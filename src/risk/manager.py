@@ -32,6 +32,11 @@ class RiskManager:
         self.cooldown_after_wins = risk_config.get("cooldown_after_wins", 1)
         self.partial_tp_enabled = risk_config.get("partial_tp_enabled", True)
         self.partial_be_buffer_atr = risk_config.get("partial_be_buffer_atr", 0.1)
+        # Majors move together. Two shorts across BTC/SOL is one directional bet at
+        # double size, not two independent positions, so cap same-side exposure.
+        self.max_same_side_positions = int(
+            risk_config.get("max_same_side_positions", 1)
+        )
 
         sizing_config = config.get("sizing", {})
         self.sizing_method = sizing_config.get("method", "half_kelly")
@@ -100,6 +105,19 @@ class RiskManager:
         if len(account.positions) >= self.max_open_positions:
             return False, f"Max positions: {len(account.positions)}/{self.max_open_positions}"
 
+        return True, "OK"
+
+    def can_open(self, signal: Signal, account: AccountState) -> tuple[bool, str]:
+        """Per-signal gate, on top of the account-level can_trade() checks."""
+        if self.max_same_side_positions <= 0:
+            return True, "OK"
+        same_side = sum(1 for p in account.positions if p.side == signal.side)
+        if same_side >= self.max_same_side_positions:
+            return (
+                False,
+                f"Correlated exposure: already {same_side} "
+                f"{signal.side.value} position(s), max {self.max_same_side_positions}",
+            )
         return True, "OK"
 
     def get_strategy_weight(self, strategy: str) -> float:

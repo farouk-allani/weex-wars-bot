@@ -216,6 +216,9 @@ class PortfolioBacktester:
                 )
                 if not signal:
                     continue
+                can_open, _ = risk.can_open(signal, account)
+                if not can_open:
+                    continue
                 size = risk.calculate_position_size(signal, account, risk.get_pair_weight(s.symbol))
                 if size <= 0:
                     continue

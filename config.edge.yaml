@@ -12,6 +12,7 @@ risk:
   max_risk_per_trade: 0.012
   max_drawdown: 0.15
   max_open_positions: 2
+  max_same_side_positions: 1
   cooldown_after_losses: 3
   max_consecutive_losses: 3
   cooldown_hours: 6
@@ -74,10 +75,10 @@ indicators:
   ema_slow: 21
   adx_period: 14
 sizing:
-  method: half_kelly
+  method: fixed_fractional
   default_win_rate: 0.52
   min_position_usd: 10
-  max_position_pct: 0.15
+  max_position_pct: 0.75
 backtest:
   initial_capital: 10000
   commission_rate: 0.0006

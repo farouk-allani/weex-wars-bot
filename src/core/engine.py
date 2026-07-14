@@ -6,6 +6,7 @@
 - File logging
 """
 
+import logging
 import time
 import yaml
 import signal as sig
@@ -128,7 +129,13 @@ class TradingEngine:
         can_trade, reason = self.risk.can_trade(account)
         if not can_trade:
             console.print(f"[yellow]Trading blocked: {reason}[/]")
-            self.logger.warning("Trading blocked: %s", reason)
+            # A full book is routine, not a warning — logging it at WARNING every
+            # cycle buries the blocks that actually matter (kill-switch, cooldown).
+            routine = reason.startswith("Max positions")
+            self.logger.log(
+                logging.INFO if routine else logging.WARNING,
+                "Trading blocked: %s", reason,
+            )
             self._manage_positions(account)
             return
 
@@ -158,6 +165,12 @@ class TradingEngine:
                     higher_tf_candles=htf_candles if htf_candles else None,
                 )
                 if signal is None:
+                    continue
+
+                can_open, why = self.risk.can_open(signal, account)
+                if not can_open:
+                    console.print(f"[yellow]Skipping {symbol}: {why}[/]")
+                    self.logger.info("SKIP %s: %s", symbol, why)
                     continue
 
                 pair_weight = self.risk.get_pair_weight(symbol)

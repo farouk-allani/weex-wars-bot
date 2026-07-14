@@ -19,6 +19,8 @@ risk:
   max_risk_per_trade: 0.012
   max_drawdown: 0.15
   max_open_positions: 2
+  # BTC/SOL are ~0.8 correlated: 2 shorts is one bet at 2x size, not 2 positions.
+  max_same_side_positions: 1
   cooldown_after_losses: 3
   max_consecutive_losses: 3
   cooldown_hours: 6
@@ -82,10 +84,17 @@ indicators:
   adx_period: 14
 
 sizing:
-  method: half_kelly
+  # Fixed-fractional: risk_amount / stop_distance already IS the 1.2% risk budget.
+  # Multiplying that by half-Kelly on top double-shrinks it — and at a 0.52 default
+  # win rate Kelly pins to its 0.15 floor for any R:R under ~2.5, so every trade was
+  # sized at ~1/8 of the stated budget until a strategy accumulated 5+ closed trades.
+  method: fixed_fractional
   default_win_rate: 0.52
   min_position_usd: 10
-  max_position_pct: 0.15
+  # Notional ceiling as a fraction of equity (x strength). At a typical ~2% stop the
+  # risk formula wants ~0.6x equity notional, so 0.15 was the real binding cap, not
+  # the risk budget. This now only catches pathologically tight stops.
+  max_position_pct: 0.75
 
 backtest:
   initial_capital: 10000
