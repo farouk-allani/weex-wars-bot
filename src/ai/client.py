@@ -16,7 +16,12 @@ import os
 import time
 from typing import Any, Optional
 
+from dotenv import load_dotenv
 from openai import OpenAI
+
+# Load here rather than relying on some other module having imported the exchange
+# first: any entrypoint that needs a decision model needs the key.
+load_dotenv()
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 # R1 rejects response_format/temperature; chat supports both.
@@ -54,13 +59,18 @@ class DeepSeekClient:
 
     def decide(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         """Returns {content, reasoning, usage, latency_ms, raw}. Raises AIError."""
+        # R1 spends its budget on chain-of-thought BEFORE emitting the answer. At
+        # 2k tokens it reasons until the budget is gone and returns empty content —
+        # so give it room for the thinking plus the JSON.
+        max_tokens = max(self.max_tokens, 8000) if self.is_reasoner else self.max_tokens
+
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens,
         }
         if not self.is_reasoner:
             kwargs["temperature"] = self.temperature

@@ -40,13 +40,49 @@ def _r(x: Any, n: int = 4) -> Any:
         return None
 
 
+def _clean(obj: Any) -> Any:
+    """Coerce numpy scalars to native Python types.
+
+    The indicator and edge code returns np.int64/np.bool_/np.float64. json.dumps
+    would fall back to default=str on those and hand the model the *string* "28" or
+    "True" instead of a number or a boolean — which it reads, and reasons over,
+    noticeably worse. Fix the types rather than the symptom.
+    """
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean(v) for v in obj]
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        v = float(obj)
+        return round(v, 6) if np.isfinite(v) else None
+    if isinstance(obj, np.ndarray):
+        return _clean(obj.tolist())
+    return obj
+
+
 def symbol_snapshot(
     symbol: str,
     candles: list[Candle],
     funding_rate: float = 0.0,
     htf_candles: Optional[list[Candle]] = None,
     edges: Optional[dict] = None,
+    positioning: Optional[dict] = None,
+    include_oscillators: bool = False,
 ) -> dict:
+    """
+    include_oscillators: RSI / StochRSI / Bollinger z-score / VWAP deviation.
+
+    Off by default, and that is not an aesthetic choice.
+    Feeding these to the model triggers a memorised playbook — "price at upper BB +
+    overbought stoch => short to VWAP" — which it recited on ~80% of decisions,
+    verbatim, while ignoring macro and positioning entirely. It fades every rally,
+    including macro-driven ones, and it loses. The oscillators have no demonstrated
+    edge here and they actively crowd out the inputs that might.
+    """
     closes = np.array([c.close for c in candles], dtype=float)
     highs = np.array([c.high for c in candles], dtype=float)
     lows = np.array([c.low for c in candles], dtype=float)
@@ -90,18 +126,6 @@ def symbol_snapshot(
             "ema_slow": _r(calculate_ema(closes, 21)[-1]),
             "htf_4h_direction": _htf_direction(htf_candles),
         },
-        "mean_reversion": {
-            "rsi_14": _r(rsi[-1], 1) if len(rsi) else None,
-            "stoch_rsi_k": _r(k[-1], 1) if len(k) else None,
-            "bb_upper": _r(upper[-1]),
-            "bb_mid": _r(mid[-1]),
-            "bb_lower": _r(lower[-1]),
-            "bb_zscore": _r(z, 2),
-            "vwap_20": _r(vwap[-1]) if len(vwap) else None,
-            "vwap_deviation_pct": _r((price / float(vwap[-1]) - 1) * 100, 2)
-            if len(vwap) and vwap[-1]
-            else None,
-        },
         "momentum": {
             "macd_hist": _r(hist[-1], 5) if len(hist) else None,
             "macd_cross": (
@@ -136,9 +160,28 @@ def symbol_snapshot(
             "recent_low_72": _r(float(np.min(lows[-72:]))) if len(lows) >= 72 else None,
         },
     }
+    if include_oscillators:
+        snap["oscillators"] = {
+            "rsi_14": _r(rsi[-1], 1) if len(rsi) else None,
+            "stoch_rsi_k": _r(k[-1], 1) if len(k) else None,
+            "bb_upper": _r(upper[-1]),
+            "bb_mid": _r(mid[-1]),
+            "bb_lower": _r(lower[-1]),
+            "bb_zscore": _r(z, 2),
+            "vwap_20": _r(vwap[-1]) if len(vwap) else None,
+            "vwap_deviation_pct": _r((price / float(vwap[-1]) - 1) * 100, 2)
+            if len(vwap) and vwap[-1]
+            else None,
+        }
     if edges:
+        # Ships with the oscillators: the "volume divergence" detector fires on
+        # almost every bar and the model quotes it as corroboration for the fade.
         snap["edge_signals"] = edges
-    return snap
+    if positioning:
+        # Who is on the wrong side of this move. The one input here that is
+        # information rather than interpretation of price.
+        snap["positioning"] = positioning
+    return _clean(snap)
 
 
 def _htf_direction(htf: Optional[list[Candle]]) -> Optional[str]:
@@ -160,6 +203,8 @@ def build_context(
     risk,
     recent_trades: list,
     competition: Optional[dict] = None,
+    fear_greed: Optional[int] = None,
+    macro: Optional[dict] = None,
 ) -> dict:
     """Full decision context: market + book + risk envelope + own recent results."""
     drawdown = 0.0
@@ -230,6 +275,22 @@ def build_context(
         "recent_closed_trades": history,
         "markets": symbols_data,
     }
+    if macro:
+        # Why the tape is moving, not just that it moved.
+        ctx["macro"] = macro
+    if fear_greed is not None:
+        ctx["market_sentiment"] = {
+            "fear_greed_index": fear_greed,
+            "label": (
+                "extreme fear" if fear_greed <= 25 else
+                "fear" if fear_greed <= 45 else
+                "neutral" if fear_greed <= 55 else
+                "greed" if fear_greed <= 75 else "extreme greed"
+            ),
+            # Scale only. What an extreme means for direction is the model's call —
+            # the last time a "note" here editorialised, the model traded the label.
+            "note": "0 = extreme fear, 100 = extreme greed.",
+        }
     if competition:
         ctx["competition"] = competition
-    return ctx
+    return _clean(ctx)

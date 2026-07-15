@@ -64,6 +64,9 @@ def main():
         title="Dry Run",
     ))
 
+    # Same context the live engine builds: oscillators/edges only if config asks.
+    use_osc = bool(cfg.get("ai", {}).get("include_oscillators", False))
+
     market, atrs, prices = [], {}, {}
     for sym in symbols:
         candles = exchange.fetch_candles(sym, tf, cfg["trading"].get("lookback_periods", 120))
@@ -77,8 +80,9 @@ def main():
         closes = np.array([c.close for c in candles])
         atrs[sym] = float(calculate_atr(highs, lows, closes)[-1])
         prices[sym] = float(closes[-1])
-        e = edges.analyze_all_edges(sym, candles, funding, higher_tf_candles=htf_c or None)
-        market.append(symbol_snapshot(sym, candles, funding, htf_c or None, e))
+        e = edges.analyze_all_edges(candles, funding, higher_tf_candles=htf_c or None) if use_osc else None
+        market.append(symbol_snapshot(sym, candles, funding, htf_c or None, e,
+                                      include_oscillators=use_osc))
         console.print(f"[green]  {sym:20s} ${prices[sym]:>10,.4f}  ATR={atrs[sym]:.4f}[/]")
 
     account = exchange.get_account_state()
