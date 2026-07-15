@@ -79,6 +79,24 @@ class TradingEngine:
         self.position_decisions: dict[str, str] = (state or {}).get("position_decisions") or {}
         self._last_ai_call: datetime | None = None
         self.ai_interval_min = float(ai_cfg.get("decision_interval_minutes", 60))
+        # Oscillators + edge_signals travel together, exactly like the replay's
+        # --no-osc arm. Off unless someone re-tests and flips it in config: feeding
+        # them triggered a memorised BB-fade reflex that shorted a bull market.
+        self.ai_include_osc = bool(ai_cfg.get("include_oscillators", False))
+
+        # --- Maker execution ---
+        # Entries rest at the touch instead of crossing the spread: measured
+        # round-trip cost at market (0.22%) exceeded the best measured edge
+        # (~0.13%/trade), so the fee/slippage saved here IS the strategy's margin.
+        exec_cfg = self.config.get("execution", {}) or {}
+        self.maker_entries = bool(exec_cfg.get("maker_entries", False))
+        self.entry_ttl_sec = float(exec_cfg.get("entry_ttl_minutes", 45)) * 60
+        self.reprice_sec = float(exec_cfg.get("reprice_seconds", 180))
+        self.max_chase_atr = float(exec_cfg.get("max_chase_atr", 0.5))
+        # symbol -> resting entry bookkeeping (order id, brackets, chase state).
+        # Restored across restarts; the first _manage_pending_entries pass
+        # reconciles each entry against the venue/paper ledger and drops the dead.
+        self.pending_entries: dict[str, dict] = (state or {}).get("pending_entries") or {}
 
         if ai_cfg.get("enabled", False):
             self.decision_log = DecisionLog(ai_cfg.get("log_file", "logs/ai_decisions.jsonl"))
@@ -145,6 +163,9 @@ class TradingEngine:
         self._cleanup()
 
     def _run_cycle(self, symbols, timeframe, htf, lookback, htf_lookback):
+        # Resting entries are managed every cycle (60s), same as stops — a fill,
+        # a chase or an abandon must never wait on the model's hourly cadence.
+        self._manage_pending_entries()
         if self.ai:
             return self._run_ai_cycle(symbols, timeframe, htf, lookback, htf_lookback)
         return self._run_rules_cycle(symbols, timeframe, htf, lookback, htf_lookback)
@@ -243,11 +264,18 @@ class TradingEngine:
                 atrs[symbol] = float(calculate_atr(highs, lows, closes)[-1])
                 prices[symbol] = float(closes[-1])
 
-                edges = self.edges.analyze_all_edges(
-                    symbol, candles, funding, higher_tf_candles=htf_candles or None
+                edges = (
+                    self.edges.analyze_all_edges(
+                        candles, funding, higher_tf_candles=htf_candles or None
+                    )
+                    if self.ai_include_osc
+                    else None
                 )
                 market.append(
-                    symbol_snapshot(symbol, candles, funding, htf_candles or None, edges)
+                    symbol_snapshot(
+                        symbol, candles, funding, htf_candles or None, edges,
+                        include_oscillators=self.ai_include_osc,
+                    )
                 )
             except Exception as e:
                 self.logger.exception("AI context build failed for %s: %s", symbol, e)
@@ -290,22 +318,52 @@ class TradingEngine:
             self.logger.info("AI_CLOSE %s reason=%s", sym, str(d.get("rationale"))[:200])
             self._close_position(pos, price, "ai_close")
 
+        # A fresh decision supersedes a resting order that no longer matches it —
+        # the model has seen an hour of data the order has not. Same-side entries
+        # keep resting (the chase logic owns the price); everything else is pulled.
+        for d in decisions:
+            sym = str(d.get("symbol") or "")
+            pe = self.pending_entries.get(sym)
+            if not pe:
+                continue
+            act = str(d.get("action", "")).lower()
+            if act in ("long", "short") and act == pe["side"]:
+                continue
+            self._abandon_pending(sym, pe, f"superseded_by_{act or 'none'}")
+
         if not can_trade:
             console.print(f"[yellow]Entries blocked: {reason}[/]")
             self.logger.info("AI entries blocked: %s", reason)
+            # Resting orders are entries too. A block that leaves them on the book
+            # would keep opening positions the risk engine just refused.
+            for sym, pe in list(self.pending_entries.items()):
+                self._abandon_pending(sym, pe, f"blocked:{reason}")
             return
 
         account = self.exchange.get_account_state()
         for d in decisions:
-            if str(d.get("action", "")).lower() not in ("long", "short"):
+            act = str(d.get("action", "")).lower()
+            if act not in ("long", "short"):
                 continue
             sym = str(d.get("symbol") or "")
             if sym not in prices:
                 continue
             if any(p.symbol == sym for p in account.positions):
                 continue
-            if len(account.positions) >= self.risk.max_open_positions:
+            if sym in self.pending_entries:
+                continue  # same thesis already resting; chase logic owns it
+            # Resting orders are commitments: count them against the caps, or a
+            # cycle of unfilled entries quietly stacks exposure past the limits.
+            if len(account.positions) + len(self.pending_entries) >= self.risk.max_open_positions:
                 break
+            pending_same = sum(1 for q in self.pending_entries.values() if q["side"] == act)
+            open_same = sum(1 for p in account.positions if p.side.value == act)
+            if 0 < self.risk.max_same_side_positions <= pending_same + open_same:
+                self.logger.info(
+                    "AI_VETO %s: %d %s position(s)/order(s) already committed",
+                    sym, pending_same + open_same, act,
+                )
+                continue
 
             signal, why = self.ai.to_signal(
                 d, sym, prices[sym], atrs.get(sym, 0.0), allowed
@@ -328,7 +386,10 @@ class TradingEngine:
                 self.logger.info("AI_VETO %s: size below minimum", sym)
                 continue
 
-            self._execute_trade(signal, size, pair_weight, decision_id=decision_id)
+            self._execute_trade(
+                signal, size, pair_weight,
+                decision_id=decision_id, atr=atrs.get(sym, 0.0),
+            )
             account = self.exchange.get_account_state()
 
     def _ai_due(self) -> bool:
@@ -365,6 +426,7 @@ class TradingEngine:
         size: float,
         pair_weight: float = 1.0,
         decision_id: str | None = None,
+        atr: float = 0.0,
     ):
         console.print(f"\n[bold cyan]Signal: {signal.side.value.upper()} {signal.symbol}[/]")
         console.print(f"   Strategy: {signal.strategy}")
@@ -386,6 +448,11 @@ class TradingEngine:
         )
 
         self.exchange.set_leverage(signal.symbol, signal.leverage)
+
+        if self.maker_entries:
+            self._place_maker_entry(signal, size, atr=atr, decision_id=decision_id)
+            return
+
         result = self.exchange.place_order(
             symbol=signal.symbol,
             side=signal.side,
@@ -446,6 +513,261 @@ class TradingEngine:
         if result.get("tp_placed") is False and self.exchange.mode != "paper":
             console.print("[yellow]   TP not on exchange — software TP active[/]")
         # Push open positions to dashboard immediately
+        self._persist_state()
+
+    # ---- Maker entry lifecycle ----
+    #
+    # place -> (chase toward the touch) -> fill | abandon. The invariants:
+    #   - one resting order per symbol, counted against position limits;
+    #   - brackets travel with the order, so a fill can never be stopless;
+    #   - we reprice toward the market but never past max_chase_atr from the
+    #     signal price, and never below the minimum R:R — a trade that must be
+    #     chased that far has already told us the setup is gone;
+    #   - a missed entry costs nothing. Crossing the spread costs 0.11% every
+    #     time. At our measured edge, patience is the whole profit margin.
+
+    def _place_maker_entry(
+        self,
+        signal: Signal,
+        size: float,
+        atr: float = 0.0,
+        decision_id: str | None = None,
+    ):
+        touch = self.exchange.touch_price(signal.symbol, signal.side)
+        if touch <= 0:
+            self.logger.warning("ENTRY_SKIP %s: no touch price", signal.symbol)
+            return
+        # A limit already beyond the stop or target is not an entry, it's a mistake.
+        if signal.side == Side.LONG and not (signal.stop_loss < touch < signal.take_profit):
+            self.logger.info("ENTRY_SKIP %s: touch %.6f outside bracket", signal.symbol, touch)
+            return
+        if signal.side == Side.SHORT and not (signal.take_profit < touch < signal.stop_loss):
+            self.logger.info("ENTRY_SKIP %s: touch %.6f outside bracket", signal.symbol, touch)
+            return
+
+        res = self.exchange.place_entry_limit(
+            signal.symbol, signal.side, size, touch,
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit,
+            strategy=signal.strategy,
+            leverage=signal.leverage,
+            partial_take_profit=signal.partial_take_profit,
+            partial_fraction=signal.partial_fraction,
+        )
+        if "error" in res:
+            # Post-only rejection means the touch moved through us between the
+            # ticker read and the order landing. Not an error to retry blindly —
+            # the next cycle re-decides with fresh prices.
+            console.print(f"[yellow]   Maker entry not placed: {res['error']}[/]")
+            self.logger.info("ENTRY_PLACE_FAILED %s: %s", signal.symbol, res["error"])
+            return
+
+        now_iso = datetime.utcnow().isoformat()
+        self.pending_entries[signal.symbol] = {
+            "order_id": str(res["id"]),
+            "side": signal.side.value,
+            "size": size,
+            "limit_price": touch,
+            "signal_price": signal.entry_price,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "partial_take_profit": signal.partial_take_profit,
+            "partial_fraction": signal.partial_fraction,
+            "strategy": signal.strategy,
+            "leverage": signal.leverage,
+            # Chase distances are measured in ATR; when the caller has none
+            # (rules path), infer it from the stop, which to_signal keeps at
+            # 0.5-4 ATR — the midpoint makes dist/2 a serviceable stand-in.
+            "atr": atr if atr > 0 else abs(signal.entry_price - signal.stop_loss) / 2,
+            "min_rr": self.ai.min_rr if self.ai else float(
+                self.config.get("competition", {}).get("min_rr", 1.35)
+            ),
+            "decision_id": decision_id,
+            "placed_at": now_iso,
+            "last_reprice_at": now_iso,
+            "reprices": 0,
+        }
+        console.print(
+            f"[cyan]   Entry resting at {touch:.6f} (maker) — "
+            f"chases <= {self.max_chase_atr}x ATR, TTL {self.entry_ttl_sec / 60:.0f}min[/]"
+        )
+        self.logger.info(
+            "ENTRY_RESTING %s %s size=%.6f limit=%.6f id=%s",
+            signal.side.value, signal.symbol, size, touch, res["id"],
+        )
+        self._persist_state()
+
+    def _manage_pending_entries(self):
+        if not self.pending_entries:
+            return
+        # Risk blocks must reach resting orders immediately, not on the model's
+        # hourly cadence — a fill during a cooldown is exposure the risk engine
+        # had already vetoed.
+        blocked = self.risk.is_killed or (
+            self.risk.cooldown_until and datetime.utcnow() < self.risk.cooldown_until
+        )
+        for symbol, pe in list(self.pending_entries.items()):
+            try:
+                if blocked:
+                    self._abandon_pending(symbol, pe, "risk_blocked")
+                else:
+                    self._manage_one_pending(symbol, pe)
+            except Exception as e:
+                console.print(f"[red]Pending entry error {symbol}: {e}[/]")
+                self.logger.exception("Pending %s: %s", symbol, e)
+
+    def _manage_one_pending(self, symbol: str, pe: dict):
+        side = Side(pe["side"])
+        res = self.exchange.check_entry_fill(pe["order_id"], symbol)
+
+        if res["status"] == "filled":
+            self._on_entry_fill(
+                symbol, pe,
+                float(res.get("filled_amount") or pe["size"]),
+                float(res.get("fill_price") or pe["limit_price"]),
+            )
+            return
+        if res["status"] == "gone":
+            filled = float(res.get("filled_amount") or 0)
+            if filled > 0:
+                self._on_entry_fill(
+                    symbol, pe, filled,
+                    float(res.get("fill_price") or pe["limit_price"]),
+                )
+            else:
+                self.logger.info("ENTRY_GONE %s (order no longer exists)", symbol)
+                self.pending_entries.pop(symbol, None)
+                self._persist_state()
+            return
+
+        # Still resting: abandon if stale or run away from, else chase the touch.
+        now = datetime.utcnow()
+        try:
+            placed_at = datetime.fromisoformat(str(pe["placed_at"]))
+            last_place = datetime.fromisoformat(str(pe.get("last_reprice_at") or pe["placed_at"]))
+        except ValueError:
+            placed_at = last_place = now
+        age = (now - placed_at).total_seconds()
+
+        touch = self.exchange.touch_price(symbol, side)
+        if touch <= 0:
+            return
+
+        atr = float(pe.get("atr") or 0)
+        signal_price = float(pe["signal_price"])
+        run = (touch - signal_price) if side == Side.LONG else (signal_price - touch)
+
+        if age > self.entry_ttl_sec:
+            self._abandon_pending(symbol, pe, "ttl_expired")
+            return
+        if atr > 0 and run > self.max_chase_atr * atr:
+            self._abandon_pending(symbol, pe, "price_ran_away")
+            return
+
+        limit = float(pe["limit_price"])
+        moved_away = (
+            touch > limit * 1.0002 if side == Side.LONG else touch < limit * 0.9998
+        )
+        if not moved_away or (now - last_place).total_seconds() < self.reprice_sec:
+            return
+
+        # Chasing squeezes the reward side. If the R:R the model was approved on
+        # no longer holds at the new price, the trade is over, not repriceable.
+        sl, tp = float(pe["stop_loss"]), float(pe["take_profit"])
+        stop_dist = abs(touch - sl)
+        rr = abs(tp - touch) / stop_dist if stop_dist > 0 else 0
+        if rr < float(pe.get("min_rr") or 0):
+            self._abandon_pending(symbol, pe, f"rr_degraded_{rr:.2f}")
+            return
+
+        cancel = self.exchange.cancel_entry(pe["order_id"], symbol)
+        filled = float(cancel.get("filled_amount") or 0)
+        if filled > 0:
+            self._on_entry_fill(symbol, pe, filled, float(pe["limit_price"]))
+            return
+
+        res = self.exchange.place_entry_limit(
+            symbol, side, float(pe["size"]), touch,
+            stop_loss=sl, take_profit=tp,
+            strategy=pe.get("strategy") or "",
+            leverage=int(pe.get("leverage") or 5),
+            partial_take_profit=pe.get("partial_take_profit"),
+            partial_fraction=float(pe.get("partial_fraction") or 0.5),
+        )
+        if "error" in res:
+            self.logger.info("ENTRY_REPRICE_FAILED %s: %s", symbol, res["error"])
+            self.pending_entries.pop(symbol, None)
+            self._persist_state()
+            return
+
+        pe["order_id"] = str(res["id"])
+        pe["limit_price"] = touch
+        pe["last_reprice_at"] = now.isoformat()
+        pe["reprices"] = int(pe.get("reprices") or 0) + 1
+        self.logger.info(
+            "ENTRY_REPRICE %s -> %.6f (#%d)", symbol, touch, pe["reprices"]
+        )
+        self._persist_state()
+
+    def _on_entry_fill(self, symbol: str, pe: dict, filled_amount: float, fill_price: float):
+        side = Side(pe["side"])
+        fin = self.exchange.finalize_entry_fill(
+            symbol, side, filled_amount, fill_price,
+            stop_loss=float(pe["stop_loss"]),
+            take_profit=float(pe["take_profit"]),
+            strategy=pe.get("strategy") or "",
+            partial_take_profit=pe.get("partial_take_profit"),
+            partial_fraction=float(pe.get("partial_fraction") or 0.5),
+        )
+        console.print(
+            f"[green]Maker entry filled: {pe['side']} {symbol} "
+            f"{filled_amount:.6f} @ {fill_price:.6f} "
+            f"(saved the spread + taker fee)[/]"
+        )
+        self.logger.info(
+            "MAKER_FILL %s %s size=%.6f price=%.6f reprices=%d id=%s",
+            pe["side"], symbol, filled_amount, fill_price,
+            int(pe.get("reprices") or 0), pe["order_id"],
+        )
+
+        decision_id = pe.get("decision_id")
+        if decision_id and self.decision_log:
+            self.decision_log.link_order(
+                decision_id,
+                symbol=symbol,
+                order_id=str(pe["order_id"]),
+                side=pe["side"],
+                size=filled_amount,
+                entry_price=fill_price,
+                stop_loss=float(pe["stop_loss"]),
+                take_profit=float(pe["take_profit"]),
+            )
+            self.position_decisions[symbol] = decision_id
+
+        if fin.get("sl_placed") is False and self.exchange.mode != "paper":
+            console.print("[yellow]   SL not on exchange — software stop active[/]")
+        if fin.get("tp_placed") is False and self.exchange.mode != "paper":
+            console.print("[yellow]   TP not on exchange — software TP active[/]")
+
+        self.pending_entries.pop(symbol, None)
+        self._persist_state()
+
+    def _abandon_pending(self, symbol: str, pe: dict, reason: str):
+        cancel = self.exchange.cancel_entry(pe["order_id"], symbol)
+        filled = float(cancel.get("filled_amount") or 0)
+        if filled > 0:
+            # The cancel raced a fill. The money is in — bracket it, don't orphan it.
+            self._on_entry_fill(symbol, pe, filled, float(pe["limit_price"]))
+            return
+        console.print(
+            f"[yellow]Entry missed ({reason}): {symbol} never filled at "
+            f"{float(pe['limit_price']):.6f} — no fee paid, no trade[/]"
+        )
+        self.logger.info(
+            "ENTRY_MISSED %s reason=%s limit=%.6f reprices=%d",
+            symbol, reason, float(pe["limit_price"]), int(pe.get("reprices") or 0),
+        )
+        self.pending_entries.pop(symbol, None)
         self._persist_state()
 
     def _manage_positions(self, account):
@@ -664,6 +986,9 @@ class TradingEngine:
                     "last_trade_time": lt,
                     # Survives restart so an open position keeps its provenance.
                     "position_decisions": self.position_decisions,
+                    # Resting maker entries: restored on start, then reconciled
+                    # against the venue by the first pending-management pass.
+                    "pending_entries": self.pending_entries,
                     "cycle_count": self.cycle_count,
                     "bot_version": "v8.5",
                     "mode": self.config.get("trading", {}).get("mode", "paper"),

@@ -54,9 +54,16 @@ class ExchangeClient:
         bt = config.get("backtest", {})
         self.commission_rate = float(bt.get("commission_rate", 0.0006))
         self.slippage_pct = float(bt.get("slippage_pct", 0.0005))
+        # Maker fee for resting limit fills. A maker fill pays no slippage either —
+        # the price is ours by construction; what we risk instead is not filling.
+        exec_cfg = config.get("execution", {}) or {}
+        self.maker_fee_rate = float(exec_cfg.get("maker_fee_rate", 0.0002))
         self.balance = float(bt.get("initial_capital", 10000))
         self.paper_positions: dict[str, Position] = {}
         self.paper_trades: list = []
+        # Paper simulation of resting entry orders, keyed by order id. Live resting
+        # orders live on the venue; this ledger only backs paper mode.
+        self.paper_pending: dict[str, dict] = {}
 
         # Live: remember SL/TP we set (exchange position fetch often omits them)
         self._local_brackets: dict[str, dict] = {}
@@ -233,32 +240,9 @@ class ExchangeClient:
                     symbol, "market", ccxt_side, amount
                 )
 
-            sl_ok, tp_ok = False, False
-            sl_err, tp_err = None, None
-
-            if stop_loss and stop_loss > 0:
-                sl_side = "sell" if side == Side.LONG else "buy"
-                try:
-                    self.exchange.create_order(
-                        symbol, "stop_market", sl_side, amount,
-                        params={"stopPrice": stop_loss, "reduceOnly": True},
-                    )
-                    sl_ok = True
-                except Exception as e:
-                    sl_err = str(e)
-                    print(f"[Exchange] WARNING: SL order failed for {symbol}: {e}")
-
-            if take_profit and take_profit > 0:
-                tp_side = "sell" if side == Side.LONG else "buy"
-                try:
-                    self.exchange.create_order(
-                        symbol, "take_profit_market", tp_side, amount,
-                        params={"stopPrice": take_profit, "reduceOnly": True},
-                    )
-                    tp_ok = True
-                except Exception as e:
-                    tp_err = str(e)
-                    print(f"[Exchange] WARNING: TP order failed for {symbol}: {e}")
+            sl_ok, tp_ok, sl_err, tp_err = self._create_live_brackets(
+                symbol, side, amount, stop_loss, take_profit
+            )
 
             # Cache brackets so software management still works
             fill_price = float(
@@ -295,6 +279,327 @@ class ExchangeClient:
         except Exception as e:
             print(f"[Exchange] Error placing order: {e}")
             return {"error": str(e)}
+
+    def _create_live_brackets(
+        self,
+        symbol: str,
+        side: Side,
+        amount: float,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+    ) -> tuple[bool, bool, Optional[str], Optional[str]]:
+        """Place venue-side SL/TP reduce-only orders. Failures are surfaced, not
+        raised — the caller keeps the position and falls back to software stops."""
+        sl_ok, tp_ok = False, False
+        sl_err, tp_err = None, None
+
+        if stop_loss and stop_loss > 0:
+            sl_side = "sell" if side == Side.LONG else "buy"
+            try:
+                self.exchange.create_order(
+                    symbol, "stop_market", sl_side, amount,
+                    params={"stopPrice": stop_loss, "reduceOnly": True},
+                )
+                sl_ok = True
+            except Exception as e:
+                sl_err = str(e)
+                print(f"[Exchange] WARNING: SL order failed for {symbol}: {e}")
+
+        if take_profit and take_profit > 0:
+            tp_side = "sell" if side == Side.LONG else "buy"
+            try:
+                self.exchange.create_order(
+                    symbol, "take_profit_market", tp_side, amount,
+                    params={"stopPrice": take_profit, "reduceOnly": True},
+                )
+                tp_ok = True
+            except Exception as e:
+                tp_err = str(e)
+                print(f"[Exchange] WARNING: TP order failed for {symbol}: {e}")
+
+        return sl_ok, tp_ok, sl_err, tp_err
+
+    # ---- Maker (post-only) entries ----
+    #
+    # Why this path exists: a market entry pays taker fee + slippage (~0.11% of
+    # notional per side); a resting post-only limit pays the maker fee and no
+    # spread. Measured round-trip cost at market was 0.22% against a best measured
+    # edge of ~0.13%/trade — execution is the difference between negative and
+    # roughly breakeven. So entries rest at the touch and the engine reprices or
+    # abandons; it never crosses the spread to chase a trade.
+
+    def touch_price(self, symbol: str, side: Side) -> float:
+        """Best passive price: the bid for a buy, the ask for a sell.
+
+        Falls back to last when the venue omits book data. Never returns a price
+        that crosses the spread."""
+        t = self.fetch_ticker(symbol)
+        if not t:
+            return 0.0
+        if side == Side.LONG:
+            return float(t.get("bid") or t.get("last") or 0)
+        return float(t.get("ask") or t.get("last") or 0)
+
+    def place_entry_limit(
+        self,
+        symbol: str,
+        side: Side,
+        amount: float,
+        limit_price: float,
+        stop_loss: float = 0.0,
+        take_profit: float = 0.0,
+        strategy: str = "",
+        leverage: Optional[int] = None,
+        partial_take_profit: Optional[float] = None,
+        partial_fraction: float = 0.5,
+    ) -> dict:
+        """Rest a post-only entry at limit_price. Returns {id, status} or {error}.
+
+        The bracket levels travel WITH the pending order so a fill can never
+        produce a position without a stop, even across a restart."""
+        if limit_price <= 0 or amount <= 0:
+            return {"error": "invalid limit price or amount"}
+
+        if self.mode == "paper":
+            if symbol in self.paper_positions:
+                return {"error": "Position already exists"}
+            order_id = f"pending_{symbol.split('/')[0]}_{int(time.time() * 1000)}"
+            self.paper_pending[order_id] = {
+                "id": order_id,
+                "symbol": symbol,
+                "side": side.value,
+                "amount": amount,
+                "limit_price": limit_price,
+                "stop_loss": float(stop_loss or 0),
+                "take_profit": float(take_profit or 0),
+                "strategy": strategy,
+                "leverage": int(leverage or self.config.get("trading", {}).get("default_leverage", 5)),
+                "partial_take_profit": partial_take_profit,
+                "partial_fraction": partial_fraction,
+                "created": time.time(),
+            }
+            return {"id": order_id, "status": "open", "limit_price": limit_price}
+
+        try:
+            ccxt_side = "buy" if side == Side.LONG else "sell"
+            order = self.exchange.create_order(
+                symbol, "limit", ccxt_side, amount, limit_price,
+                params={"postOnly": True},
+            )
+            return {
+                "id": str(order.get("id")),
+                "status": order.get("status") or "open",
+                "limit_price": limit_price,
+            }
+        except Exception as e:
+            # A post-only order that would cross is rejected by the venue — that is
+            # the mechanism working, not a fault. The engine simply retries at the
+            # new touch on its next pass.
+            return {"error": str(e)}
+
+    def check_entry_fill(self, order_id: str, symbol: str) -> dict:
+        """Poll one resting entry. Returns {status: open|filled|gone, fill_price,
+        filled_amount}.
+
+        Paper fill rule: a buy limit fills when the market trades at or below it,
+        a sell limit at or above. Queue-optimistic (a touch counts as a fill) but
+        price-honest — the fill is at OUR price, never an assumed improvement.
+        Polling is 60s, so touches between polls are missed: conservative."""
+        if self.mode == "paper":
+            pending = self.paper_pending.get(order_id)
+            if not pending:
+                return {"status": "gone", "fill_price": 0.0, "filled_amount": 0.0}
+            ticker = self.fetch_ticker(symbol)
+            last = float(ticker.get("last") or 0) if ticker else 0.0
+            if last <= 0:
+                return {"status": "open", "fill_price": 0.0, "filled_amount": 0.0}
+
+            limit = float(pending["limit_price"])
+            side = Side(pending["side"])
+            hit = last <= limit if side == Side.LONG else last >= limit
+            if not hit:
+                return {"status": "open", "fill_price": 0.0, "filled_amount": 0.0}
+
+            if symbol in self.paper_positions:
+                # Should be unreachable (engine holds one pending per symbol), but a
+                # duplicate position would corrupt the ledger — drop the order.
+                self.paper_pending.pop(order_id, None)
+                return {"status": "gone", "fill_price": 0.0, "filled_amount": 0.0}
+
+            self.paper_pending.pop(order_id, None)
+            self._open_paper_position(
+                symbol=symbol,
+                side=side,
+                amount=float(pending["amount"]),
+                fill_price=limit,
+                fee_rate=self.maker_fee_rate,
+                stop_loss=float(pending.get("stop_loss") or 0),
+                take_profit=float(pending.get("take_profit") or 0),
+                strategy=pending.get("strategy") or "",
+                leverage=int(pending.get("leverage") or 5),
+                partial_take_profit=pending.get("partial_take_profit"),
+                partial_fraction=float(pending.get("partial_fraction") or 0.5),
+            )
+            return {
+                "status": "filled",
+                "fill_price": limit,
+                "filled_amount": float(pending["amount"]),
+            }
+
+        try:
+            order = self.exchange.fetch_order(order_id, symbol)
+            status = str(order.get("status") or "open").lower()
+            filled = float(order.get("filled") or 0)
+            fill_price = float(order.get("average") or order.get("price") or 0)
+            if status == "closed":
+                return {"status": "filled", "fill_price": fill_price, "filled_amount": filled}
+            if status in ("canceled", "cancelled", "expired", "rejected"):
+                return {"status": "gone", "fill_price": fill_price, "filled_amount": filled}
+            return {"status": "open", "fill_price": fill_price, "filled_amount": filled}
+        except Exception as e:
+            # fetch_order unsupported or transient failure: infer from open orders,
+            # then from the position book. Anything still ambiguous stays "open" —
+            # the next cycle retries rather than guessing.
+            try:
+                open_orders = self.exchange.fetch_open_orders(symbol)
+                if any(str(o.get("id")) == order_id for o in open_orders):
+                    return {"status": "open", "fill_price": 0.0, "filled_amount": 0.0}
+                positions = self.exchange.fetch_positions([symbol])
+                for p in positions:
+                    if abs(float(p.get("contracts") or 0)) > 0:
+                        return {
+                            "status": "filled",
+                            "fill_price": float(p.get("entryPrice") or 0),
+                            "filled_amount": abs(float(p.get("contracts") or 0)),
+                        }
+                return {"status": "gone", "fill_price": 0.0, "filled_amount": 0.0}
+            except Exception:
+                print(f"[Exchange] check_entry_fill failed for {symbol}: {e}")
+                return {"status": "open", "fill_price": 0.0, "filled_amount": 0.0}
+
+    def cancel_entry(self, order_id: str, symbol: str) -> dict:
+        """Cancel a resting entry. Reports any amount that filled before the cancel
+        landed so the caller can bracket the partial position instead of orphaning it."""
+        if self.mode == "paper":
+            existed = self.paper_pending.pop(order_id, None) is not None
+            return {"cancelled": existed, "filled_amount": 0.0}
+
+        filled = 0.0
+        try:
+            self.exchange.cancel_order(order_id, symbol)
+        except Exception as e:
+            print(f"[Exchange] cancel_entry {symbol} {order_id}: {e}")
+        try:
+            order = self.exchange.fetch_order(order_id, symbol)
+            filled = float(order.get("filled") or 0)
+        except Exception:
+            pass
+        return {"cancelled": True, "filled_amount": filled}
+
+    def finalize_entry_fill(
+        self,
+        symbol: str,
+        side: Side,
+        amount: float,
+        fill_price: float,
+        stop_loss: float,
+        take_profit: float,
+        strategy: str = "",
+        partial_take_profit: Optional[float] = None,
+        partial_fraction: float = 0.5,
+    ) -> dict:
+        """Attach brackets to a just-filled maker entry.
+
+        Paper positions were already built with their brackets at fill time, so
+        this is live-only work: venue SL/TP orders plus the local bracket cache
+        that software management reads."""
+        if self.mode == "paper":
+            return {"sl_placed": True, "tp_placed": True}
+
+        sl_ok, tp_ok, sl_err, tp_err = self._create_live_brackets(
+            symbol, side, amount, stop_loss, take_profit
+        )
+        entry_fee = amount * fill_price * self.maker_fee_rate
+        self._local_brackets[symbol] = {
+            "stop_loss": stop_loss or 0,
+            "take_profit": take_profit or 0,
+            "trailing_stop": None,
+            "highest_price": fill_price,
+            "lowest_price": fill_price,
+            "strategy": strategy,
+            "exchange_sl_set": sl_ok,
+            "exchange_tp_set": tp_ok,
+            "side": side.value,
+            "initial_size": amount,
+            "entry_fee": entry_fee,
+            "fees_paid": entry_fee,
+            "realized_pnl": 0.0,
+            "partial_take_profit": partial_take_profit,
+            "partial_fraction": partial_fraction,
+        }
+        out = {"sl_placed": sl_ok, "tp_placed": tp_ok}
+        if sl_err:
+            out["sl_error"] = sl_err
+        if tp_err:
+            out["tp_error"] = tp_err
+        return out
+
+    def _open_paper_position(
+        self,
+        symbol: str,
+        side: Side,
+        amount: float,
+        fill_price: float,
+        fee_rate: float,
+        stop_loss: float = 0.0,
+        take_profit: float = 0.0,
+        strategy: str = "",
+        leverage: Optional[int] = None,
+        partial_take_profit: Optional[float] = None,
+        partial_fraction: float = 0.5,
+    ) -> Position:
+        """Book a paper position at an explicit fill price and fee rate — shared by
+        market fills (slippage + taker) and limit fills (own price + maker)."""
+        entry_fee = amount * fill_price * fee_rate
+        self.balance -= entry_fee
+
+        lev = leverage or self.config.get("trading", {}).get("default_leverage", 5)
+        sl = float(stop_loss or 0)
+        tp = float(take_profit or 0)
+
+        # Validate SL/TP sides
+        if sl > 0:
+            if side == Side.LONG and sl >= fill_price:
+                sl = fill_price * 0.98
+            if side == Side.SHORT and sl <= fill_price:
+                sl = fill_price * 1.02
+        if tp > 0:
+            if side == Side.LONG and tp <= fill_price:
+                tp = fill_price * 1.02
+            if side == Side.SHORT and tp >= fill_price:
+                tp = fill_price * 0.98
+
+        position = Position(
+            symbol=symbol,
+            side=side,
+            entry_price=fill_price,
+            size=amount,
+            leverage=int(lev),
+            stop_loss=sl,
+            take_profit=tp,
+            highest_price=fill_price,
+            lowest_price=fill_price,
+            strategy=strategy,
+            exchange_sl_set=sl > 0,
+            exchange_tp_set=tp > 0,
+            initial_size=amount,
+            entry_fee=entry_fee,
+            fees_paid=entry_fee,
+            partial_take_profit=partial_take_profit,
+            partial_fraction=partial_fraction,
+        )
+        self.paper_positions[symbol] = position
+        return position
 
     def update_local_brackets(self, position: Position):
         """Sync software-managed stops back into local cache (live)."""
@@ -386,43 +691,17 @@ class ExchangeClient:
             return {"error": "Position already exists"}
 
         fill_price = self.apply_slippage(mark, side)
-        entry_fee = amount * fill_price * self.commission_rate
-        self.balance -= entry_fee
-
-        lev = leverage or self.config.get("trading", {}).get("default_leverage", 5)
-        sl = float(stop_loss or 0)
-        tp = float(take_profit or 0)
-
-        # Validate SL/TP sides
-        if sl > 0:
-            if side == Side.LONG and sl >= fill_price:
-                sl = fill_price * 0.98
-            if side == Side.SHORT and sl <= fill_price:
-                sl = fill_price * 1.02
-        if tp > 0:
-            if side == Side.LONG and tp <= fill_price:
-                tp = fill_price * 1.02
-            if side == Side.SHORT and tp >= fill_price:
-                tp = fill_price * 0.98
-
-        position = Position(
+        position = self._open_paper_position(
             symbol=symbol,
             side=side,
-            entry_price=fill_price,
-            size=amount,
-            leverage=int(lev),
-            stop_loss=sl,
-            take_profit=tp,
-            highest_price=fill_price,
-            lowest_price=fill_price,
+            amount=amount,
+            fill_price=fill_price,
+            fee_rate=self.commission_rate,
+            stop_loss=float(stop_loss or 0),
+            take_profit=float(take_profit or 0),
             strategy=strategy,
-            exchange_sl_set=sl > 0,
-            exchange_tp_set=tp > 0,
-            initial_size=amount,
-            entry_fee=entry_fee,
-            fees_paid=entry_fee,
+            leverage=leverage,
         )
-        self.paper_positions[symbol] = position
 
         order_id = f"paper_{int(time.time() * 1000)}"
         return {
@@ -432,11 +711,11 @@ class ExchangeClient:
             "amount": amount,
             "price": fill_price,
             "status": "filled",
-            "stop_loss": sl,
-            "take_profit": tp,
-            "sl_placed": sl > 0,
-            "tp_placed": tp > 0,
-            "entry_fee": entry_fee,
+            "stop_loss": position.stop_loss,
+            "take_profit": position.take_profit,
+            "sl_placed": position.stop_loss > 0,
+            "tp_placed": position.take_profit > 0,
+            "entry_fee": position.entry_fee,
         }
 
     def update_paper_positions(self):
@@ -454,6 +733,9 @@ class ExchangeClient:
             return {}
         return {
             "balance": self.balance,
+            # Resting entries survive a restart with their brackets intact — a fill
+            # after recovery must still produce a stopped position.
+            "pending": list(self.paper_pending.values()),
             "positions": [
                 {
                     "symbol": p.symbol,
@@ -485,6 +767,11 @@ class ExchangeClient:
             return
         if state.get("balance") is not None:
             self.balance = float(state["balance"])
+        for raw in state.get("pending") or []:
+            try:
+                self.paper_pending[str(raw["id"])] = dict(raw)
+            except Exception as e:
+                print(f"[Exchange] Could not restore pending order: {e}")
         for raw in state.get("positions") or []:
             try:
                 self.paper_positions[raw["symbol"]] = Position(

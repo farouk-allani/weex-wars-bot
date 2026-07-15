@@ -20,7 +20,22 @@ ai:
   min_conviction: 0.35          # below this, the model's own doubt vetoes the trade
   min_stop_atr: 0.5             # tighter than this is noise-stopped
   max_stop_atr: 4.0             # wider than this is not a trade
+  # RSI/Bollinger/StochRSI/VWAP + edge_signals in the AI context. Measured: triggers
+  # a memorised "fade to VWAP" reflex (~80% of decisions) with no PnL benefit in any
+  # replay arm. Do not enable without re-running run_ai_replay A/B first.
+  include_oscillators: false
   log_file: logs/ai_decisions.jsonl
+
+# Execution: how orders reach the venue. Round-trip cost with market orders
+# measured 0.22% of notional vs a best measured edge of ~0.13%/trade — the spread
+# and taker fee were the entire losing margin. Maker entries rest at the touch,
+# chase a little, and abandon rather than ever cross the spread.
+execution:
+  maker_entries: true
+  maker_fee_rate: 0.0002        # WEEX futures maker tier; taker stays at backtest.commission_rate
+  entry_ttl_minutes: 45         # unfilled after this = the setup left without us; fine
+  reprice_seconds: 180          # re-quote toward the touch at most this often
+  max_chase_atr: 0.5            # never chase price further than this from the signal
 
 trading:
   mode: paper
@@ -38,7 +53,8 @@ trading:
   max_leverage: 20              # competition ceiling
   timeframe: 1h
   higher_timeframe: 4h
-  lookback_periods: 120
+  # 200h > 1 week, so the model's 7d change and 72h levels actually populate.
+  lookback_periods: 200
   htf_lookback: 80
 risk:
   max_risk_per_trade: 0.012
