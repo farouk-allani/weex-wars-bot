@@ -13,3 +13,6 @@ data/cache/
 .venv/
 venv/
 config.tuned.yaml
+
+# collected market data (large, regenerable)
+data/

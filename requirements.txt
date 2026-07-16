@@ -18,3 +18,4 @@ schedule>=1.2.0
 # Dashboard
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
+truststore>=0.9  # Windows dev box: OS trust store for exchange certs

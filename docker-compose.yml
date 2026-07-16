@@ -82,6 +82,39 @@ services:
         max-size: "5m"
         max-file: "3"
 
+  collectors:
+    build: .
+    image: weex-wars-bot:latest
+    container_name: weex-collectors
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - bot-data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    # two loops: (bg) real Binance forced-order recorder, 24h files forever;
+    # (fg) carry paper book step + funding snapshot every 8h (each funding print)
+    command:
+      - sh
+      - -c
+      - >
+        (while true; do python run_liq_record.py --hours 24; sleep 5; done) &
+        sleep 20;
+        while true; do
+        python run_carry_weex.py --paper;
+        python run_carry_weex.py --live;
+        sleep 28800;
+        done
+    depends_on:
+      - bot
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
 volumes:
   bot-data:
   bot-logs:
