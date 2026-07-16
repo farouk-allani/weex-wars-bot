@@ -324,11 +324,101 @@ function updateSymbols(symbols) {
     .join("");
 }
 
+function updateEdges(e) {
+  if (!e) return;
+  // ---- carry ----
+  const c = e.carry;
+  const verdictEl = $("carry-verdict");
+  if (c) {
+    setText("carry-verdict", c.verdict || "—");
+    if (verdictEl) {
+      verdictEl.classList.remove("pos", "neg");
+      verdictEl.classList.add(String(c.verdict || "").startsWith("TRADE") ? "pos" : "neg");
+    }
+    setText("carry-snapshots", (c.snapshots ?? 0) + " snaps");
+    setText("carry-3d", fmtPct(c.exp_carry_3d, 3));
+    setText("carry-7d", fmtPct(c.exp_carry_7d, 3));
+    setText("carry-cost", fmtPct(c.cost ?? 0.001, 2));
+    const basket = $("carry-basket");
+    if (basket && c.rates) {
+      const short = (s) => s.split("/")[0];
+      const rows = Object.entries(c.rates)
+        .sort((a, b) => a[1] - b[1])
+        .map(([sym, r]) => {
+          const role = (c.longs || []).includes(sym)
+            ? '<span class="tag pos">LONG</span>'
+            : (c.shorts || []).includes(sym)
+              ? '<span class="tag neg">SHORT</span>'
+              : "";
+          return (
+            '<div class="stat-item"><span>' +
+            escapeHtml(short(sym)) +
+            "</span><strong>" +
+            (r * 100).toFixed(4) +
+            "%/8h " +
+            role +
+            "</strong></div>"
+          );
+        });
+      basket.innerHTML = rows.join("");
+    }
+  }
+  const p = e.carry_paper;
+  if (p) {
+    setText("carry-equity", p.equity != null ? Number(p.equity).toFixed(4) : "—");
+    setText(
+      "carry-book",
+      p.book
+        ? "OPEN since " + String(p.book.opened || "").slice(5, 16)
+        : "flat (gated)"
+    );
+    setText(
+      "carry-closed",
+      (p.closed ?? 0) + " / " + fmtPct(p.net_total ?? 0, 3)
+    );
+  }
+  // ---- liquidations ----
+  const q = e.liq;
+  const st = $("liq-status");
+  if (q) {
+    const live = q.recorder_age_sec != null && q.recorder_age_sec < 300;
+    setText("liq-status", live ? "LIVE" : "stale");
+    if (st) {
+      st.classList.remove("pos", "neg");
+      st.classList.add(live ? "pos" : "neg");
+    }
+    setText("liq-files", (q.files ?? 0) + " files");
+    setText("liq-count", (q.forced_orders ?? 0).toLocaleString());
+    setText("liq-usd", fmtUsd(q.notional_usd ?? 0, 0));
+    setText(
+      "liq-biggest",
+      q.biggest ? fmtUsd(q.biggest.usd, 0) + " " + escapeHtml((q.biggest.sym || "").split("/")[0]) : "—"
+    );
+    const lastEl = $("liq-last");
+    if (lastEl) {
+      lastEl.innerHTML = q.last
+        ? '<div class="stat-item"><span>last forced order</span><strong>' +
+          escapeHtml((q.last.sym || "").split("/")[0]) +
+          " " +
+          escapeHtml(q.last.side || "") +
+          " @ " +
+          q.last.px +
+          " (" +
+          fmtUsd(q.last.usd, 0) +
+          ")</strong></div>"
+        : '<div class="stat-item"><span>last forced order</span><strong>—</strong></div>';
+    }
+  }
+}
+
 async function refresh() {
   try {
-    const [overview, logs] = await Promise.all([
+    const [overview, logs, edgesData] = await Promise.all([
       fetch("/api/overview", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/logs?lines=100", { cache: "no-store" }).then((r) => r.json()),
+      fetch("/api/edges", { cache: "no-store" })
+        .then((r) => r.json())
+        .catch(() => null),
     ]);
 
     const bot = overview.bot || {};
@@ -354,6 +444,7 @@ async function refresh() {
     updateTrades(m.trades || []);
     renderStatList($("strat-list"), m.strategy_stats || []);
     renderStatList($("pair-list"), m.pair_stats || []);
+    updateEdges(edgesData);
     updateLogs(logs);
     updateSymbols(bot.symbols || []);
     await refreshExportInfo();

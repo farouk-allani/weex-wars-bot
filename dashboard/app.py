@@ -100,6 +100,104 @@ def load_state() -> dict:
         return {}
 
 
+def _data_dir() -> Path:
+    return _state_path().parent
+
+
+# incremental tail cache for the (large) liquidation tape: path -> progress
+_liq_cache: dict[str, dict] = {}
+
+
+def _scan_liq_file(path: Path) -> dict:
+    key = str(path)
+    st = path.stat()
+    c = _liq_cache.get(key)
+    if c is None or st.st_size < c["offset"]:
+        c = {"offset": 0, "liqs": 0, "usd": 0.0, "last": None, "biggest": None}
+    if st.st_size > c["offset"]:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            f.seek(c["offset"])
+            for line in f:
+                if '"liq"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                c["liqs"] += 1
+                c["usd"] += r.get("usd") or 0
+                c["last"] = r
+                if c["biggest"] is None or (r.get("usd") or 0) > (c["biggest"].get("usd") or 0):
+                    c["biggest"] = r
+            c["offset"] = f.tell()
+    _liq_cache[key] = c
+    return c
+
+
+def build_edges(cfg: dict) -> dict[str, Any]:
+    d = _data_dir()
+    out: dict[str, Any] = {"carry": None, "carry_paper": None, "liq": None}
+
+    fwd = d / "carry_forward.jsonl"
+    if fwd.exists():
+        lines = fwd.read_text(encoding="utf-8").strip().splitlines()
+        if lines:
+            try:
+                snap = json.loads(lines[-1])
+                snap["snapshots"] = len(lines)
+                out["carry"] = snap
+            except json.JSONDecodeError:
+                pass
+
+    pstate = d / "carry_paper_state.json"
+    paper: dict[str, Any] = {}
+    if pstate.exists():
+        try:
+            paper = json.loads(pstate.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            paper = {}
+    trades_f = d / "carry_paper_trades.jsonl"
+    trades = []
+    if trades_f.exists():
+        for line in trades_f.read_text(encoding="utf-8").strip().splitlines():
+            try:
+                trades.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if paper or trades:
+        out["carry_paper"] = {
+            "equity": paper.get("equity"),
+            "book": paper.get("book"),
+            "closed": len(trades),
+            "net_total": sum(t.get("net", 0) for t in trades),
+            "last_trades": trades[-5:],
+        }
+
+    liq_dir = d / "liq_forward"
+    if liq_dir.exists():
+        files = sorted(liq_dir.glob("*.jsonl"))
+        total, usd, last, biggest, newest_age = 0, 0.0, None, None, None
+        for f in files:
+            c = _scan_liq_file(f)
+            total += c["liqs"]
+            usd += c["usd"]
+            if c["last"]:
+                last = c["last"]
+            if c["biggest"] and (biggest is None or c["biggest"]["usd"] > biggest["usd"]):
+                biggest = c["biggest"]
+        if files:
+            newest_age = max(0, datetime.now(timezone.utc).timestamp() - files[-1].stat().st_mtime)
+        out["liq"] = {
+            "files": len(files),
+            "forced_orders": total,
+            "notional_usd": usd,
+            "last": last,
+            "biggest": biggest,
+            "recorder_age_sec": newest_age,
+        }
+    return out
+
+
 def parse_log_lines(text: str, limit: int = 150) -> list[dict]:
     lines = text.splitlines()
     lines = lines[-limit:]
@@ -458,6 +556,13 @@ def health():
         "log_path": str(log),
         "has_trades": bool((state.get("risk") or {}).get("trade_history")),
     }
+
+
+@app.get("/api/edges")
+def edges():
+    """Edge Lab: carry paper book + funding gate + liquidation collector."""
+    cfg = load_config()
+    return build_edges(cfg)
 
 
 # ---------- Exports (for iteration / hand logs to AI) ----------

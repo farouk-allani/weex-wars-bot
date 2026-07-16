@@ -666,3 +666,29 @@ a:hover { color: #8bbcff; }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---- Edge Lab ---- */
+.tag.pos {
+  color: #22d3a6;
+  background: rgba(34, 211, 166, 0.12);
+  border-color: rgba(34, 211, 166, 0.3);
+}
+.tag.neg {
+  color: #ff8fa3;
+  background: rgba(255, 92, 122, 0.12);
+  border-color: rgba(255, 92, 122, 0.3);
+}
+.stat-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.2rem;
+  border-bottom: 1px dashed var(--border);
+  font-size: 0.8rem;
+}
+.stat-item:last-child { border-bottom: none; }
+.stat-item span { color: var(--faint); font-size: 0.7rem; }
+.stat-item strong { font-family: var(--mono); font-weight: 600; }
+#carry-basket { margin-top: 0.6rem; }
+#sec-edges .card-head h2 .tag { margin-left: 0.4rem; vertical-align: middle; }
