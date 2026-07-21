@@ -24,6 +24,7 @@ class DecisionLog:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._recent: dict[str, dict] = {}  # decision_id -> entry, for ai-log emission
 
     def record(
         self,
@@ -36,6 +37,7 @@ class DecisionLog:
         usage: Optional[dict] = None,
         latency_ms: Optional[int] = None,
         error: Optional[str] = None,
+        messages: Optional[list] = None,
     ) -> str:
         """Log one AI decision cycle. Returns the decision_id used for OrderId matching."""
         decision_id = f"dec_{uuid.uuid4().hex[:16]}"
@@ -46,6 +48,9 @@ class DecisionLog:
             # The exact inputs the model saw. Without these the reasoning is
             # unauditable and the log is worthless for compliance review.
             "context": context,
+            # Literal request message array — the WEEX ai-log schema requires
+            # the complete prompt in its original form.
+            "messages": messages or [],
             "reasoning": reasoning,
             "decisions": decisions,
             "raw_response": raw_response,
@@ -56,6 +61,11 @@ class DecisionLog:
             "orders": [],
         }
         self._append(entry)
+        # In-memory tail so link_order can emit a WEEX ai-log without a file
+        # re-read. Capped: decisions older than the cap can't get new orders.
+        self._recent[decision_id] = entry
+        while len(self._recent) > 100:
+            self._recent.pop(next(iter(self._recent)))
         return decision_id
 
     def link_order(
@@ -76,20 +86,31 @@ class DecisionLog:
         line: the log stays append-only, so a fill can never corrupt the decision
         that preceded it. Readers fold these into the parent by decision_id.
         """
+        order = {
+            "symbol": symbol,
+            "order_id": str(order_id),
+            "side": side,
+            "size": size,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+        }
         self._append({
             "type": "order_link",
             "decision_id": decision_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "order": {
-                "symbol": symbol,
-                "order_id": str(order_id),
-                "side": side,
-                "size": size,
-                "entry_price": entry_price,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-            },
+            "order": order,
         })
+        # Emit the WEEX-schema ai-log file for this order. Must never break
+        # trading — the trade is already live when this runs.
+        try:
+            from . import wars_log
+
+            entry = self._recent.get(decision_id)
+            if entry:
+                wars_log.emit(entry, order)
+        except Exception:
+            pass
 
     def record_outcome(
         self,

@@ -191,14 +191,42 @@ def summarize(all_rets, label, cost):
 
 
 def main():
+    import argparse
+    from datetime import datetime, timezone
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("globs", nargs="+")
+    ap.add_argument("--since", default=None,
+                    help="ISO date: only use data at/after this UTC date. "
+                         "REQUIRED discipline for the pre-declared continuation "
+                         "hypothesis: judge it only on data after 2026-07-20.")
+    ap.add_argument("--direction", choices=["fade", "with"], default="fade",
+                    help="'fade' = against the flush (KILLED 2026-07-20); "
+                         "'with' = continuation, the registered follow-up")
+    args = ap.parse_args()
+
     paths = []
-    for a in sys.argv[1:]:
+    for a in args.globs:
         paths.extend(sorted(glob.glob(a)))
     if not paths:
-        print("usage: run_liq_forward.py data/liq_forward/*.jsonl")
+        print("usage: run_liq_forward.py data/liq_forward/*.jsonl "
+              "[--since 2026-07-20 --direction with]")
         sys.exit(1)
     print(f"loading {len(paths)} files...")
     liqs, px = load(paths)
+
+    if args.since:
+        cut = int(datetime.fromisoformat(args.since)
+                  .replace(tzinfo=timezone.utc).timestamp() * 1000)
+        liqs = {s: [r for r in v if r[0] >= cut] for s, v in liqs.items()}
+        liqs = {s: v for s, v in liqs.items() if v}
+        px = {s: [r for r in v if r[0] >= cut] for s, v in px.items()}
+        px = {s: v for s, v in px.items() if len(v) > 100}
+        print(f"--since {args.since}: filtered to fresh data only")
+    sign = -1.0 if args.direction == "with" else 1.0
+    if args.direction == "with":
+        print("DIRECTION = WITH the cascade (continuation hypothesis, "
+              "pre-declared 2026-07-20: primary cell $250k/60m beta-neutral episodes)")
     total_liq = sum(len(v) for v in liqs.values())
     total_usd = sum(u for v in liqs.values() for _, _, u in v)
     span_h = (max(v[-1][0] for v in liqs.values() if v) -
@@ -222,7 +250,7 @@ def main():
         events_by_sym = {}
         for s in PRICE_SYMBOLS:
             if s in grids and s in liqs:
-                ev = find_cascades(liqs[s], thr)
+                ev = [(t, f * sign) for t, f in find_cascades(liqs[s], thr)]
                 if ev:
                     events_by_sym[s] = ev
         n_ev = sum(len(v) for v in events_by_sym.values())

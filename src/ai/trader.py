@@ -110,6 +110,13 @@ class AITrader:
             + json.dumps(context, indent=2, default=str)
             + "\n\nDecide. Return only the JSON object."
         )
+        # The literal request messages, preserved verbatim: the WEEX ai-log
+        # schema requires the COMPLETE prompt in its original message-array
+        # form, unsummarized and unflattened.
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
         try:
             result = self.client.decide(SYSTEM_PROMPT, user_prompt)
         except Exception as e:
@@ -120,6 +127,7 @@ class AITrader:
                 raw_response="",
                 reasoning="",
                 error=str(e),
+                messages=messages,
             )
             return [], "", decision_id
 
@@ -132,7 +140,7 @@ class AITrader:
             result["content"] += f"\n\n[PARSE ERROR: {e}]"
 
         decision_id = self.log.record(
-            model=self.client.model,
+            model=result.get("model") or self.client.model,
             context=context,
             decisions=decisions,
             raw_response=result["content"],
@@ -140,6 +148,7 @@ class AITrader:
             reasoning=result.get("reasoning") or assessment,
             usage=result.get("usage"),
             latency_ms=result.get("latency_ms"),
+            messages=messages,
         )
         return decisions, assessment, decision_id
 

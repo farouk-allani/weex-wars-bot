@@ -95,7 +95,8 @@ services:
       - bot-data:/app/data
       - ./config.yaml:/app/config.yaml:ro
     # two loops: (bg) real Binance forced-order recorder, 24h files forever;
-    # (fg) carry paper book step + funding snapshot every 8h (each funding print)
+    # (fg) every 8h: carry paper book step + funding snapshot + continuation
+    # hypothesis auto-eval on fresh (post-2026-07-20) forced-order data only
     command:
       - sh
       - -c
@@ -105,6 +106,9 @@ services:
         while true; do
         python run_carry_weex.py --paper;
         python run_carry_weex.py --live;
+        python run_liq_forward.py 'data/liq_forward/*.jsonl'
+        --since 2026-07-20 --direction with
+        > data/continuation_eval.txt 2>&1 || true;
         sleep 28800;
         done
     depends_on:

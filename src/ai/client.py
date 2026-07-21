@@ -93,6 +93,9 @@ class DeepSeekClient:
                     "usage": resp.usage.model_dump() if resp.usage else {},
                     "latency_ms": int((time.time() - started) * 1000),
                     "raw": content,
+                    # Provider-RESOLVED model id. The WEEX ai-log schema requires
+                    # the exact raw id, not the requested alias.
+                    "model": getattr(resp, "model", None) or self.model,
                 }
             except Exception as e:
                 last_err = e
