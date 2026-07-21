@@ -93,11 +93,11 @@ strategy:
     bb_period: 20
     bb_std: 2.0
   keepalive:
-    enabled: false
+    enabled: true            # 3/10 trades at day 5 — DQ insurance, tiny maker in-outs
     symbol_base: SOL
-    interval_hours: 16
+    interval_hours: 12
     strength: 0.04
-    max_per_week: 2
+    max_per_week: 5
 competition:
   min_trades: 10                # below this = disqualified
   # ends_at: "2026-07-28T12:00:00"   # set this so the AI knows its clock
