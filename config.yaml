@@ -21,8 +21,14 @@ ai:
   # this budget BEFORE the answer is written. 2000 was enough for V3's bare JSON
   # but would be consumed by reasoning and return empty content (= a silent hold).
   max_tokens: 8000
-  timeout_seconds: 90
-  max_retries: 2
+  # A real 8-symbol prompt measured 64s / 9.7k tokens on v4-pro (it writes ~9k
+  # chars of reasoning first), so 90s left almost no headroom and a slow call
+  # would time out into a lost hour of trading. Retries drop to 1 to keep the
+  # worst case bounded: the AI call blocks the 60s cycle loop, and stop
+  # enforcement runs on that loop, so total attempt budget is a risk parameter
+  # and not just a latency one. 2 x 150s ~= the old 3 x 90s.
+  timeout_seconds: 150
+  max_retries: 1
   # Consecutive failed calls before the bot is declared brain-dead: logs at ERROR
   # and fails the container healthcheck instead of holding forever in silence.
   max_consecutive_failures: 3
