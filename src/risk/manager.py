@@ -455,6 +455,11 @@ class RiskManager:
                     "strategy": t.strategy,
                     "banked_pnl": t.banked_pnl,
                     "fees": t.fees,
+                    # Without this, TradeResult's default_factory stamps every
+                    # restored trade with boot time, and any "trades in the last N
+                    # hours" count silently reads the whole history as happening at
+                    # once. Round-pace tracking depends on it being real.
+                    "timestamp": t.timestamp.isoformat() if t.timestamp else None,
                 }
                 for t in self.trade_history[-200:]
             ],
@@ -499,23 +504,32 @@ class RiskManager:
         self.trade_history = []
         for raw in state.get("trade_history") or []:
             try:
-                self.trade_history.append(
-                    TradeResult(
-                        symbol=raw["symbol"],
-                        side=Side(raw["side"]),
-                        entry_price=float(raw["entry_price"]),
-                        exit_price=float(raw["exit_price"]),
-                        size=float(raw["size"]),
-                        leverage=int(raw["leverage"]),
-                        pnl=float(raw["pnl"]),
-                        pnl_pct=float(raw.get("pnl_pct") or 0),
-                        duration_seconds=int(raw.get("duration_seconds") or 0),
-                        exit_reason=raw.get("exit_reason") or "",
-                        strategy=raw.get("strategy") or "",
-                        banked_pnl=float(raw.get("banked_pnl") or 0),
-                        fees=float(raw.get("fees") or 0),
-                    )
+                kwargs = dict(
+                    symbol=raw["symbol"],
+                    side=Side(raw["side"]),
+                    entry_price=float(raw["entry_price"]),
+                    exit_price=float(raw["exit_price"]),
+                    size=float(raw["size"]),
+                    leverage=int(raw["leverage"]),
+                    pnl=float(raw["pnl"]),
+                    pnl_pct=float(raw.get("pnl_pct") or 0),
+                    duration_seconds=int(raw.get("duration_seconds") or 0),
+                    exit_reason=raw.get("exit_reason") or "",
+                    strategy=raw.get("strategy") or "",
+                    banked_pnl=float(raw.get("banked_pnl") or 0),
+                    fees=float(raw.get("fees") or 0),
                 )
+                # Pre-timestamp states exist on disk; let the default stand for those
+                # rather than dropping the trade.
+                ts = raw.get("timestamp")
+                if ts:
+                    try:
+                        kwargs["timestamp"] = datetime.fromisoformat(
+                            str(ts).replace("Z", "")
+                        )
+                    except Exception:
+                        pass
+                self.trade_history.append(TradeResult(**kwargs))
             except Exception:
                 continue
 

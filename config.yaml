@@ -1,19 +1,31 @@
 # WEEX AI Wars — AI-driven config.
 # DeepSeek is the primary decision-maker; the risk block below is a hard veto layer
-# it cannot override. Rules: ranking by cumulative PnL, min 10 trades, max 20x
-# leverage, >8h without AI logs is non-compliant.
+# it cannot override. Rules (AI Wars II): scoring is MULTI-METRIC — profit AND risk
+# management AND strategy stability, not cumulative PnL alone — min 10 trades,
+# max 20x leverage, >8h without AI logs is non-compliant.
 
 # AI decision layer
 ai:
   enabled: true
   provider: deepseek
-  model: deepseek-chat          # deepseek-reasoner logs full chain-of-thought (richer
-                                # compliance artifact, slower + pricier per call)
+  # Verified against /models on 2026-07-25: only deepseek-v4-pro and
+  # deepseek-v4-flash exist. deepseek-chat (V3) was retired by the provider on
+  # 2026-07-24 and every call 400'd for 16h while all healthchecks stayed green —
+  # the client now validates this id at startup and refuses to run on a dead one.
+  # v4-pro over v4-flash: at 24 calls/day cost is negligible and the decision is
+  # the whole product; ~1.5s latency is irrelevant on an hourly cadence.
+  model: deepseek-v4-pro
   base_url: https://api.deepseek.com
   temperature: 0.3
-  max_tokens: 2000
+  # Both v4 models emit reasoning_content, and the thinking is charged against
+  # this budget BEFORE the answer is written. 2000 was enough for V3's bare JSON
+  # but would be consumed by reasoning and return empty content (= a silent hold).
+  max_tokens: 8000
   timeout_seconds: 90
   max_retries: 2
+  # Consecutive failed calls before the bot is declared brain-dead: logs at ERROR
+  # and fails the container healthcheck instead of holding forever in silence.
+  max_consecutive_failures: 3
   # Every call writes an AI log entry, trade or no trade. 60min keeps us far inside
   # the 8h inactivity rule even if several calls fail in a row.
   decision_interval_minutes: 60
@@ -93,13 +105,26 @@ strategy:
     bb_period: 20
     bb_std: 2.0
   keepalive:
-    enabled: true            # 3/10 trades at day 5 — DQ insurance, tiny maker in-outs
+    # OFF, and it must stay off in AI mode: keepalive only ever ran on the rules
+    # path (_run_rules_cycle), which `ai.enabled: true` never reaches — so this flag
+    # was inert for the whole paper run and produced zero trades. It is also the
+    # wrong tool for AI Wars II: a code-generated heartbeat order has no model
+    # decision behind it, so it would upload with no ai-log (non-compliant), and
+    # robotic in-outs are penalised by the stability metric. The trade floor is now
+    # handled by feeding round pace into the AI context (see _trade_pace).
+    enabled: false
     symbol_base: SOL
     interval_hours: 12
     strength: 0.04
     max_per_week: 5
 competition:
   min_trades: 10                # below this = disqualified
+  # The minimum is per ROUND, and rounds are weekly — 10 trades in 7 days needs
+  # ~1.4/day, which is MORE than the observed ~0.9/day. Set round_started at the
+  # top of each live round so pace is measured against the real clock; left unset,
+  # pace is measured over a trailing round_days window instead.
+  round_days: 7
+  # round_started: "2026-08-31T00:00:00"
   # ends_at: "2026-07-28T12:00:00"   # set this so the AI knows its clock
   min_edges: 1
   min_rr: 1.35

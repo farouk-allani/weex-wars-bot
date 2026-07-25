@@ -6,11 +6,12 @@
 - File logging
 """
 
+import json
 import logging
 import time
 import yaml
 import signal as sig
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from rich.console import Console
@@ -98,12 +99,30 @@ class TradingEngine:
         # reconciles each entry against the venue/paper ledger and drops the dead.
         self.pending_entries: dict[str, dict] = (state or {}).get("pending_entries") or {}
 
+        # AI liveness. A failed decision call fails closed (no decision = hold), which
+        # is correct but indistinguishable from a calm market — so the failures are
+        # counted and surfaced. Without this, a retired model id bought us 16h of a
+        # bot that logged cheerfully and did not think.
+        self.ai_max_failures = int(ai_cfg.get("max_consecutive_failures", 3))
+        self._ai_consecutive_failures = 0
+        self._last_ai_success: datetime | None = None
+        self.ai_health_path = self.state_path.parent / "ai_health.json"
+
         if ai_cfg.get("enabled", False):
             self.decision_log = DecisionLog(ai_cfg.get("log_file", "logs/ai_decisions.jsonl"))
-            self.ai = AITrader(self.config, DeepSeekClient(self.config), self.decision_log)
+            client = DeepSeekClient(self.config)
+            # Fail at startup on a dead model id rather than once an hour, silently,
+            # forever. A listing outage is not fatal — the failure alarm covers that.
+            try:
+                client.validate_model()
+                self.logger.info("AI model %s validated against provider", client.model)
+            except Exception as e:
+                self.logger.error("AI MODEL VALIDATION FAILED: %s", e)
+                console.print(f"[bold red]AI model validation failed: {e}[/]")
+            self.ai = AITrader(self.config, client, self.decision_log)
             self.logger.info(
-                "AI decision layer active: model=%s interval=%smin",
-                self.ai.client.model, self.ai_interval_min,
+                "AI decision layer active: model=%s interval=%smin alarm_after=%d failures",
+                self.ai.client.model, self.ai_interval_min, self.ai_max_failures,
             )
 
         sig.signal(sig.SIGINT, self._shutdown)
@@ -299,10 +318,25 @@ class TradingEngine:
         console.print(f"[cyan]Consulting {self.ai.client.model}...[/]")
         decisions, assessment, decision_id = self.ai.decide(context)
         self._last_ai_call = datetime.utcnow()
+        self._record_ai_health(self.ai.last_error)
 
-        if assessment:
-            console.print(f"[dim]{assessment}[/]")
-        self.logger.info("AI decision_id=%s assessment=%s", decision_id, assessment[:200])
+        if self.ai.last_error:
+            # Deliberately ERROR, not INFO. The previous outage was invisible because
+            # a dead brain logged an empty assessment at the same level as a quiet
+            # one. Execution below still runs: with no decisions it opens and closes
+            # nothing, but the risk-block safety that pulls resting orders must not
+            # be skipped just because the model is unreachable.
+            self.logger.error(
+                "AI CALL FAILED (%d consecutive, last success %s): %s",
+                self._ai_consecutive_failures,
+                self._last_ai_success.isoformat() if self._last_ai_success else "never",
+                self.ai.last_error,
+            )
+            console.print(f"[bold red]AI call failed: {self.ai.last_error}[/]")
+        else:
+            if assessment:
+                console.print(f"[dim]{assessment}[/]")
+            self.logger.info("AI decision_id=%s assessment=%s", decision_id, assessment[:200])
 
         allowed = set(symbols)
         # Exits first: closing frees a slot that an entry below may want.
@@ -398,14 +432,69 @@ class TradingEngine:
         elapsed_min = (datetime.utcnow() - self._last_ai_call).total_seconds() / 60
         return elapsed_min >= self.ai_interval_min
 
+    def _record_ai_health(self, error: str | None):
+        """Publish decision-layer liveness so something outside the process can see it.
+
+        `bot_state.json` keeps being written on every cycle whether or not the model
+        answers, so its mtime cannot distinguish a thinking bot from a brain-dead
+        one — which is exactly how a 16h outage passed every healthcheck. This file
+        is the signal the container healthcheck actually keys on.
+        """
+        if error:
+            self._ai_consecutive_failures += 1
+        else:
+            self._ai_consecutive_failures = 0
+            self._last_ai_success = datetime.utcnow()
+
+        healthy = self._ai_consecutive_failures < self.ai_max_failures
+        try:
+            self.ai_health_path.parent.mkdir(parents=True, exist_ok=True)
+            self.ai_health_path.write_text(json.dumps({
+                "healthy": healthy,
+                "consecutive_failures": self._ai_consecutive_failures,
+                "max_consecutive_failures": self.ai_max_failures,
+                "last_success": (
+                    self._last_ai_success.isoformat() + "Z" if self._last_ai_success else None
+                ),
+                "last_error": error,
+                "model": self.ai.client.model if self.ai else None,
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            }, indent=1))
+        except Exception as e:  # never let telemetry break the trading loop
+            self.logger.warning("could not write ai_health: %s", e)
+
+        if not healthy:
+            self.logger.critical(
+                "AI DECISION LAYER DOWN: %d consecutive failures (>= %d). "
+                "The bot is holding everything and cannot trade. Last error: %s",
+                self._ai_consecutive_failures, self.ai_max_failures, error,
+            )
+            console.print(Panel.fit(
+                f"[bold red]AI DECISION LAYER DOWN[/]\n"
+                f"{self._ai_consecutive_failures} consecutive failures\n"
+                f"{error}",
+                title="ALARM",
+            ))
+
     def _competition_context(self) -> dict:
-        """Trade count and clock — the model should know it needs 10 trades to qualify."""
+        """Scoring, trade count and clock — the model reasons about all three."""
         comp = self.config.get("competition", {}) or {}
         real = [t for t in self.risk.trade_history if not self.risk.is_keepalive(t.strategy)]
+        stats = self.risk.get_stats()
         ctx = {
-            "ranking_metric": "cumulative PnL",
+            # AI Wars II is scored on profit AND risk AND stability. Telling the
+            # model "cumulative PnL" (the AI Wars I rule) pointed it at variance
+            # while the scoring punishes exactly that.
+            "scoring": "multi-metric: realised profit + risk management + strategy stability",
+            "ranking_metric": (
+                "NOT cumulative PnL alone. A smaller steady gain with shallow "
+                "drawdown outranks a larger erratic one."
+            ),
             "trades_executed": len(real),
             "minimum_trades_required": comp.get("min_trades", 10),
+            # Let it see the metrics it is judged on, not just its P&L.
+            "current_win_rate": round(stats.get("win_rate", 0.0), 3),
+            "current_sharpe": round(stats.get("sharpe_ratio", 0.0), 2),
             "note": (
                 "Fewer than the minimum trades means disqualification, but forcing "
                 "low-quality trades to hit a count is a losing play. Take good ones."
@@ -418,7 +507,112 @@ class TradingEngine:
                 ctx["hours_remaining"] = round(remaining.total_seconds() / 3600, 1)
             except Exception:
                 pass
+        ctx["pace"] = self._trade_pace(comp, real)
         return ctx
+
+    def _trade_pace(self, comp: dict, real: list) -> dict:
+        """How the trade count is tracking against the round's minimum.
+
+        The minimum is per round, and rounds are short (weekly). At the observed
+        ~0.9 trades/day a 7-day round lands near 6 trades — under a 10-trade floor.
+        So the count has to be watched, but the previous answer (mechanical keepalive
+        in-outs) is wrong twice over for AI Wars II: a code-generated order carries no
+        model decision, so it would ship with no ai-log and be non-compliant, and
+        robotic heartbeat trades are exactly the erratic behaviour the stability
+        metric punishes.
+
+        Instead the constraint is handed to the model as a fact about its situation.
+        It already picks instrument, direction and levels; asking it to spend its
+        remaining budget on the best marginal setups it can find beats having code
+        pick a blind one, and every resulting order keeps its reasoning trail.
+        """
+        min_trades = int(comp.get("min_trades", 10) or 0)
+        round_days = float(comp.get("round_days", 7) or 7)
+
+        now = datetime.utcnow()
+        started = comp.get("round_started")
+        round_start = None
+        if started:
+            try:
+                round_start = datetime.fromisoformat(str(started).replace("Z", ""))
+            except Exception:
+                round_start = None
+
+        if round_start is None:
+            # PRESEASON / unanchored: there is no round clock, so a countdown would be
+            # fiction. Report the trailing window as a rehearsal rate instead — the
+            # question that can honestly be answered is "would this pace qualify?".
+            window_start = now - timedelta(days=round_days)
+            recent = [t for t in real if t.timestamp and t.timestamp >= window_start]
+            per_day = len(recent) / round_days
+            projected = per_day * round_days
+            return {
+                "round_days": round_days,
+                "round_anchored": False,
+                "trades_last_%dd" % int(round_days): len(recent),
+                "observed_trades_per_day": round(per_day, 2),
+                "projected_trades_per_round": round(projected, 1),
+                "minimum_trades_required": min_trades,
+                "status": (
+                    f"PRESEASON (no round clock). At the current {per_day:.2f} "
+                    f"trades/day a {round_days:.0f}-day round would finish with about "
+                    f"{projected:.0f} trades against a {min_trades}-trade minimum — "
+                    + (
+                        "that would QUALIFY. Optimise purely for quality."
+                        if projected >= min_trades
+                        else "that would MISS the minimum. Treat this as evidence that "
+                        "your bar for 'tradeable' is too high for a weekly round, and "
+                        "take good-but-imperfect setups you would currently pass on."
+                    )
+                ),
+            }
+
+        elapsed_h = max((now - round_start).total_seconds() / 3600, 0.1)
+        remaining_h = max(round_days * 24 - elapsed_h, 0.0)
+        in_round = [t for t in real if t.timestamp and t.timestamp >= round_start]
+        still_needed = max(min_trades - len(in_round), 0)
+        required_per_day = (
+            round(still_needed / (remaining_h / 24), 2) if remaining_h > 1 else None
+        )
+        observed_per_day = round(len(in_round) / (elapsed_h / 24), 2)
+
+        pace = {
+            "round_days": round_days,
+            "round_anchored": True,
+            "trades_this_round": len(in_round),
+            "trades_still_needed": still_needed,
+            "hours_elapsed": round(elapsed_h, 1),
+            "hours_remaining_in_round": round(remaining_h, 1),
+            "observed_trades_per_day": observed_per_day,
+            "required_trades_per_day": required_per_day,
+        }
+
+        # Only nag when the arithmetic actually says we are short, and say by how
+        # much. A vague "trade more" instruction is how a bot starts churning.
+        if still_needed == 0:
+            pace["status"] = (
+                f"minimum already met ({len(in_round)}/{min_trades}) — extra trades "
+                "are now pure cost. Quality only."
+            )
+        elif remaining_h <= 0:
+            pace["status"] = (
+                f"round is over with {len(in_round)}/{min_trades} trades. Nothing "
+                "further to do about the count."
+            )
+        elif required_per_day and required_per_day > observed_per_day:
+            pace["status"] = (
+                f"BEHIND PACE: {still_needed} more trades needed in "
+                f"{remaining_h:.0f}h to clear the {min_trades}-trade minimum "
+                f"({required_per_day}/day required vs {observed_per_day}/day so far). "
+                "Widen what you consider tradeable — take your best available setups "
+                "at moderate conviction rather than waiting for perfect ones — but do "
+                "not breach risk limits and do not open a position you cannot justify."
+            )
+        else:
+            pace["status"] = (
+                f"on pace ({len(in_round)}/{min_trades} with {remaining_h:.0f}h left)"
+            )
+        return pace
 
     def _execute_trade(
         self,

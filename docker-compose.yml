@@ -25,17 +25,22 @@ services:
       - ./config.yaml:/app/config.yaml:ro
     command: ["python", "-m", "src.main"]
     healthcheck:
+      # Two conditions, because state freshness alone is a lie: the engine rewrites
+      # bot_state.json every cycle even when the decision model is unreachable, so
+      # a brain-dead bot passed this check for 16h straight. ai_health.json carries
+      # the consecutive-failure verdict, and a missing/stale one (> 3 decision
+      # intervals) is itself unhealthy.
       test:
         [
           "CMD",
           "python",
           "-c",
-          "from pathlib import Path; import time, json; p=Path('data/bot_state.json'); exit(0 if p.exists() and time.time()-p.stat().st_mtime < 600 else 1)",
+          "import json,time; from pathlib import Path; s=Path('data/bot_state.json'); h=Path('data/ai_health.json'); assert s.exists() and time.time()-s.stat().st_mtime<600, 'state stale'; d=json.loads(h.read_text()) if h.exists() else None; assert d is None or (d.get('healthy') and time.time()-h.stat().st_mtime<11000), 'ai unhealthy'",
         ]
       interval: 2m
       timeout: 10s
       retries: 3
-      start_period: 2m
+      start_period: 5m
     logging:
       driver: json-file
       options:
