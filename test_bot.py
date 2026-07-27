@@ -215,7 +215,28 @@ assert _dl2.last_ailog_error
 _status = _dl2.compliance_status(_tmp / "ailogs")
 assert _status["orders_linked"] == 2 and _status["ai_logs_on_disk"] == 1
 assert _status["orders_without_ai_log"] == 1 and _status["compliant"] is False
+assert _status["ai_logs_incomplete"] == 0, _status["incomplete"]
 print(f"compliance gap detected OK ({_status['orders_without_ai_log']}/{_status['orders_linked']})")
+
+print("\n=== A PRESENT-BUT-UNUSABLE LOG IS NOT COMPLIANT ===")
+# A file can exist and still fail the schema — most importantly with no verbatim
+# prompt, which is what backfilling a pre-logbook decision produces.
+_good = _wl.build_ai_log(
+    {"model": "m", "messages": [{"role": "user", "content": "c"}],
+     "context": {"markets": []}, "decisions": [{"symbol": "BTC/USDT:USDT", "rationale": "r"}]},
+    {"symbol": "BTC/USDT:USDT", "side": "long", "size": 0.01, "entry_price": 1.0},
+)
+assert _wl.validate(_good) == [], _wl.validate(_good)
+_bad = json.loads(json.dumps(_good))
+_bad["input"]["messages"] = []
+assert any("messages" in p for p in _wl.validate(_bad)), _wl.validate(_bad)
+_bad2 = json.loads(json.dumps(_good))
+_bad2["output"]["quantity"] = None
+assert any("quantity" in p for p in _wl.validate(_bad2))
+_bad3 = json.loads(json.dumps(_good))
+_bad3["explanation"] = "x" * 1001
+assert any("1001" in p for p in _wl.validate(_bad3))
+print("ai-log schema validation OK")
 
 print("\n=== BOOT-STAMPED TRADES ARE QUARANTINED ===")
 from src.core.models import TradeResult as _TR
@@ -225,14 +246,24 @@ def _mk(n, stamp):
                 leverage=5, pnl=0.5, pnl_pct=1, duration_seconds=60, exit_reason="be_stop",
                 strategy="ai_deepseek", timestamp=stamp) for _ in range(n)]
 
-_shared = datetime(2026, 7, 25, 10, 37, 53)
+# The real artifact is microsecond-SEQUENTIAL, not identical: the old loader ran
+# the default factory once per trade inside a loop. Measured on the VPS: 7 trades
+# spanning 53us. An earlier version of this check keyed on equality and never fired.
+_base = datetime(2026, 7, 25, 10, 37, 53, 148001)
+_seq = [_base + timedelta(microseconds=9 * i) for i in range(8)]
 _rm = RiskManager(config)
-_rm.trade_history = _mk(8, _shared) + _mk(1, datetime(2026, 7, 26, 6, 5, 37))
+_rm.trade_history = [_mk(1, s)[0] for s in _seq] + _mk(1, datetime(2026, 7, 26, 6, 5, 37))
 _rm._quarantine_boot_stamped_trades()
-assert sum(1 for t in _rm.trade_history if t.timestamp is None) == 8
+assert sum(1 for t in _rm.trade_history if t.timestamp is None) == 8, \
+    [t.timestamp for t in _rm.trade_history]
 assert sum(t.pnl for t in _rm.trade_history) == 4.5, "quarantine must not touch P&L"
+# Trades genuinely seconds apart are real history and must survive.
+_rm2 = RiskManager(config)
+_rm2.trade_history = [_mk(1, _base + timedelta(seconds=30 * i))[0] for i in range(8)]
+_rm2._quarantine_boot_stamped_trades()
+assert all(t.timestamp is not None for t in _rm2.trade_history), "real closes wrongly dropped"
 _rm3 = RiskManager(config)
-_rm3.trade_history = _mk(3, _shared)  # a plausible real cluster must survive
+_rm3.trade_history = _mk(3, _base)  # a short cluster stays below the run threshold
 _rm3._quarantine_boot_stamped_trades()
 assert all(t.timestamp is not None for t in _rm3.trade_history)
 # A legacy state with no timestamps must yield None, never boot time: a boot-time

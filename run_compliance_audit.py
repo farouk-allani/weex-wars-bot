@@ -42,15 +42,26 @@ def main() -> int:
         return 2
 
     print("=== ai-log compliance ===")
-    print(f"  orders linked        : {status['orders_linked']}")
-    print(f"  ai-logs on disk      : {status['ai_logs_on_disk']}")
-    print(f"  orders WITHOUT a log : {status['orders_without_ai_log']}")
-    print(f"  compliant            : {status['compliant']}")
+    print(f"  orders linked          : {status['orders_linked']}")
+    print(f"  ai-logs on disk        : {status['ai_logs_on_disk']}")
+    print(f"  orders WITHOUT a log   : {status['orders_without_ai_log']}")
+    print(f"  logs INCOMPLETE        : {status['ai_logs_incomplete']}")
+    print(f"  compliant              : {status['compliant']}")
+
+    if status["incomplete"]:
+        print(f"\n--- {status['ai_logs_incomplete']} log(s) present but not usable ---")
+        for c in status["incomplete"]:
+            print(f"  {c['file'][:56]}")
+            for pr in c["problems"]:
+                print(f"      - {pr}")
+        print("  NOTE: a log whose input has no verbatim message array cannot be")
+        print("  repaired if the decision that produced it never captured one.")
 
     missing = status["missing"]
     if not missing:
-        print("\nAll linked orders have an ai-log.")
-        return 0
+        if status["compliant"]:
+            print("\nAll linked orders have a complete ai-log.")
+        return 0 if status["compliant"] else 1
 
     print(f"\n--- {len(missing)} order(s) missing an ai-log ---")
     for m in missing:
@@ -100,8 +111,14 @@ def main() -> int:
 
     after = dl.compliance_status(args.ai_logs)
     print(f"\n  rebuilt {done}, unrecoverable {unrecoverable}")
-    print(f"  orders WITHOUT a log now: {after['orders_without_ai_log']}  "
-          f"(compliant={after['compliant']})")
+    print(f"  orders WITHOUT a log now : {after['orders_without_ai_log']}")
+    print(f"  logs INCOMPLETE now      : {after['ai_logs_incomplete']}")
+    print(f"  compliant                : {after['compliant']}")
+    if after["ai_logs_incomplete"]:
+        print("\n  A rebuilt log is only as complete as the decision behind it. Logs")
+        print("  from before the logbook captured verbatim messages will stay")
+        print("  incomplete — that is a fact about the record, not something to")
+        print("  paper over by inventing a prompt.")
     return 0 if after["compliant"] else 1
 
 

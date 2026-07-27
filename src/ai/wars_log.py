@@ -96,6 +96,46 @@ def _truncate(text: str, limit: int) -> str:
     return cut.rstrip() + "…"
 
 
+def validate(payload: dict) -> list[str]:
+    """Schema problems in a built ai-log, worst first. Empty list = usable.
+
+    Presence of a file is a weaker guarantee than a usable log, and only the
+    stricter one is worth anything at review time: a log whose `input` has no
+    message array does not carry "the complete original request" the schema asks
+    for, however well-formed the rest of it looks.
+    """
+    problems: list[str] = []
+    if not str(payload.get("stage") or "").strip():
+        problems.append("stage is empty")
+    model = str(payload.get("model") or "").strip()
+    if not model:
+        problems.append("model is empty")
+
+    src = payload.get("input") or {}
+    if not isinstance(src, dict):
+        problems.append("input is not an object")
+    else:
+        if not (src.get("messages") or []):
+            problems.append("input.messages is empty (no verbatim prompt)")
+        if not (src.get("market_context") or {}):
+            problems.append("input.market_context is empty")
+
+    out = payload.get("output") or {}
+    if not isinstance(out, dict):
+        problems.append("output is not an object")
+    else:
+        for k in ("symbol", "side", "quantity"):
+            if out.get(k) in (None, "", 0):
+                problems.append(f"output.{k} is missing")
+
+    expl = str(payload.get("explanation") or "")
+    if not expl.strip():
+        problems.append("explanation is empty")
+    elif len(expl) > 1000:
+        problems.append(f"explanation is {len(expl)} chars (limit 1000)")
+    return problems
+
+
 def emit(entry: dict, order: dict, out_dir: Path | None = None) -> Path:
     """Write the ai-log JSON next to the data volume. Returns the file path."""
     out = Path(out_dir) if out_dir else AI_LOGS_DIR

@@ -813,33 +813,51 @@ class RiskManager:
 
         self._quarantine_boot_stamped_trades()
 
-    # A mass close is not a thing this engine does: positions are closed one at a
-    # time with a venue round-trip between them, and the book has never held more
-    # than a handful at once. So a run of trades sharing one timestamp to the second
-    # is not history, it is the load-time default above having been applied before
-    # it was fixed — and those values are now persisted in state files on disk.
-    # Measured 2026-07-27: 8 of 14 trades carried an identical stamp, with durations
-    # that contradicted the decision log.
+    # Detecting timestamps a previous loader invented.
+    #
+    # The signature is a tight cluster: the old loader let the default factory run
+    # once per restored trade inside a for-loop, so the stamps come out microseconds
+    # apart. Measured on the VPS: 7 trades spanning 53 MICROSECONDS
+    # (10:37:53.148001 -> .148054). No real close path can do that — even in paper
+    # mode a close does P&L arithmetic, a state write, logging and console output, and
+    # in live mode it waits on the venue. Note the stamps are NOT identical, so this
+    # cannot key on equality; an earlier version of this check did and never fired.
+    #
+    # The window is deliberately far tighter than any plausible real burst, because
+    # the cost of a false positive (discarding a genuine close time) is worse than
+    # leaving one artifact in place.
     _BOOT_STAMP_RUN = 4
+    _BOOT_STAMP_WINDOW_S = 0.05
 
     def _quarantine_boot_stamped_trades(self) -> None:
         """Drop timestamps that a previous loader invented, keeping the trades."""
-        groups: dict[str, list] = {}
-        for t in self.trade_history:
-            if t.timestamp is None:
-                continue
-            groups.setdefault(t.timestamp.isoformat(), []).append(t)
-        for stamp, ts in groups.items():
-            if len(ts) < self._BOOT_STAMP_RUN:
-                continue
-            for t in ts:
-                t.timestamp = None
-            logger.warning(
-                "trade history: %d trades shared timestamp %s — treating as a "
-                "load-time artifact, close times set to unknown. P&L is unaffected; "
-                "time-windowed counts will exclude them.",
-                len(ts), stamp,
-            )
+        dated = sorted(
+            (t for t in self.trade_history if t.timestamp is not None),
+            key=lambda t: t.timestamp,
+        )
+        i = 0
+        while i < len(dated):
+            j = i + 1
+            while (
+                j < len(dated)
+                and (dated[j].timestamp - dated[i].timestamp).total_seconds()
+                <= self._BOOT_STAMP_WINDOW_S
+            ):
+                j += 1
+            run = dated[i:j]
+            if len(run) >= self._BOOT_STAMP_RUN:
+                span_ms = (run[-1].timestamp - run[0].timestamp).total_seconds() * 1000
+                first = run[0].timestamp.isoformat()
+                for t in run:
+                    t.timestamp = None
+                logger.warning(
+                    "trade history: %d trades stamped within %.3fms of each other "
+                    "at %s — treating as a load-time artifact, close times set to "
+                    "unknown. P&L is unaffected; time-windowed counts (round pace) "
+                    "will exclude them.",
+                    len(run), span_ms, first,
+                )
+            i = j
 
     def reset_kill_switch(self):
         self.is_killed = False

@@ -203,7 +203,8 @@ class DecisionLog:
             return {"error": str(e)}
 
         d = Path(ai_logs_dir)
-        names = [p.name for p in d.glob("*.json")] if d.exists() else []
+        files = sorted(d.glob("*.json")) if d.exists() else []
+        names = [p.name for p in files]
         missing = []
         for r in links:
             did = r.get("decision_id") or ""
@@ -216,13 +217,30 @@ class DecisionLog:
                     "order_id": oid,
                     "decision_id": did,
                 })
+
+        # A file that exists but carries no verbatim prompt is not a usable log, so
+        # presence alone is not the invariant worth reporting.
+        from . import wars_log
+
+        incomplete = []
+        for p in files:
+            try:
+                problems = wars_log.validate(json.loads(p.read_text(encoding="utf-8")))
+            except Exception as e:
+                problems = [f"unreadable: {e}"]
+            if problems:
+                incomplete.append({"file": p.name, "problems": problems})
+
         return {
             "orders_linked": len(links),
             "ai_logs_on_disk": len(names),
             "orders_without_ai_log": len(missing),
-            # Bounded: the list is for diagnosis, the count is the alarm.
+            "ai_logs_incomplete": len(incomplete),
+            # Bounded: the lists are for diagnosis, the counts are the alarm.
             "missing": missing[-20:],
-            "compliant": not missing,
+            "incomplete": incomplete[-20:],
+            # Every order has a log AND every log is usable.
+            "compliant": not missing and not incomplete,
             "emitted_this_process": self.ailog_emitted,
             "failed_this_process": self.ailog_failed,
             "last_error": self.last_ailog_error,

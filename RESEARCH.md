@@ -55,6 +55,41 @@ then again on a fresh window.
   verbatim message array, full context, raw response, reasoning; `link_order()`
   binds OrderId→decision and **emits a WEEX-schema ai-log file** per order to
   `data/ai_logs/` via `src/ai/wars_log.py` (schema-tested).
+
+**Audited 2026-07-27 (commit `005df32`) — it was NOT actually covering every order.**
+Measured on the VPS: **7 of 18 linked orders had no ai-log file.** The misses all
+predate `wars_log.py` (2026-07-21), so live coverage was 11/11, but the mechanism
+was still able to fire:
+
+- `link_order()` looked the decision up in `DecisionLog._recent` (process memory)
+  and swallowed a miss with `except: pass`. A maker entry rests up to
+  `entry_ttl_minutes` (45) and can fill **after a restart/deploy** → no ai-log, no
+  message. Fixed: `_read_decision()` recovers it from the append-only log; failures
+  count, set `last_ailog_error`, and log at ERROR.
+- `explanation` looked for `reason`/`reasoning` but the model emits **`rationale`**.
+  It never matched, so every log shipped the cycle's raw chain-of-thought truncated
+  at exactly 1000 chars instead of the per-symbol reasoning. Fixed + boundary-aware
+  truncation.
+- `quantity`/`price` were raw floats (`0.5436481177706018`). The schema wants the
+  parameters that **match the submitted request**, so orders are now rounded to
+  venue increments *before* being built (`normalize_amount`/`normalize_price`);
+  paper rounds identically to live.
+- Monitoring: `data/compliance.json` written every cycle, alarms on a new gap,
+  exposed on `/api/health`. `run_compliance_audit.py [--backfill]` reconciles
+  order_link records against files on disk and rebuilds recoverable logs (never
+  fabricates one).
+
+**Related state-loading bug, same silent-corruption signature:**
+`TradeResult.timestamp` defaulted to `utcnow()`, so trades restored from a state
+file written before timestamps were persisted took **boot time**. 8 of 14 trades
+shared one stamp with durations contradicting the decision log — and the book never
+held >3 positions at once, so those simultaneous closes never happened. Undated
+trades now load as `None`; a run of ≥4 identical stamps is quarantined (P&L
+untouched). **Why it mattered:** in a live round a boot-time stamp falls *inside*
+the round window, so 8 phantom trades would have read as 11/10 against the
+10-trade minimum and told the model to stop trading with 3 real trades on the
+board. `_trade_pace` counts only dated trades; covered in `test_bot.py`.
+
 - Remaining before round 1: hook the official skill's upload flow for LIVE orders
   (`--ai-log @file.json`), and a supervised tiny-size LIVE maker-path test.
 
