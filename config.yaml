@@ -147,9 +147,13 @@ strategy:
 competition:
   min_trades: 10                # below this = disqualified
   # The minimum is per ROUND, and rounds are weekly — 10 trades in 7 days needs
-  # ~1.4/day, which is MORE than the observed ~0.9/day. Set round_started at the
-  # top of each live round so pace is measured against the real clock; left unset,
-  # pace is measured over a trailing round_days window instead.
+  # ~1.4/day. Measured 2026-07-27 from the decision log: 28 entry decisions over
+  # 12 days = ~2.3/day, i.e. ~16 per weekly round, comfortably clear of the floor.
+  # (An earlier read of ~9/day came from trade_history timestamps that a loader
+  # had invented — see RESEARCH.md §4. Count entries in the decision log, not
+  # closes in state, when judging pace.)
+  # Set round_started at the top of each live round so pace is measured against
+  # the real clock; left unset, pace is measured over a trailing round_days window.
   round_days: 7
   # round_started: "2026-08-31T00:00:00"
   # ends_at: "2026-07-28T12:00:00"   # set this so the AI knows its clock

@@ -77,18 +77,43 @@ was still able to fire:
 - Monitoring: `data/compliance.json` written every cycle, alarms on a new gap,
   exposed on `/api/health`. `run_compliance_audit.py [--backfill]` reconciles
   order_link records against files on disk and rebuilds recoverable logs (never
-  fabricates one).
+  fabricates one). **Backfilled all 7 on 2026-07-27 → 18/18 orders have a log.**
+- **Presence is the weak invariant; usability is the real one.** `wars_log.validate()`
+  checks stage/model/`input.messages`/`input.market_context`/output
+  symbol+side+quantity/explanation≤1000. **7 of the 18 logs have an EMPTY verbatim
+  message array** — their decisions predate the logbook capturing messages, so they
+  cannot be completed from anything on disk. They are classified
+  `ai_logs_unrepairable_historical` (derived from the source decision, not an
+  allowlist) and excluded from `compliant` / the alarm, so permanent history cannot
+  desensitise us to a NEW emitter failure. They are preseason PAPER orders and will
+  never be submitted. Current live state: `compliant: true`, 0 missing, 0 repairable.
 
 **Related state-loading bug, same silent-corruption signature:**
 `TradeResult.timestamp` defaulted to `utcnow()`, so trades restored from a state
-file written before timestamps were persisted took **boot time**. 8 of 14 trades
-shared one stamp with durations contradicting the decision log — and the book never
-held >3 positions at once, so those simultaneous closes never happened. Undated
-trades now load as `None`; a run of ≥4 identical stamps is quarantined (P&L
-untouched). **Why it mattered:** in a live round a boot-time stamp falls *inside*
-the round window, so 8 phantom trades would have read as 11/10 against the
-10-trade minimum and told the model to stop trading with 3 real trades on the
-board. `_trade_pace` counts only dated trades; covered in `test_bot.py`.
+file written before timestamps were persisted took **boot time**. 8 of 14 trades on
+the VPS were stamped inside 0.078ms of each other, with durations contradicting the
+decision log — and the book never held >3 positions at once, so those simultaneous
+closes never happened. Undated trades now load as `None`.
+
+**The stamps are microsecond-SEQUENTIAL, not identical** (`10:37:53.148001` →
+`.148054`): the old loader ran the default factory once per trade inside a for-loop.
+The first version of the quarantine grouped by exact `isoformat()` and silently
+never fired — the audit that suggested equality had truncated to seconds for
+display. Detection is now a run of ≥4 stamps within **50ms**, which no close path
+can produce (even paper does P&L arithmetic, a state write, logging and console
+output). Window kept far tighter than any real burst: wrongly discarding a genuine
+close time is worse than leaving one artifact.
+
+**Why it mattered:** in a live round a boot-time stamp falls *inside* the round
+window, so 8 phantom trades would have read as 11/10 against the 10-trade minimum
+and told the model to stop trading with 3 real trades on the board. `_trade_pace`
+counts only dated trades. Both covered in `test_bot.py` (incl. real closes 30s apart
+surviving).
+
+**Method note:** every one of these was found by checking what the artifacts
+actually contain, not what the code intends to write — and two of the fixes were
+themselves wrong on the first pass and only caught by verifying against the live
+VPS. Verify the fix, not just the bug.
 
 - Remaining before round 1: hook the official skill's upload flow for LIVE orders
   (`--ai-log @file.json`), and a supervised tiny-size LIVE maker-path test.
