@@ -77,13 +77,29 @@ class ExchangeClient:
     def fetch_candles(
         self, symbol: str, timeframe: str = "1h", limit: int = 100
     ) -> list[Candle]:
-        """Fetch OHLCV candles from exchange."""
+        """Fetch OHLCV candles from exchange.
+
+        The cache is keyed on symbol+timeframe but NOT on `limit`, so it must only
+        serve a request it can actually satisfy. It previously ignored `limit`
+        entirely, which had a silent and expensive consequence: `_manage_positions`
+        runs first each cycle and asks for 30 1h candles per open position, so the
+        AI context loop's later request for 200 got the cached 30, failed its
+        `len(candles) < 100` guard, and every held symbol was dropped from the
+        model's market data. Measured 2026-07-27: 42 of 42 open positions had no
+        market data in the same context — the model could see its entry and stop
+        but not the tape it was deciding against. Serving the tail of a longer
+        cached series is fine; serving a shorter one is not.
+        """
         cache_key = f"{symbol}_{timeframe}"
         ttl = 30 if timeframe in ("15m", "1h") else 60
 
-        if cache_key in self._last_fetch:
-            if time.time() - self._last_fetch[cache_key] < ttl:
-                return self._candle_cache.get(cache_key, [])
+        cached = self._candle_cache.get(cache_key, [])
+        if (
+            cache_key in self._last_fetch
+            and time.time() - self._last_fetch[cache_key] < ttl
+            and len(cached) >= limit
+        ):
+            return cached[-limit:]
 
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)

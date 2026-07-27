@@ -276,6 +276,14 @@ class TradingEngine:
             try:
                 candles = self.exchange.fetch_candles(symbol, timeframe, lookback)
                 if len(candles) < 100:
+                    # Never silent: a symbol missing here is invisible to the model,
+                    # and if we hold it, the model reasons about holding or closing
+                    # it with no tape in front of it.
+                    held = any(p.symbol == symbol for p in account.positions)
+                    self.logger.warning(
+                        "AI context: %s dropped, only %d candles (held=%s)",
+                        symbol, len(candles), held,
+                    )
                     continue
                 htf_candles = self.exchange.fetch_candles(symbol, htf, htf_lookback)
                 funding = self.exchange.fetch_funding_rate(symbol)
