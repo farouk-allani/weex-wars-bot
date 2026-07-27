@@ -269,6 +269,9 @@ class TradingEngine:
         market = []
         atrs: dict[str, float] = {}
         prices: dict[str, float] = {}
+        # Closes are kept so the correlation matrix comes free off data we already
+        # fetch — the portfolio risk budget needs covariance, not a position count.
+        closes_by_symbol: dict[str, np.ndarray] = {}
         for symbol in symbols:
             try:
                 candles = self.exchange.fetch_candles(symbol, timeframe, lookback)
@@ -282,6 +285,7 @@ class TradingEngine:
                 closes = np.array([c.close for c in candles])
                 atrs[symbol] = float(calculate_atr(highs, lows, closes)[-1])
                 prices[symbol] = float(closes[-1])
+                closes_by_symbol[symbol] = closes
 
                 edges = (
                     self.edges.analyze_all_edges(
@@ -303,6 +307,10 @@ class TradingEngine:
             self.logger.warning("AI cycle skipped: no market data")
             return
 
+        correlations = self.risk.returns_correlation(
+            closes_by_symbol, self.risk.correlation_lookback
+        )
+
         context = build_context(
             symbols_data=market,
             account=account,
@@ -314,6 +322,7 @@ class TradingEngine:
         # exits and holds instead of proposing entries that will be thrown away.
         if not can_trade:
             context["hard_limits"]["entries_blocked"] = reason
+        self._add_correlation_context(context, account, correlations)
 
         console.print(f"[cyan]Consulting {self.ai.client.model}...[/]")
         decisions, assessment, decision_id = self.ai.decide(context)
@@ -420,6 +429,27 @@ class TradingEngine:
                 self.logger.info("AI_VETO %s: size below minimum", sym)
                 continue
 
+            # Correlation-aware portfolio budget. Scales rather than vetoes: a
+            # second, highly-correlated leg is not forbidden, it just cannot be
+            # full size, because the risk that matters is what happens when every
+            # stop fills in the same move.
+            scale, why_scale = self.risk.correlation_scale(
+                signal, size, account, correlations
+            )
+            if scale <= 0:
+                console.print(f"[yellow]AI {sym} vetoed: {why_scale}[/]")
+                self.logger.info("AI_VETO %s: %s", sym, why_scale)
+                continue
+            if scale < 1.0:
+                size *= scale
+                console.print(f"[yellow]   {sym} {why_scale}[/]")
+                self.logger.info("RISK_SCALE %s size x%.3f — %s", sym, scale, why_scale)
+                if size * signal.entry_price < self.risk.min_position_usd:
+                    self.logger.info(
+                        "AI_VETO %s: scaled size below minimum notional", sym
+                    )
+                    continue
+
             self._execute_trade(
                 signal, size, pair_weight,
                 decision_id=decision_id, atr=atrs.get(sym, 0.0),
@@ -431,6 +461,73 @@ class TradingEngine:
             return True
         elapsed_min = (datetime.utcnow() - self._last_ai_call).total_seconds() / 60
         return elapsed_min >= self.ai_interval_min
+
+    def _add_correlation_context(self, context: dict, account, correlations: dict):
+        """Show the model its correlation exposure, not just its position count.
+
+        Without this the budget is invisible to the decision-maker: it proposes a
+        second correlated leg at full conviction, the engine silently halves it, and
+        the model never learns that a diversifying trade would have been worth more.
+        """
+        try:
+            positions = list(account.positions or [])
+            eq = account.equity or 0.0
+            used = self.risk.portfolio_risk(positions, correlations)
+            used_n = self.risk.correlated_notional(positions, correlations)
+            hl = context.setdefault("hard_limits", {})
+
+            # Budget 1: tail loss if every stop fires together.
+            hl["max_portfolio_stopout_risk_pct"] = round(
+                self.risk.max_portfolio_risk * 100, 2
+            )
+            hl["portfolio_stopout_risk_used_pct"] = (
+                round(used / eq * 100, 3) if eq else 0.0
+            )
+            # Budget 2: how hard the equity curve can swing. Usually the binding one.
+            hl["max_correlated_notional_x_equity"] = round(
+                self.risk.max_correlated_notional, 2
+            )
+            hl["correlated_notional_used_x_equity"] = (
+                round(used_n / eq, 3) if eq else 0.0
+            )
+            hl["portfolio_risk_note"] = (
+                "Two correlation budgets, both scored. The stop-out one is what you "
+                "lose if EVERY open stop fills in the same move. The notional one is "
+                "how hard your equity curve can swing, which is what the stability "
+                "metric sees. Same-side positions in correlated pairs consume both "
+                "nearly additively, so a leg that doubles an existing bet is "
+                "automatically scaled down, while one that diversifies or hedges is "
+                "not. Prefer the diversifying trade when setups are comparable."
+            )
+
+            # The book's own correlations, so "diversifying" is a fact not a guess.
+            if correlations and account.positions:
+                held = [p.symbol for p in account.positions]
+                pairs = {}
+                for (a, b), c in correlations.items():
+                    if a in held or b in held:
+                        pairs[f"{a.split('/')[0]}~{b.split('/')[0]}"] = round(c, 2)
+                if pairs:
+                    top = dict(
+                        sorted(pairs.items(), key=lambda kv: -abs(kv[1]))[:12]
+                    )
+                    hl["correlations_vs_open_book"] = top
+            exhausted = [
+                name
+                for name, u, cap in (
+                    ("stop-out risk", used, self.risk.max_portfolio_risk * eq),
+                    ("correlated notional", used_n, self.risk.max_correlated_notional * eq),
+                )
+                if cap > 0 and u >= cap
+            ]
+            if exhausted:
+                hl["portfolio_risk_exhausted"] = (
+                    f"{' and '.join(exhausted)} budget is full — new entries will be "
+                    "rejected until a position closes or a stop tightens. Reason about "
+                    "exits and holds, not entries."
+                )
+        except Exception as e:  # context enrichment must never break a cycle
+            self.logger.warning("correlation context failed: %s", e)
 
     def _record_ai_health(self, error: str | None):
         """Publish decision-layer liveness so something outside the process can see it.

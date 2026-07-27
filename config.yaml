@@ -78,7 +78,28 @@ risk:
   max_risk_per_trade: 0.012
   max_drawdown: 0.15
   max_open_positions: 3
+  # Counts SYMBOLS, so it cannot tell BTC+ETH (~0.9 correlated, one double-sized
+  # bet) from BTC+DOGE. Kept as a coarse backstop; max_portfolio_risk below is the
+  # control that actually binds.
   max_same_side_positions: 2
+  # Correlation-aware portfolio budget: the most we accept losing if EVERY open stop
+  # fills in the same move. Measured 2026-07-27, the bot held BTC long + ETH long at
+  # once — legal under the position count, ~0.9 correlated in fact, and they went
+  # underwater together. 2.0% sits just under the 2.5% daily loss limit so a full
+  # simultaneous stop-out does not by itself end the trading day. New entries are
+  # SCALED DOWN to fit rather than rejected: losing the trade costs pace, and a
+  # smaller trade still bounds the loss.
+  max_portfolio_risk: 0.02
+  # The second correlation budget, and the one that binds in practice. Stop-out risk
+  # bounds the TAIL; this bounds the day-to-day SWING, which is what the stability
+  # metric actually scores. Equity-curve volatility tracks correlated NOTIONAL, not
+  # stop distance: the observed BTC+ETH pair was a harmless 0.71% of equity in
+  # stop-out terms but $713 of correlation-adjusted notional on $1k, and that mark
+  # is what moved the curve. 1.0x equity lets two correlated legs through and bites
+  # on the third — i.e. it forbids turning the book into one 3x beta bet.
+  max_correlated_notional: 1.0
+  correlation_lookback: 100     # 1h bars behind the return-correlation estimate
+  correlation_floor: 0.5        # never count a same-side pair below this (tails spike)
   cooldown_after_losses: 3
   max_consecutive_losses: 3
   cooldown_hours: 6

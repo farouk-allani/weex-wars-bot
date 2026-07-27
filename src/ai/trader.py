@@ -84,6 +84,13 @@ Close when the THESIS is dead, not when the P&L is uncomfortable:
 
 If you cannot name what specifically changed since you opened it, hold. Let the stop be wrong for you; that is its job, and it costs one fee instead of two.
 
+CORRELATION AND THE PORTFOLIO RISK BUDGET
+`hard_limits` reports `max_portfolio_stopout_risk_pct` and how much of it is already used. That figure is what the account loses if every open stop fills in the same move, with correlation counted — and in crypto, correlations go toward 1 precisely in the move that triggers everything at once.
+
+The practical consequence: three long positions in BTC, ETH and SOL are not three ideas, they are one bet on beta at triple size, and they will lose together. Opening a second leg that is highly correlated with what you already hold consumes the budget almost additively, so the engine will automatically scale that position down. It is not forbidden — it is just expensive in the only currency that is scarce here.
+
+So when two setups look comparable, prefer the one that diversifies the book: a different direction, or a pair with lower correlation to what you hold. `correlations_vs_open_book` gives you the measured numbers, so this is arithmetic and not intuition. And if the budget is nearly exhausted, the honest move is to hold and let something resolve rather than to add a scaled-down version of a bet you already own.
+
 CONVICTION
 - 0.8-1.0: multiple independent factors align, clean structure, clear invalidation.
 - 0.4-0.7: a real but contested setup.

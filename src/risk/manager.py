@@ -34,9 +34,33 @@ class RiskManager:
         self.partial_be_buffer_atr = risk_config.get("partial_be_buffer_atr", 0.1)
         # Majors move together. Two shorts across BTC/SOL is one directional bet at
         # double size, not two independent positions, so cap same-side exposure.
+        # This counts SYMBOLS, which is a crude proxy — it cannot tell BTC+ETH
+        # (~0.9 correlated, effectively one double bet) from BTC+DOGE. It stays as a
+        # coarse backstop; the binding control is the portfolio risk budget below.
         self.max_same_side_positions = int(
             risk_config.get("max_same_side_positions", 1)
         )
+        # Correlation-aware portfolio risk budget: the most we are willing to lose if
+        # EVERY open stop fills at once, as a fraction of equity. Correlated same-side
+        # positions consume this fast; a genuine hedge consumes almost none. Used to
+        # scale new positions down rather than to veto them, because losing the trade
+        # costs pace and a smaller trade still bounds the loss.
+        self.max_portfolio_risk = float(risk_config.get("max_portfolio_risk", 0.02))
+        # Second, independent dimension. The stop-out budget above bounds the TAIL
+        # (what if every stop fires); this bounds the day-to-day SWING. Equity-curve
+        # volatility scales with correlated *notional*, not with stop distance, and
+        # that curve is what the stability metric scores. Measured 2026-07-27: BTC
+        # long + ETH long was only 0.71% of equity in stop-out terms — genuinely
+        # small — yet $713 of correlation-adjusted notional on $1k equity, and the
+        # mark-to-market on those two is what actually moved the curve.
+        self.max_correlated_notional = float(
+            risk_config.get("max_correlated_notional", 1.0)
+        )
+        self.correlation_lookback = int(risk_config.get("correlation_lookback", 100))
+        # Crypto correlations spike toward 1 in exactly the stress move this budget
+        # exists to survive, so a calm-market estimate understates the tail. Never
+        # count a same-side pair below this, whatever the sample says.
+        self.correlation_floor = float(risk_config.get("correlation_floor", 0.5))
 
         sizing_config = config.get("sizing", {})
         self.sizing_method = sizing_config.get("method", "half_kelly")
@@ -119,6 +143,253 @@ class RiskManager:
                 f"{signal.side.value} position(s), max {self.max_same_side_positions}",
             )
         return True, "OK"
+
+    # ------------------------------------------------------------------
+    # Correlation-aware portfolio risk
+    #
+    # Counting positions treats BTC+ETH the same as BTC+DOGE. Measured on
+    # 2026-07-27 the bot held BTC long and ETH long simultaneously — two "slots"
+    # under the old cap, but ~0.9 correlated, i.e. one directional bet at nearly
+    # double risk, and they went underwater together. What actually matters is:
+    # if every stop fills at once, how much is lost? That is a portfolio
+    # question, so it needs the covariance, not a count.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def returns_correlation(
+        closes_by_symbol: dict[str, Any], lookback: int = 100
+    ) -> dict[tuple[str, str], float]:
+        """Pairwise correlation of log returns, keyed by unordered symbol pair.
+
+        Built from the candles the engine already fetches each cycle, so this costs
+        nothing extra. Symbols with too little history are simply absent, and the
+        caller falls back to a conservative assumption rather than to zero.
+        """
+        rets: dict[str, Any] = {}
+        for sym, closes in (closes_by_symbol or {}).items():
+            arr = np.asarray(closes, dtype=float)
+            arr = arr[-(lookback + 1):]
+            if arr.size < 20 or np.any(arr <= 0):
+                continue
+            r = np.diff(np.log(arr))
+            if r.size < 19 or not np.isfinite(r).all() or np.std(r) == 0:
+                continue
+            rets[sym] = r
+
+        out: dict[tuple[str, str], float] = {}
+        syms = sorted(rets)
+        for i, a in enumerate(syms):
+            for b in syms[i + 1:]:
+                n = min(rets[a].size, rets[b].size)
+                ra, rb = rets[a][-n:], rets[b][-n:]
+                if n < 19 or np.std(ra) == 0 or np.std(rb) == 0:
+                    continue
+                c = float(np.corrcoef(ra, rb)[0, 1])
+                if np.isfinite(c):
+                    out[(a, b)] = max(-1.0, min(1.0, c))
+        return out
+
+    def _rho(self, a: str, b: str, same_side: bool, correlations: dict | None) -> float:
+        """Correlation to USE (not merely to observe) between two legs."""
+        if a == b:
+            return 1.0
+        c = None
+        if correlations:
+            c = correlations.get((a, b), correlations.get((b, a)))
+        if same_side:
+            # Conservative in the tail, and conservative when we know nothing.
+            return self.correlation_floor if c is None else max(c, self.correlation_floor)
+        # Opposite sides: only credit a hedge we have actually measured.
+        return 0.0 if c is None else c
+
+    @staticmethod
+    def _leg_risk(symbol: str, side: Side, entry: float, size: float, stop: float):
+        """(direction, USD lost if this leg stops out)."""
+        dist = abs(entry - stop) if stop and stop > 0 else entry * 0.015
+        return (1.0 if side == Side.LONG else -1.0), max(dist, 0.0) * max(size, 0.0)
+
+    def portfolio_risk(
+        self,
+        positions: list[Position],
+        correlations: dict | None = None,
+        extra: Optional[tuple[str, Side, float, float, float]] = None,
+    ) -> float:
+        """USD at risk if every stop fills together, accounting for correlation.
+
+        sqrt( SUM_i SUM_j d_i d_j rho_ij r_i r_j ) — same-side correlated legs add
+        almost linearly, opposite-side correlated legs partly cancel. `extra` is a
+        candidate (symbol, side, entry, size, stop) evaluated as if already open.
+        """
+        legs: list[tuple[str, float, float]] = []
+        for p in positions or []:
+            d, r = self._leg_risk(
+                p.symbol, p.side, p.entry_price, p.size, getattr(p, "stop_loss", 0) or 0
+            )
+            if r > 0:
+                legs.append((p.symbol, d, r))
+        if extra:
+            sym, side, entry, size, stop = extra
+            d, r = self._leg_risk(sym, side, entry, size, stop)
+            if r > 0:
+                legs.append((sym, d, r))
+        if not legs:
+            return 0.0
+
+        total = 0.0
+        for i, (sa, da, ra) in enumerate(legs):
+            for j, (sb, db, rb) in enumerate(legs):
+                rho = 1.0 if i == j else self._rho(sa, sb, da * db > 0, correlations)
+                total += da * db * rho * ra * rb
+        return float(np.sqrt(max(total, 0.0)))
+
+    def correlated_notional(
+        self,
+        positions: list[Position],
+        correlations: dict | None = None,
+        extra: Optional[tuple[str, Side, float, float]] = None,
+    ) -> float:
+        """Correlation-adjusted net directional notional, in USD.
+
+        Same quadratic form as portfolio_risk but weighted by notional instead of
+        stop distance, because mark-to-market swing — the thing the stability metric
+        sees — scales with position size, not with where the stop happens to sit.
+        `extra` is a candidate (symbol, side, entry, size).
+        """
+        legs: list[tuple[str, float, float]] = []
+        for p in positions or []:
+            d = 1.0 if p.side == Side.LONG else -1.0
+            n = abs(p.entry_price * p.size)
+            if n > 0:
+                legs.append((p.symbol, d, n))
+        if extra:
+            sym, side, entry, size = extra
+            d = 1.0 if side == Side.LONG else -1.0
+            n = abs(entry * size)
+            if n > 0:
+                legs.append((sym, d, n))
+        if not legs:
+            return 0.0
+        total = 0.0
+        for i, (sa, da, na) in enumerate(legs):
+            for j, (sb, db, nb) in enumerate(legs):
+                rho = 1.0 if i == j else self._rho(sa, sb, da * db > 0, correlations)
+                total += da * db * rho * na * nb
+        return float(np.sqrt(max(total, 0.0)))
+
+    @staticmethod
+    def _quadratic_scale(A: float, B: float, C: float, budget: float) -> Optional[float]:
+        """Largest s >= 0 with A + 2Bs + Cs^2 <= budget^2, or None if unbounded/moot.
+
+        Shared by both budgets: each is a quadratic form in the candidate's size, so
+        "how big can this leg be" is the same root-solve in both cases.
+        """
+        cap = budget * budget
+        if A >= cap:
+            return 0.0
+        if C <= 0:
+            return None
+        disc = B * B - C * (A - cap)
+        if disc < 0:
+            return None
+        return max(0.0, (-B + float(np.sqrt(disc))) / C)
+
+    def correlation_scale(
+        self,
+        signal: Signal,
+        size: float,
+        account: AccountState,
+        correlations: dict | None = None,
+    ) -> tuple[float, str]:
+        """Multiplier in [0,1] for `size` honouring BOTH correlation budgets.
+
+        Two different questions, both scored by the competition:
+          - stop-out risk : what if every stop fires at once (risk management)
+          - net notional  : how hard does the equity curve swing (stability)
+        The binding one wins, so the trade is scaled to satisfy whichever is tighter.
+        """
+        if size <= 0 or account.equity <= 0:
+            return 1.0, "no size to scale"
+
+        open_positions = list(account.positions or [])
+        d_c = 1.0 if signal.side == Side.LONG else -1.0
+        results: list[tuple[float, str]] = []
+
+        # --- budget 1: correlated stop-out risk ---
+        if self.max_portfolio_risk > 0:
+            _, r_c = self._leg_risk(
+                signal.symbol, signal.side, signal.entry_price, size, signal.stop_loss
+            )
+            if r_c > 0:
+                legs = []
+                for p in open_positions:
+                    d, r = self._leg_risk(
+                        p.symbol, p.side, p.entry_price, p.size,
+                        getattr(p, "stop_loss", 0) or 0,
+                    )
+                    if r > 0:
+                        legs.append((p.symbol, d, r))
+                A = self.portfolio_risk(open_positions, correlations) ** 2
+                B = sum(
+                    d * d_c
+                    * self._rho(sym, signal.symbol, d * d_c > 0, correlations)
+                    * r * r_c
+                    for sym, d, r in legs
+                )
+                s = self._quadratic_scale(
+                    A, B, r_c * r_c, self.max_portfolio_risk * account.equity
+                )
+                if s is not None:
+                    results.append((s, f"stop-out budget {self.max_portfolio_risk:.2%}"))
+
+        # --- budget 2: correlated directional notional ---
+        if self.max_correlated_notional > 0:
+            n_c = abs(signal.entry_price * size)
+            if n_c > 0:
+                legs_n = []
+                for p in open_positions:
+                    d = 1.0 if p.side == Side.LONG else -1.0
+                    n = abs(p.entry_price * p.size)
+                    if n > 0:
+                        legs_n.append((p.symbol, d, n))
+                A = self.correlated_notional(open_positions, correlations) ** 2
+                B = sum(
+                    d * d_c
+                    * self._rho(sym, signal.symbol, d * d_c > 0, correlations)
+                    * n * n_c
+                    for sym, d, n in legs_n
+                )
+                s = self._quadratic_scale(
+                    A, B, n_c * n_c, self.max_correlated_notional * account.equity
+                )
+                if s is not None:
+                    results.append(
+                        (s, f"notional budget {self.max_correlated_notional:.2f}x equity")
+                    )
+
+        if not results:
+            return 1.0, "no correlation budget binding"
+
+        s, which = min(results, key=lambda kv: kv[0])
+        if s <= 0:
+            return 0.0, f"{which} already exhausted"
+        if s >= 1.0:
+            return 1.0, "within both correlation budgets at full size"
+
+        worst_rho = max(
+            (
+                self._rho(
+                    p.symbol, signal.symbol,
+                    (1.0 if p.side == Side.LONG else -1.0) * d_c > 0,
+                    correlations,
+                )
+                for p in open_positions
+            ),
+            default=0.0,
+        )
+        return s, (
+            f"scaled to {s:.0%} by the {which} "
+            f"(max correlation vs open book {worst_rho:+.2f})"
+        )
 
     def get_strategy_weight(self, strategy: str) -> float:
         """Adaptive weight 0.5–1.4 from recent strategy PnL."""
