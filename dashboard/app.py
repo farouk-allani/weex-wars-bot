@@ -547,6 +547,19 @@ def health():
     state = load_state()
     log = _log_path(cfg)
     st = _state_path(cfg)
+    # Decision-layer liveness and ai-log coverage, both published by the bot.
+    # Surfaced here because "is the brain alive and are we compliant" should be
+    # answerable without an SSH session.
+    def _sidecar(name: str) -> dict:
+        try:
+            p = st.parent / name
+            return json.loads(p.read_text()) if p.exists() else {}
+        except Exception:
+            return {}
+
+    ai = _sidecar("ai_health.json")
+    comp = _sidecar("compliance.json")
+    gap = comp.get("orders_without_ai_log")
     return {
         "ok": True,
         "config_exists": _config_path().exists(),
@@ -555,6 +568,14 @@ def health():
         "state_path": str(st),
         "log_path": str(log),
         "has_trades": bool((state.get("risk") or {}).get("trade_history")),
+        "ai_healthy": ai.get("healthy"),
+        "ai_model": ai.get("model"),
+        "ai_last_success": ai.get("last_success"),
+        "ai_consecutive_failures": ai.get("consecutive_failures"),
+        "compliance_ok": comp.get("compliant"),
+        "orders_linked": comp.get("orders_linked"),
+        "ai_logs_on_disk": comp.get("ai_logs_on_disk"),
+        "orders_without_ai_log": gap,
     }
 
 

@@ -1,9 +1,10 @@
 """Quick smoke test — modules, risk sizing by strength, SL guards, strategy."""
 
 import copy
+import json
 import numpy as np
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, ".")
 
@@ -169,5 +170,93 @@ rm2.load_state(loaded.get("risk") or {})
 assert rm2.peak_equity == rm.peak_equity or True
 p.unlink(missing_ok=True)
 print("State round-trip OK")
+
+# ---------------------------------------------------------------------------
+# Compliance. An AI-driven order without its ai-log is not a worse score, it is
+# a non-compliant order — so these are invariants, not nice-to-haves.
+# ---------------------------------------------------------------------------
+print("\n=== AI-LOG SURVIVES A RESTART ===")
+import logging as _logging
+import tempfile
+from src.ai import wars_log as _wl
+from src.ai.logbook import DecisionLog
+
+_logging.getLogger("src.ai.logbook").setLevel(_logging.CRITICAL)  # expected ERROR below
+_tmp = Path(tempfile.mkdtemp())
+_dl = DecisionLog(_tmp / "dec.jsonl")
+_did = _dl.record(
+    model="test-model",
+    context={"markets": []},
+    decisions=[{"symbol": "BTC/USDT:USDT", "action": "long", "rationale": "because X"}],
+    raw_response="{}", reasoning="cot",
+    messages=[{"role": "user", "content": "ctx"}],
+)
+# A maker entry can rest for entry_ttl_minutes and fill after a deploy, so the
+# emitter must not depend on this process's memory.
+_dl2 = DecisionLog(_tmp / "dec.jsonl")
+assert _dl2._recent == {}, "fresh log must start with no in-memory decisions"
+_wl.AI_LOGS_DIR = _tmp / "ailogs"
+_dl2.link_order(_did, symbol="BTC/USDT:USDT", order_id="oid1", side="long",
+                size=0.01, entry_price=50000.0, stop_loss=49000.0, take_profit=52000.0)
+_files = list((_tmp / "ailogs").glob("*.json"))
+assert len(_files) == 1, f"ai-log not written after restart: {_files}"
+assert _dl2.ailog_emitted == 1 and _dl2.ailog_failed == 0
+_payload = json.loads(_files[0].read_text())
+assert _payload["explanation"] == "because X", _payload["explanation"]
+for _k in ("stage", "model", "input", "output", "explanation"):
+    assert _payload.get(_k), f"ai-log missing required field {_k}"
+print("ai-log emitted from disk-recovered decision OK")
+
+print("\n=== AI-LOG FAILURE IS LOUD ===")
+_dl2.link_order("dec_missing", symbol="ETH/USDT:USDT", order_id="oid2", side="short",
+                size=1.0, entry_price=3000.0, stop_loss=3100.0, take_profit=2800.0)
+assert _dl2.ailog_failed == 1, "an unrecoverable ai-log must be counted, not swallowed"
+assert _dl2.last_ailog_error
+_status = _dl2.compliance_status(_tmp / "ailogs")
+assert _status["orders_linked"] == 2 and _status["ai_logs_on_disk"] == 1
+assert _status["orders_without_ai_log"] == 1 and _status["compliant"] is False
+print(f"compliance gap detected OK ({_status['orders_without_ai_log']}/{_status['orders_linked']})")
+
+print("\n=== BOOT-STAMPED TRADES ARE QUARANTINED ===")
+from src.core.models import TradeResult as _TR
+
+def _mk(n, stamp):
+    return [_TR(symbol="BTC/USDT:USDT", side=Side.LONG, entry_price=1, exit_price=1, size=1,
+                leverage=5, pnl=0.5, pnl_pct=1, duration_seconds=60, exit_reason="be_stop",
+                strategy="ai_deepseek", timestamp=stamp) for _ in range(n)]
+
+_shared = datetime(2026, 7, 25, 10, 37, 53)
+_rm = RiskManager(config)
+_rm.trade_history = _mk(8, _shared) + _mk(1, datetime(2026, 7, 26, 6, 5, 37))
+_rm._quarantine_boot_stamped_trades()
+assert sum(1 for t in _rm.trade_history if t.timestamp is None) == 8
+assert sum(t.pnl for t in _rm.trade_history) == 4.5, "quarantine must not touch P&L"
+_rm3 = RiskManager(config)
+_rm3.trade_history = _mk(3, _shared)  # a plausible real cluster must survive
+_rm3._quarantine_boot_stamped_trades()
+assert all(t.timestamp is not None for t in _rm3.trade_history)
+# A legacy state with no timestamps must yield None, never boot time: a boot-time
+# stamp lands inside the live round window and reads as a trade that never happened.
+_rm4 = RiskManager(config)
+_rm4.load_state({"trade_history": [{
+    "symbol": "BTC/USDT:USDT", "side": "long", "entry_price": 1, "exit_price": 1,
+    "size": 1, "leverage": 5, "pnl": 1.0, "pnl_pct": 1, "duration_seconds": 60,
+    "exit_reason": "be_stop"}]})
+assert _rm4.trade_history[0].timestamp is None, _rm4.trade_history[0].timestamp
+assert _rm4.trade_history[0].pnl == 1.0
+print("boot-stamp quarantine + legacy load OK")
+
+print("\n=== ROUND PACE COUNTS ONLY DATED TRADES ===")
+from src.core.engine import TradingEngine
+_now = datetime.utcnow()
+_comp = {"min_trades": 10, "round_days": 7,
+         "round_started": (_now - timedelta(days=5)).isoformat()}
+_pace = TradingEngine._trade_pace(None, _comp, _mk(3, _now - timedelta(days=1)) + _mk(8, None))
+assert _pace["trades_this_round"] == 3, _pace["trades_this_round"]
+assert _pace["trades_still_needed"] == 7
+assert _pace["status"].startswith("BEHIND PACE"), _pace["status"]
+_met = TradingEngine._trade_pace(None, _comp, _mk(12, _now - timedelta(days=1)))
+assert _met["trades_still_needed"] == 0 and "pure cost" in _met["status"]
+print("round pace OK (undated trades cannot fake the minimum)")
 
 print("\n=== ALL TESTS PASSED ===")

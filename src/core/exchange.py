@@ -72,6 +72,47 @@ class ExchangeClient:
         self._candle_cache: dict[str, list[Candle]] = {}
         self._last_fetch: dict[str, float] = {}
 
+        # Venue precision, loaded lazily on first use.
+        self._markets_loaded = False
+
+    # ---- Venue precision ----
+    #
+    # Sizes and prices are rounded to the venue's tradable increments *before* an
+    # order is built, not left for the venue to adjust afterwards. Two reasons, and
+    # the first is a hard competition requirement: the ai-log we submit must carry
+    # the parameters that match the final trade request, so the number we log has to
+    # be the number we sent. Second, paper rounds identically to live, so a paper
+    # fill is always a size live would actually accept.
+
+    def _ensure_markets(self) -> bool:
+        if self._markets_loaded:
+            return True
+        try:
+            self.exchange.load_markets()
+            self._markets_loaded = True
+        except Exception:
+            self._markets_loaded = False
+        return self._markets_loaded
+
+    def normalize_amount(self, symbol: str, amount: float) -> float:
+        """Round a size to the venue's amount precision. Falls back to the raw
+        value if markets are unreachable — never blocks a trade."""
+        if self._ensure_markets():
+            try:
+                return float(self.exchange.amount_to_precision(symbol, amount))
+            except Exception:
+                pass
+        return float(amount)
+
+    def normalize_price(self, symbol: str, price: float) -> float:
+        """Round a price to the venue's tick size, same contract as above."""
+        if self._ensure_markets():
+            try:
+                return float(self.exchange.price_to_precision(symbol, price))
+            except Exception:
+                pass
+        return float(price)
+
     # ---- Market Data ----
 
     def fetch_candles(
@@ -238,6 +279,14 @@ class ExchangeClient:
         leverage: Optional[int] = None,
     ) -> dict:
         """Place entry + optional SL/TP brackets."""
+        # Same contract as place_entry_limit: round before recording, so the
+        # ai-log's quantity/price match the submitted request.
+        amount = self.normalize_amount(symbol, amount)
+        if amount <= 0:
+            return {"error": "amount rounds to zero at venue precision"}
+        if price:
+            price = self.normalize_price(symbol, price)
+
         if self.mode == "paper":
             return self._paper_order(
                 symbol, side, amount, price, order_type,
@@ -375,6 +424,14 @@ class ExchangeClient:
         produce a position without a stop, even across a restart."""
         if limit_price <= 0 or amount <= 0:
             return {"error": "invalid limit price or amount"}
+
+        # Round to venue increments before anything records these numbers: the
+        # pending order, the resulting position, and the audited ai-log must all
+        # agree with what was actually submitted.
+        amount = self.normalize_amount(symbol, amount)
+        limit_price = self.normalize_price(symbol, limit_price)
+        if amount <= 0:
+            return {"error": "amount rounds to zero at venue precision"}
 
         if self.mode == "paper":
             if symbol in self.paper_positions:

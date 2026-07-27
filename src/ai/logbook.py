@@ -11,12 +11,15 @@ record of a decision the exchange already acted on.
 """
 
 import json
+import logging
 import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class DecisionLog:
@@ -25,6 +28,11 @@ class DecisionLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._recent: dict[str, dict] = {}  # decision_id -> entry, for ai-log emission
+        # ai-log emission counters. An order without an ai-log is a compliance
+        # failure, so the tally is state the engine reports, not a debug detail.
+        self.ailog_emitted = 0
+        self.ailog_failed = 0
+        self.last_ailog_error: Optional[str] = None
 
     def record(
         self,
@@ -101,16 +109,124 @@ class DecisionLog:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "order": order,
         })
-        # Emit the WEEX-schema ai-log file for this order. Must never break
-        # trading — the trade is already live when this runs.
+        self._emit_ai_log(decision_id, order)
+
+    def _lookup(self, decision_id: str) -> Optional[dict]:
+        """The decision behind an order, from memory or from disk."""
+        entry = self._recent.get(decision_id)
+        if entry is not None:
+            return entry
+        return self._read_decision(decision_id)
+
+    def _read_decision(self, decision_id: str) -> Optional[dict]:
+        """Recover a decision record from the log file.
+
+        `_recent` is process memory, but a maker entry rests for up to
+        execution.entry_ttl_minutes and can therefore fill *after* a restart or a
+        deploy. Without this fallback that order's ai-log was never written and the
+        order shipped non-compliant — silently, because the emit path swallowed the
+        miss. Measured 2026-07-27: 7 of 18 orders had no ai-log file.
+        """
+        if not self.path.exists():
+            return None
+        found = None
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                for line in f:
+                    # Cheap pre-filter: skip the JSON parse for non-matching lines.
+                    if decision_id not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if row.get("type"):  # linkage/outcome record, not the decision
+                        continue
+                    if row.get("decision_id") == decision_id:
+                        found = row
+        except Exception as e:
+            logger.error("ai-log: could not read decision log for %s: %s", decision_id, e)
+        return found
+
+    def _emit_ai_log(self, decision_id: str, order: dict) -> Optional[Path]:
+        """Write the WEEX-schema ai-log for an order.
+
+        Never raises — the trade is already live by the time this runs. But a
+        failure is recorded and logged at ERROR: an order without an ai-log is
+        non-compliant, and the previous silent `except: pass` is exactly why that
+        went unnoticed for six days.
+        """
         try:
             from . import wars_log
 
-            entry = self._recent.get(decision_id)
-            if entry:
-                wars_log.emit(entry, order)
-        except Exception:
-            pass
+            entry = self._lookup(decision_id)
+            if entry is None:
+                raise LookupError("decision not found in memory or on disk")
+            path = wars_log.emit(entry, order)
+            self.ailog_emitted += 1
+            self.last_ailog_error = None
+            logger.info(
+                "AILOG_OK %s order=%s -> %s",
+                order.get("symbol"), order.get("order_id"), path.name,
+            )
+            return path
+        except Exception as e:
+            self.ailog_failed += 1
+            self.last_ailog_error = (
+                f"{order.get('symbol')} order {order.get('order_id')}: {e}"
+            )
+            logger.error(
+                "AILOG_FAILED (COMPLIANCE) %s order=%s decision=%s: %s",
+                order.get("symbol"), order.get("order_id"), decision_id, e,
+            )
+            return None
+
+    def compliance_status(self, ai_logs_dir: str | Path = "data/ai_logs") -> dict:
+        """Every linked order vs every ai-log file on disk.
+
+        Read off the artifacts themselves rather than the in-process counters, so
+        it stays true across restarts and reports the same thing a competition
+        reviewer would see.
+        """
+        links: list[dict] = []
+        try:
+            if self.path.exists():
+                with open(self.path, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        if row.get("type") == "order_link":
+                            links.append(row)
+        except Exception as e:
+            return {"error": str(e)}
+
+        d = Path(ai_logs_dir)
+        names = [p.name for p in d.glob("*.json")] if d.exists() else []
+        missing = []
+        for r in links:
+            did = r.get("decision_id") or ""
+            oid = str((r.get("order") or {}).get("order_id") or "")
+            prefix = f"ailog_{did}_{oid}_"
+            if not any(n.startswith(prefix) for n in names):
+                missing.append({
+                    "timestamp": r.get("timestamp"),
+                    "symbol": (r.get("order") or {}).get("symbol"),
+                    "order_id": oid,
+                    "decision_id": did,
+                })
+        return {
+            "orders_linked": len(links),
+            "ai_logs_on_disk": len(names),
+            "orders_without_ai_log": len(missing),
+            # Bounded: the list is for diagnosis, the count is the alarm.
+            "missing": missing[-20:],
+            "compliant": not missing,
+            "emitted_this_process": self.ailog_emitted,
+            "failed_this_process": self.ailog_failed,
+            "last_error": self.last_ailog_error,
+        }
 
     def record_outcome(
         self,

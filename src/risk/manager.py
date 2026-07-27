@@ -6,11 +6,15 @@
 - Strategy-level performance weights
 """
 
+import logging
+
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional, Any
 
 from ..core.models import Signal, Side, Position, AccountState, TradeResult
+
+logger = logging.getLogger(__name__)
 
 
 class RiskManager:
@@ -790,9 +794,12 @@ class RiskManager:
                     banked_pnl=float(raw.get("banked_pnl") or 0),
                     fees=float(raw.get("fees") or 0),
                 )
-                # Pre-timestamp states exist on disk; let the default stand for those
-                # rather than dropping the trade.
+                # A trade whose close time is unknown gets None, never the default
+                # factory's "now": a boot-time stamp reads as a real close and
+                # backdates the trade into whatever window the loader ran in.
+                # Callers that use timestamps already skip None.
                 ts = raw.get("timestamp")
+                kwargs["timestamp"] = None
                 if ts:
                     try:
                         kwargs["timestamp"] = datetime.fromisoformat(
@@ -803,6 +810,36 @@ class RiskManager:
                 self.trade_history.append(TradeResult(**kwargs))
             except Exception:
                 continue
+
+        self._quarantine_boot_stamped_trades()
+
+    # A mass close is not a thing this engine does: positions are closed one at a
+    # time with a venue round-trip between them, and the book has never held more
+    # than a handful at once. So a run of trades sharing one timestamp to the second
+    # is not history, it is the load-time default above having been applied before
+    # it was fixed — and those values are now persisted in state files on disk.
+    # Measured 2026-07-27: 8 of 14 trades carried an identical stamp, with durations
+    # that contradicted the decision log.
+    _BOOT_STAMP_RUN = 4
+
+    def _quarantine_boot_stamped_trades(self) -> None:
+        """Drop timestamps that a previous loader invented, keeping the trades."""
+        groups: dict[str, list] = {}
+        for t in self.trade_history:
+            if t.timestamp is None:
+                continue
+            groups.setdefault(t.timestamp.isoformat(), []).append(t)
+        for stamp, ts in groups.items():
+            if len(ts) < self._BOOT_STAMP_RUN:
+                continue
+            for t in ts:
+                t.timestamp = None
+            logger.warning(
+                "trade history: %d trades shared timestamp %s — treating as a "
+                "load-time artifact, close times set to unknown. P&L is unaffected; "
+                "time-windowed counts will exclude them.",
+                len(ts), stamp,
+            )
 
     def reset_kill_switch(self):
         self.is_killed = False

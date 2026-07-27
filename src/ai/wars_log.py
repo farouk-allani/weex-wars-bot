@@ -52,16 +52,48 @@ def build_ai_log(entry: dict, order: dict) -> dict:
 
 
 def _explanation(entry: dict, order: dict) -> str:
-    """The model's own reasoning for THIS symbol, capped at the schema's 1000."""
-    sym = order.get("symbol", "")
+    """The model's own reasoning for THIS symbol, capped at the schema's 1000.
+
+    The per-symbol key the model actually emits is `rationale` (see the schema in
+    ai/trader.py). This used to look only for `reason`/`reasoning`, never matched,
+    and fell through to the whole cycle's raw chain-of-thought truncated at exactly
+    1000 chars — a mid-sentence CoT dump, when the schema asks for an explanation
+    tied to specific facts in the input. Prefer the symbol's own rationale.
+    """
+    sym = str(order.get("symbol") or "")
     reason = ""
     for d in entry.get("decisions") or []:
-        if str(d.get("symbol", "")) in sym or sym in str(d.get("symbol", "")):
-            reason = d.get("reason") or d.get("reasoning") or ""
-            break
+        if not isinstance(d, dict):
+            continue
+        dsym = str(d.get("symbol") or "")
+        # Both sides must be non-empty, otherwise "" matches the first decision.
+        if not dsym or not sym:
+            continue
+        if dsym == sym or dsym in sym or sym in dsym:
+            reason = str(
+                d.get("rationale") or d.get("reason") or d.get("reasoning") or ""
+            ).strip()
+            if reason:
+                break
     if not reason:
-        reason = entry.get("reasoning") or "Decision per attached model output."
-    return reason[:1000]
+        reason = str(entry.get("reasoning") or "").strip()
+    if not reason:
+        reason = "Decision per attached model output."
+    return _truncate(reason, 1000)
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Cap at `limit` on a sentence, then word, boundary — never mid-word."""
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    for sep in (". ", "; ", ", ", " "):
+        i = cut.rfind(sep)
+        # Only honour a boundary that keeps most of the budget, else a stray early
+        # period would throw away the explanation.
+        if i > limit * 0.6:
+            return cut[: i + (1 if sep.startswith(".") else 0)].rstrip() or cut
+    return cut.rstrip() + "…"
 
 
 def emit(entry: dict, order: dict, out_dir: Path | None = None) -> Path:

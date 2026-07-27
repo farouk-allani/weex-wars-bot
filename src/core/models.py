@@ -166,7 +166,12 @@ class TradeResult:
     duration_seconds: int
     exit_reason: str
     strategy: str = ""
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    # Close time. The factory is right for a trade being recorded now, but a trade
+    # restored from a state file that predates timestamp persistence must be None,
+    # NOT boot time — a boot-time stamp is indistinguishable from a real close and
+    # silently backdates history into whatever window the loader happens to run in.
+    # Anything that places trades on a clock must therefore skip a None timestamp.
+    timestamp: Optional[datetime] = field(default_factory=datetime.utcnow)
     # pnl is the full round trip (partial legs + final leg, net of fees).
     # banked_pnl is the portion already realized by partial TP, so callers that
     # credited it at scale-out time don't count it twice.

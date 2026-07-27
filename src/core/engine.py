@@ -107,6 +107,9 @@ class TradingEngine:
         self._ai_consecutive_failures = 0
         self._last_ai_success: datetime | None = None
         self.ai_health_path = self.state_path.parent / "ai_health.json"
+        # ai-log coverage, published next to it. Alarms on change, not every cycle.
+        self.compliance_path = self.state_path.parent / "compliance.json"
+        self._last_compliance_gap = -1
 
         if ai_cfg.get("enabled", False):
             self.decision_log = DecisionLog(ai_cfg.get("log_file", "logs/ai_decisions.jsonl"))
@@ -336,6 +339,7 @@ class TradingEngine:
         decisions, assessment, decision_id = self.ai.decide(context)
         self._last_ai_call = datetime.utcnow()
         self._record_ai_health(self.ai.last_error)
+        self._record_compliance()
 
         if self.ai.last_error:
             # Deliberately ERROR, not INFO. The previous outage was invisible because
@@ -580,6 +584,40 @@ class TradingEngine:
                 f"{error}",
                 title="ALARM",
             ))
+
+    def _record_compliance(self):
+        """Publish ai-log coverage: every linked order must have an ai-log file.
+
+        An AI-driven live order without its ai-log is non-compliant, and the penalty
+        is not a worse score but potentially no score — so coverage is monitored on
+        every cycle rather than checked by hand before a round. Derived from the
+        artifacts on disk, so it reports what a reviewer would see.
+        """
+        if not self.decision_log:
+            return
+        try:
+            status = self.decision_log.compliance_status()
+            status["updated_at"] = datetime.utcnow().isoformat() + "Z"
+            self.compliance_path.parent.mkdir(parents=True, exist_ok=True)
+            self.compliance_path.write_text(json.dumps(status, indent=1, default=str))
+        except Exception as e:
+            self.logger.warning("could not write compliance status: %s", e)
+            return
+
+        gap = int(status.get("orders_without_ai_log") or 0)
+        if gap and gap != self._last_compliance_gap:
+            self.logger.critical(
+                "COMPLIANCE: %d of %d linked orders have NO ai-log file. "
+                "AI-driven orders without a log are non-compliant. Last error: %s",
+                gap, status.get("orders_linked"), status.get("last_error"),
+            )
+            console.print(Panel.fit(
+                f"[bold red]{gap} ORDER(S) WITHOUT AN AI-LOG[/]\n"
+                f"{status.get('orders_linked')} orders linked, "
+                f"{status.get('ai_logs_on_disk')} logs on disk",
+                title="COMPLIANCE ALARM",
+            ))
+        self._last_compliance_gap = gap
 
     def _competition_context(self) -> dict:
         """Scoring, trade count and clock — the model reasons about all three."""
