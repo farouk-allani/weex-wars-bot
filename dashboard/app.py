@@ -576,6 +576,9 @@ def health():
         "orders_linked": comp.get("orders_linked"),
         "ai_logs_on_disk": comp.get("ai_logs_on_disk"),
         "orders_without_ai_log": gap,
+        "ai_logs_repairable_incomplete": comp.get("ai_logs_repairable_incomplete"),
+        "ai_logs_unrepairable_historical": comp.get("ai_logs_unrepairable_historical"),
+        "compliance_note": comp.get("note") or None,
     }
 
 

@@ -604,17 +604,28 @@ class TradingEngine:
             self.logger.warning("could not write compliance status: %s", e)
             return
 
-        gap = int(status.get("orders_without_ai_log") or 0)
+        # Alarm on what is actionable: a missing log, or one that is incomplete
+        # despite the record holding everything needed to complete it. Logs that
+        # provably cannot be repaired are counted separately and stay quiet, so
+        # they cannot desensitise us to a new failure.
+        gap = int(status.get("orders_without_ai_log") or 0) + int(
+            status.get("ai_logs_repairable_incomplete") or 0
+        )
         if gap and gap != self._last_compliance_gap:
             self.logger.critical(
-                "COMPLIANCE: %d of %d linked orders have NO ai-log file. "
-                "AI-driven orders without a log are non-compliant. Last error: %s",
-                gap, status.get("orders_linked"), status.get("last_error"),
+                "COMPLIANCE: %d of %d linked orders lack a usable ai-log "
+                "(%d missing, %d incomplete-but-repairable). AI-driven orders "
+                "without a valid log are non-compliant. Last error: %s",
+                gap, status.get("orders_linked"),
+                status.get("orders_without_ai_log"),
+                status.get("ai_logs_repairable_incomplete"),
+                status.get("last_error"),
             )
             console.print(Panel.fit(
-                f"[bold red]{gap} ORDER(S) WITHOUT AN AI-LOG[/]\n"
+                f"[bold red]{gap} ORDER(S) WITHOUT A USABLE AI-LOG[/]\n"
                 f"{status.get('orders_linked')} orders linked, "
-                f"{status.get('ai_logs_on_disk')} logs on disk",
+                f"{status.get('ai_logs_on_disk')} logs on disk\n"
+                f"run: python run_compliance_audit.py --backfill",
                 title="COMPLIANCE ALARM",
             ))
         self._last_compliance_gap = gap

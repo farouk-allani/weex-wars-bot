@@ -202,45 +202,73 @@ class DecisionLog:
         except Exception as e:
             return {"error": str(e)}
 
-        d = Path(ai_logs_dir)
-        files = sorted(d.glob("*.json")) if d.exists() else []
-        names = [p.name for p in files]
-        missing = []
-        for r in links:
-            did = r.get("decision_id") or ""
-            oid = str((r.get("order") or {}).get("order_id") or "")
-            prefix = f"ailog_{did}_{oid}_"
-            if not any(n.startswith(prefix) for n in names):
-                missing.append({
-                    "timestamp": r.get("timestamp"),
-                    "symbol": (r.get("order") or {}).get("symbol"),
-                    "order_id": oid,
-                    "decision_id": did,
-                })
-
         # A file that exists but carries no verbatim prompt is not a usable log, so
         # presence alone is not the invariant worth reporting.
         from . import wars_log
 
-        incomplete = []
-        for p in files:
+        d = Path(ai_logs_dir)
+        files = sorted(d.glob("*.json")) if d.exists() else []
+        names = [p.name for p in files]
+
+        missing: list[dict] = []
+        broken: list[dict] = []
+        unrepairable: list[dict] = []
+        for r in links:
+            did = r.get("decision_id") or ""
+            order = r.get("order") or {}
+            oid = str(order.get("order_id") or "")
+            row = {
+                "timestamp": r.get("timestamp"),
+                "symbol": order.get("symbol"),
+                "order_id": oid,
+                "decision_id": did,
+            }
+            prefix = f"ailog_{did}_{oid}_"
+            match = next((p for p in files if p.name.startswith(prefix)), None)
+            if match is None:
+                missing.append(row)
+                continue
             try:
-                problems = wars_log.validate(json.loads(p.read_text(encoding="utf-8")))
+                problems = wars_log.validate(
+                    json.loads(match.read_text(encoding="utf-8"))
+                )
             except Exception as e:
                 problems = [f"unreadable: {e}"]
-            if problems:
-                incomplete.append({"file": p.name, "problems": problems})
+            if not problems:
+                continue
+            row = dict(row, file=match.name, problems=problems)
+            # Split "we have a bug" from "the source record never held this".
+            # Decisions logged before the logbook captured verbatim messages cannot
+            # be completed from anything on disk, and inventing a prompt to close
+            # the count would be worse than reporting the hole. Those are recorded
+            # once as a known historical fact so they cannot mask a NEW failure.
+            src = self._read_decision(did) or {}
+            if any("input.messages" in p for p in problems) and not (
+                src.get("messages") or []
+            ):
+                unrepairable.append(row)
+            else:
+                broken.append(row)
 
+        # `compliant` is about what is still actionable: every order has a log, and
+        # every log that COULD be complete is. A permanently-false flag is a monitor
+        # nobody reads.
         return {
             "orders_linked": len(links),
             "ai_logs_on_disk": len(names),
             "orders_without_ai_log": len(missing),
-            "ai_logs_incomplete": len(incomplete),
+            "ai_logs_repairable_incomplete": len(broken),
+            "ai_logs_unrepairable_historical": len(unrepairable),
             # Bounded: the lists are for diagnosis, the counts are the alarm.
             "missing": missing[-20:],
-            "incomplete": incomplete[-20:],
-            # Every order has a log AND every log is usable.
-            "compliant": not missing and not incomplete,
+            "incomplete": broken[-20:],
+            "unrepairable": unrepairable[-20:],
+            "compliant": not missing and not broken,
+            "note": (
+                f"{len(unrepairable)} historical log(s) predate verbatim-prompt "
+                "capture and cannot be completed from the record"
+                if unrepairable else ""
+            ),
             "emitted_this_process": self.ailog_emitted,
             "failed_this_process": self.ailog_failed,
             "last_error": self.last_ailog_error,

@@ -42,20 +42,29 @@ def main() -> int:
         return 2
 
     print("=== ai-log compliance ===")
-    print(f"  orders linked          : {status['orders_linked']}")
-    print(f"  ai-logs on disk        : {status['ai_logs_on_disk']}")
-    print(f"  orders WITHOUT a log   : {status['orders_without_ai_log']}")
-    print(f"  logs INCOMPLETE        : {status['ai_logs_incomplete']}")
-    print(f"  compliant              : {status['compliant']}")
+    print(f"  orders linked            : {status['orders_linked']}")
+    print(f"  ai-logs on disk          : {status['ai_logs_on_disk']}")
+    print(f"  orders WITHOUT a log     : {status['orders_without_ai_log']}")
+    print(f"  incomplete (repairable)  : {status['ai_logs_repairable_incomplete']}")
+    print(f"  incomplete (historical)  : {status['ai_logs_unrepairable_historical']}")
+    print(f"  compliant                : {status['compliant']}")
+    if status.get("note"):
+        print(f"  note                     : {status['note']}")
 
-    if status["incomplete"]:
-        print(f"\n--- {status['ai_logs_incomplete']} log(s) present but not usable ---")
-        for c in status["incomplete"]:
-            print(f"  {c['file'][:56]}")
+    for label, rows in (("REPAIRABLE", status["incomplete"]),
+                        ("HISTORICAL / unrepairable", status["unrepairable"])):
+        if not rows:
+            continue
+        print(f"\n--- {len(rows)} log(s) present but not usable [{label}] ---")
+        for c in rows:
+            print(f"  {c['symbol']:<16} {c['file'][:52]}")
             for pr in c["problems"]:
                 print(f"      - {pr}")
-        print("  NOTE: a log whose input has no verbatim message array cannot be")
-        print("  repaired if the decision that produced it never captured one.")
+    if status["unrepairable"]:
+        print("\n  The historical ones cannot be completed: the decisions behind them")
+        print("  were logged before verbatim prompts were captured. They are reported")
+        print("  separately so they cannot hide a NEW emitter failure, and they are")
+        print("  preseason paper orders that will never be submitted.")
 
     missing = status["missing"]
     if not missing:
@@ -112,13 +121,14 @@ def main() -> int:
     after = dl.compliance_status(args.ai_logs)
     print(f"\n  rebuilt {done}, unrecoverable {unrecoverable}")
     print(f"  orders WITHOUT a log now : {after['orders_without_ai_log']}")
-    print(f"  logs INCOMPLETE now      : {after['ai_logs_incomplete']}")
+    print(f"  incomplete (repairable)  : {after['ai_logs_repairable_incomplete']}")
+    print(f"  incomplete (historical)  : {after['ai_logs_unrepairable_historical']}")
     print(f"  compliant                : {after['compliant']}")
-    if after["ai_logs_incomplete"]:
+    if after["ai_logs_unrepairable_historical"]:
         print("\n  A rebuilt log is only as complete as the decision behind it. Logs")
-        print("  from before the logbook captured verbatim messages will stay")
-        print("  incomplete — that is a fact about the record, not something to")
-        print("  paper over by inventing a prompt.")
+        print("  from before the logbook captured verbatim messages stay incomplete —")
+        print("  that is a fact about the record, not something to paper over by")
+        print("  inventing a prompt.")
     return 0 if after["compliant"] else 1
 
 

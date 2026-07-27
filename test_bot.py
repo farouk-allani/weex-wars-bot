@@ -215,7 +215,8 @@ assert _dl2.last_ailog_error
 _status = _dl2.compliance_status(_tmp / "ailogs")
 assert _status["orders_linked"] == 2 and _status["ai_logs_on_disk"] == 1
 assert _status["orders_without_ai_log"] == 1 and _status["compliant"] is False
-assert _status["ai_logs_incomplete"] == 0, _status["incomplete"]
+assert _status["ai_logs_repairable_incomplete"] == 0, _status["incomplete"]
+assert _status["ai_logs_unrepairable_historical"] == 0, _status["unrepairable"]
 print(f"compliance gap detected OK ({_status['orders_without_ai_log']}/{_status['orders_linked']})")
 
 print("\n=== A PRESENT-BUT-UNUSABLE LOG IS NOT COMPLIANT ===")
@@ -237,6 +238,27 @@ _bad3 = json.loads(json.dumps(_good))
 _bad3["explanation"] = "x" * 1001
 assert any("1001" in p for p in _wl.validate(_bad3))
 print("ai-log schema validation OK")
+
+print("\n=== UNREPAIRABLE HISTORY DOES NOT MASK A NEW FAILURE ===")
+# A decision logged before verbatim prompts were captured yields a log that can
+# never be completed. It must be reported, but separately: a permanently-false
+# compliance flag is a monitor nobody reads.
+_tmp2 = Path(tempfile.mkdtemp())
+_wl.AI_LOGS_DIR = _tmp2 / "ailogs"
+_dl3 = DecisionLog(_tmp2 / "dec.jsonl")
+_old = _dl3.record(model="deepseek-chat", context={"markets": []},
+                   decisions=[{"symbol": "SOL/USDT:USDT", "action": "short",
+                               "rationale": "historical"}],
+                   raw_response="{}", reasoning="cot")  # note: no messages=
+_dl3.link_order(_old, symbol="SOL/USDT:USDT", order_id="oidH", side="short",
+                size=1.0, entry_price=100.0, stop_loss=105.0, take_profit=95.0)
+_s = _dl3.compliance_status(_tmp2 / "ailogs")
+assert _s["orders_without_ai_log"] == 0, _s
+assert _s["ai_logs_unrepairable_historical"] == 1, _s
+assert _s["ai_logs_repairable_incomplete"] == 0, _s["incomplete"]
+assert _s["compliant"] is True, "unrepairable history must not pin compliance false"
+assert _s["note"]
+print(f"classified as historical, compliant stays True — note: {_s['note']}")
 
 print("\n=== BOOT-STAMPED TRADES ARE QUARANTINED ===")
 from src.core.models import TradeResult as _TR
