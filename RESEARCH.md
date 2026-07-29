@@ -31,6 +31,7 @@
 | Liquidation-cascade FADE (OI proxy) | run_liq_scan | misleading | 15m buy-flush looked great on 8 pairs (n=9, t=2.6) — **failed replication** on top-40 (t=0.3). Universe was contaminated by tokenized-equity perps; time-clustered events inflate t. |
 | Liquidation-cascade FADE (real forced orders) | run_liq_forward | **DEAD** (2026-07-20) | 89.5h, 15,393 real forced orders: raw fade "profit" (60m +0.18%, t 3.3) is **pure market beta** — beta-neutral deduped: −0.077%, t=−2.7 at $250k. Bigger flush → CONTINUES, not reverts. |
 | **Cascade CONTINUATION (trade WITH the flush)** | run_liq_forward `--since 2026-07-20 --direction with` | **PRE-DECLARED, judging on fresh data only** | Registered 2026-07-20 after the fade's −2.7t. Primary cell: $250k/180s, 60m, beta-neutral deduped episodes. Auto-evaluates every 8h on the VPS → `data/continuation_eval.txt`. NO backfitting to pre-07-20 data. |
+| 1h OHLCV entry families, re-judged under the FIXED exit geometry | run_entry_scan → run_entry_artifact_check | **DEAD** (2026-07-29) | 30 pre-declared cells (momentum/zscore/breakout/ema/rsi/vol-surge × both signs). 3 cleared "net>0 in full sample AND both OOS halves" — **all 3 died to beta + episode dedup**. See §2c. |
 
 **The recurring lesson:** significant IC/t-stat + negative gross PnL = artifact
 (bounce, beta, clustering). Demand *money*, in both halves, after maker cost,
@@ -83,6 +84,45 @@ geometry still loses −0.65/trade to costs. It lowers the bar from unreachable 
 merely hard — the entry-edge search in §2 is still the binding problem, and the crude
 1h z-score mean-reversion proxy tested here was *anti*-predictive (gross −0.073/trade
 vs random's −0.001), consistent with everything else on the scoreboard.
+
+### 2c. Entry families re-tested under the corrected bar — still nothing (2026-07-29)
+
+Fixing the exits (§2b) lowered the required accuracy 62.1% → 54.8%, which legitimately
+reopens entry hypotheses that were rejected as "edge < cost" against the old bar: the
+cost side of that comparison moved. Asked once, with the grid pre-declared:
+`run_entry_scan.py` — 30 cells (momentum 6/12/24/48, z-score fade 20/50, breakout
+12/24/48, EMA cross 8/16, RSI extreme 10/14, volume surge 24/48, **both signs each**),
+judged in net money through the shipped exit geometry, bar = net > 0 on the full sample
+**and** in both OOS halves independently.
+
+Three cells cleared it: `breakout_24_against` (+0.18/trade), `vol_surge_24_against`
+(+0.45), `vol_surge_48_against` (+0.40). All three t < 1.3 — and `vol_surge_*_against`
+is close kin to the liquidation-cascade FADE that died on 2026-07-20, so it inherited
+that suspicion rather than a clean slate. `run_entry_artifact_check.py` applied the same
+scrub that killed the cascade fade:
+
+| cell | raw | beta-neutral | +episode dedup |
+|---|---|---|---|
+| breakout_24_against | +0.18 (t 0.48) | +0.92 (t 0.70) | +0.45 (t 0.58) |
+| vol_surge_24_against | +0.45 (t 1.27) | **−0.20** (t −0.75) | **−0.18** (t −0.75) |
+| vol_surge_48_against | +0.40 (t 1.06) | **−0.20** (t −0.74) | **−0.20** (t −0.64) |
+
+**All three are artifacts.** The window fell −21.9% equal-weight over 120d, and although
+the fade signals were ~55% long *by count*, their short legs harvested that drift — so
+removing the basket move flips the sign. Episode dedup independently halves the sample
+(957→450, 1067→453): one market-wide event was being counted once per correlated pair.
+
+**The scrub is symmetric, and that matters.** The continuation cells looked *strongly*
+negative (breakout_24_with −1.76 at t=−4.76; vol_surge_24_with −1.77 at t=−5.18) and
+they collapse too — to t=−1.69 and **t=+0.21**. So there is no robust "1h momentum is
+anti-predictive" claim either; the −21.9% drift was manufacturing loud t-stats in *both*
+directions. Any future candidate must pass `run_entry_artifact_check.py` before it is
+believed, including ones whose sign looks intuitively right.
+
+Net position: the exits no longer set an impossible bar, and there is still no entry
+edge in cheap 1h OHLCV features. That is consistent with §2 and narrows where to look —
+the remaining untested directions (event-reaction latency, order-book microstructure,
+on-chain flows) all require data this scan does not have.
 
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 
