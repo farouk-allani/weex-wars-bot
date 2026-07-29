@@ -145,6 +145,12 @@ assert pos.trailing_stop is not None
 print(f"Trailing after activation: {pos.trailing_stop:.2f} (before small move: {trail_before})")
 
 print("\n=== PARTIAL TP ===")
+# Scale-out is disabled by policy in config.yaml (it was measured to destroy edge),
+# but the mechanism must still work for anyone who turns it back on — so this test
+# opts in explicitly rather than inheriting the shipped default.
+ptp_config = copy.deepcopy(config)
+ptp_config["risk"]["partial_tp_enabled"] = True
+rm_ptp = RiskManager(ptp_config)
 pos2 = Position(
     symbol="BTC/USDT:USDT", side=Side.LONG, entry_price=50000,
     size=0.2, leverage=5, stop_loss=49000, take_profit=53000,
@@ -152,12 +158,81 @@ pos2 = Position(
     partial_take_profit=51000, partial_fraction=0.5, initial_size=0.2,
 )
 assert pos2.should_partial_tp(51000) is True
-pos2, realized, closed = rm.apply_partial_tp(pos2, 51000, atr=200)
+pos2, realized, closed = rm_ptp.apply_partial_tp(pos2, 51000, atr=200)
 assert realized is not None and realized > 0
 assert pos2.partial_taken is True
 assert pos2.size < 0.2
 assert pos2.stop_loss >= 50000  # BE
 print(f"Partial: realized=${realized:.2f} closed={closed:.4f} rem={pos2.size:.4f} SL={pos2.stop_loss:.1f}")
+
+print("\n=== EXIT GEOMETRY REGRESSIONS ===")
+# Three defects measured over 8 pairs x 120d that together demanded 62% directional
+# accuracy just to break even. Each assertion below pins one of them.
+
+# 1. The trail must take the LOOSER of chandelier and percent trail. With max() the
+#    fixed percent trail always won, the ATR chandelier was dead code, and every
+#    winner was capped under 1% — a trailing stop that never fired in 20 live trades.
+pos3 = Position(
+    symbol="BTC/USDT:USDT", side=Side.LONG, entry_price=50000,
+    size=0.1, leverage=5, stop_loss=49000, take_profit=54000,
+    highest_price=50000, lowest_price=50000,
+)
+atr3 = 500.0  # 1% of price
+rm.adjust_stops(pos3, 51500, atr=atr3)  # +3%, well past activation
+chandelier = pos3.highest_price - atr3 * rm.chandelier_atr_mult
+pct_trail = 51500 * (1 - rm.trailing_stop_distance)
+assert pos3.trailing_stop is not None, "trail must arm at +3%"
+assert abs(pos3.trailing_stop - min(chandelier, pct_trail)) < 1e-6, (
+    f"long trail took {pos3.trailing_stop:.2f}, expected the looser "
+    f"min(chandelier={chandelier:.2f}, pct={pct_trail:.2f})"
+)
+# and the mirror image for a short
+pos4 = Position(
+    symbol="BTC/USDT:USDT", side=Side.SHORT, entry_price=50000,
+    size=0.1, leverage=5, stop_loss=51000, take_profit=46000,
+    highest_price=50000, lowest_price=50000,
+)
+rm.adjust_stops(pos4, 48500, atr=atr3)
+chandelier_s = pos4.lowest_price + atr3 * rm.chandelier_atr_mult
+pct_trail_s = 48500 * (1 + rm.trailing_stop_distance)
+assert abs(pos4.trailing_stop - max(chandelier_s, pct_trail_s)) < 1e-6, (
+    "short trail must take the looser max(chandelier, pct)"
+)
+print(f"Trail takes looser candidate OK (long={pos3.trailing_stop:.1f}, "
+      f"short={pos4.trailing_stop:.1f})")
+
+# 2. Breakeven must not fire at 1R. be_trigger_r is configurable and >1 as shipped.
+assert rm.be_trigger_r > 1.0, "BE at <=1R surrenders a full R the moment it works"
+pos5 = Position(
+    symbol="BTC/USDT:USDT", side=Side.LONG, entry_price=50000,
+    size=0.1, leverage=5, stop_loss=49000, take_profit=54000,
+    highest_price=50000, lowest_price=50000,
+)
+rm.adjust_stops(pos5, 50900, atr=10.0)  # +0.9R, tiny ATR so the trail cannot arm
+assert pos5.stop_loss < 50000, f"BE fired at 0.9R (stop={pos5.stop_loss})"
+print(f"BE holds at 0.9R OK (trigger={rm.be_trigger_r}R)")
+
+# 3. A too-tight AI stop must be WIDENED, not rejected — rejecting costs pace, and
+#    pace is a scored metric.
+from src.ai.trader import AITrader
+trader = AITrader(config, client=None, logbook=None)
+price, atr_t = 50000.0, 500.0
+tight = {"symbol": "BTC/USDT:USDT", "action": "long", "conviction": 0.8,
+         "stop_loss": price - atr_t * 0.4, "take_profit": price + atr_t * 1.0,
+         "rationale": "test"}
+sig, why = trader.to_signal(tight, "BTC/USDT:USDT", price, atr_t,
+                             {"BTC/USDT:USDT"})
+assert sig is not None, f"tight stop was rejected instead of widened: {why}"
+new_dist = abs(price - sig.stop_loss)
+assert new_dist >= trader.min_stop_atr * atr_t - 1e-6, (
+    f"stop {new_dist / atr_t:.2f}x ATR still under floor {trader.min_stop_atr}x"
+)
+rr_in = (atr_t * 1.0) / (atr_t * 0.4)
+rr_out = abs(sig.take_profit - price) / new_dist
+assert abs(rr_in - rr_out) < 1e-6, f"R:R not preserved: {rr_in:.3f} -> {rr_out:.3f}"
+assert sig.partial_take_profit is None, "partial must be off when policy disables it"
+print(f"Tight AI stop widened 0.40x -> {new_dist / atr_t:.2f}x ATR, "
+      f"R:R preserved at {rr_out:.2f}, partial off")
 
 print("\n=== STATE SAVE/LOAD ===")
 from src.utils.state import save_state, load_state

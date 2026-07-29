@@ -36,6 +36,10 @@ class RiskManager:
         self.cooldown_after_wins = risk_config.get("cooldown_after_wins", 1)
         self.partial_tp_enabled = risk_config.get("partial_tp_enabled", True)
         self.partial_be_buffer_atr = risk_config.get("partial_be_buffer_atr", 0.1)
+        # How many R of open profit before the stop is pulled to breakeven. Was hard
+        # coded at 1.0, which surrendered a full R of room the moment the trade first
+        # worked — measured as the second-largest leak after the partial.
+        self.be_trigger_r = risk_config.get("be_trigger_r", 1.0)
         # Majors move together. Two shorts across BTC/SOL is one directional bet at
         # double size, not two independent positions, so cap same-side exposure.
         # This counts SYMBOLS, which is a crude proxy — it cannot tell BTC+ETH
@@ -519,7 +523,7 @@ class RiskManager:
         )
 
         # Faster BE after partial taken
-        be_trigger = 0.7 if position.partial_taken else 1.0
+        be_trigger = self.be_trigger_r * (0.7 if position.partial_taken else 1.0)
         if position.side == Side.LONG:
             if current_price >= position.entry_price + risk * be_trigger:
                 be = position.entry_price + atr * 0.12
@@ -536,10 +540,17 @@ class RiskManager:
         chand_mult = self.chandelier_atr_mult * (0.7 if position.partial_taken else 1.0)
         trail_dist = self.trailing_stop_distance * (0.75 if position.partial_taken else 1.0)
         if profit_pct >= act:
+            # Take the LOOSER of the two candidates, not the tighter. With max() the
+            # fixed percent trail (0.6%, 0.45% after a partial) won essentially every
+            # time, so the volatility-adaptive chandelier was dead code and every
+            # winner was capped at well under 1% regardless of how much the pair was
+            # actually moving — the mechanism behind a 0.63 payoff ratio live and a
+            # trailing stop that never once fired in 20 trades. The percent trail now
+            # only binds when it is the looser of the two, i.e. as an outer bound.
             if position.side == Side.LONG:
                 chandelier = position.highest_price - atr * chand_mult
                 pct_trail = current_price * (1 - trail_dist)
-                trail = max(chandelier, pct_trail)
+                trail = min(chandelier, pct_trail)
                 if position.trailing_stop is None or trail > position.trailing_stop:
                     position.trailing_stop = trail
                 if position.trailing_stop > position.stop_loss:
@@ -547,7 +558,7 @@ class RiskManager:
             else:
                 chandelier = position.lowest_price + atr * chand_mult
                 pct_trail = current_price * (1 + trail_dist)
-                trail = min(chandelier, pct_trail)
+                trail = max(chandelier, pct_trail)
                 if position.trailing_stop is None or trail < position.trailing_stop:
                     position.trailing_stop = trail
                 if position.stop_loss <= 0 or position.trailing_stop < position.stop_loss:

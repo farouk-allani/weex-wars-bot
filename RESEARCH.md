@@ -1,6 +1,6 @@
 # RESEARCH.md — everything measured, built, and decided (do NOT start from zero)
 
-> Living document. Last full update: **2026-07-21**.
+> Living document. Last full update: **2026-07-29**.
 > Method for ALL hypotheses: measure IC/event-study → out-of-sample split → cost bar →
 > forward validation on fresh data → only then wire into the bot. Never trust one green cell.
 
@@ -35,6 +35,54 @@
 **The recurring lesson:** significant IC/t-stat + negative gross PnL = artifact
 (bounce, beta, clustering). Demand *money*, in both halves, after maker cost,
 then again on a fresh window.
+
+### 2b. The exit geometry was setting an impossible bar (2026-07-29)
+
+Every entry above was judged against a bar the *exits* had quietly raised. Measured
+with `run_exit_lab.py` / `run_stop_width.py` / `run_exit_robust.py` (8 pairs, 120d 1h,
+risk-based sizing, maker TP legs, stop wins intra-bar ties):
+
+| | break-even directional accuracy |
+|---|---|
+| config as deployed 2026-07-16..29 | **62.1%** |
+| after the three fixes below | **54.8%** |
+
+62% accuracy on 8 liquid majors is not reachable. **The bot could not have been
+profitable in that window no matter how good the entries were** — which reframes the
+20-trade live result (30% WR, 0.63 payoff, −2.37%) as partly a geometry artifact
+rather than pure model failure.
+
+The three defects, in order of measured damage:
+
+1. **Partial TP at the midpoint to TP** — banked half the position exactly where the
+   right tail begins, paid an extra round trip to do it, and flipped the position into
+   the post-partial regime whose 0.45% trail closed the remainder at +0.3..0.9%. Its
+   cost **scales with edge**: +0.01/trade at zero alpha, +0.13/trade at 60% accuracy.
+   That signature — harmless when there is nothing to destroy, expensive when there is
+   — is exactly what a right-tail-truncating rule looks like. Now `partial_tp_enabled:
+   false`.
+2. **A 1.2x-ATR stop, when 7/8 pairs preferred ≥1.6x and the optimum was a plateau at
+   2.0-2.5x.** Under risk-based sizing a tight stop also buys a *larger* position, so it
+   paid more fees to die more often. Both OOS halves agreed. `min_stop_atr` is now
+   **1.8 and widens rather than rejects** (rejecting would cost pace, a scored metric);
+   the target scales with it so the model's intended R:R survives.
+3. **`trail = max(chandelier, pct_trail)` took the tighter candidate**, so the fixed
+   0.6% percent trail won essentially always and the ATR chandelier was dead code. No
+   winner could ever give back more than 0.6% regardless of the pair's volatility —
+   the mechanism behind a trailing stop that **never fired once in 20 live trades**.
+   Now takes the looser; `trailing_stop_distance` widened to 0.02 as an outer bound.
+   Breakeven also moved off 1R (surrendered a full R the instant a trade worked) to a
+   configurable `be_trigger_r: 1.75`.
+
+Result on the shipped combination: payoff 0.84 → 1.33, per-trade Sharpe −0.039 →
++0.013, fees/trade −9%, and `take_profit` exits doubled at the expense of capped
+`be_stop` exits (883 → 183 per 2649 trades).
+
+**What this does NOT do:** it does not create alpha. At 50% accuracy the shipped
+geometry still loses −0.65/trade to costs. It lowers the bar from unreachable to
+merely hard — the entry-edge search in §2 is still the binding problem, and the crude
+1h z-score mean-reversion proxy tested here was *anti*-predictive (gross −0.073/trade
+vs random's −0.001), consistent with everything else on the scoreboard.
 
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 

@@ -36,7 +36,14 @@ ai:
   # the 8h inactivity rule even if several calls fail in a row.
   decision_interval_minutes: 60
   min_conviction: 0.35          # below this, the model's own doubt vetoes the trade
-  min_stop_atr: 0.5             # tighter than this is noise-stopped
+  # Not a rejection threshold any more — a stop tighter than this is WIDENED to it
+  # (target scaled with it, so the model's R:R is preserved and pace is not lost).
+  # 0.5 was low enough to be inert: live stops landed at 0.4-1.6x ATR and 7 of 20
+  # trades were noise-stopped. Measured over 8 pairs x 120d with risk-based sizing,
+  # both OOS halves agreeing, 7/8 pairs preferred >= 1.6x ATR and the optimum was a
+  # plateau at 2.0-2.5x (run_stop_width.py). 1.8 sits inside that plateau while
+  # still letting the model choose wider when it has reason to.
+  min_stop_atr: 1.8
   max_stop_atr: 4.0             # wider than this is not a trade
   # RSI/Bollinger/StochRSI/VWAP + edge_signals in the AI context. Measured: triggers
   # a memorised "fade to VWAP" reflex (~80% of decisions) with no PnL benefit in any
@@ -105,10 +112,27 @@ risk:
   cooldown_hours: 6
   daily_loss_limit: 0.025
   trailing_stop_activation: 0.012
-  trailing_stop_distance: 0.006
+  # Now an OUTER bound, not the binding constraint: adjust_stops takes the looser of
+  # this and the chandelier, so the ATR-adaptive stop leads and this only catches the
+  # pathological case. Widened from 0.006 to match — at 0.6% it would still be the
+  # looser one only rarely, which would leave the old behaviour in place.
+  trailing_stop_distance: 0.02
   chandelier_atr_mult: 2.3
+  # Breakeven at 1R gave back a full R of room the instant a trade worked; 1.75R
+  # keeps the protection but only once the trade has earned it. Measured: 2R was
+  # marginally better still, but at a 1.8x ATR stop 2R lands beyond most targets,
+  # which disables the protection entirely rather than improving it.
+  be_trigger_r: 1.75
   win_streak_cooldown: false
-  partial_tp_enabled: true
+  # OFF by measurement. Banking half at the midpoint to TP looked prudent and was the
+  # single largest value destroyer in the exit lab: it pays an extra round trip, and
+  # it flips the position into the post-partial regime whose 0.45% trail then closes
+  # the remainder at +0.3-0.9%. Live evidence: all 5 be_stop exits were capped wins
+  # (+1.70..+2.94) while stops ran to -5.10, for a payoff of 0.63 against the 2.0 a
+  # 30% win rate needs. The damage SCALES WITH EDGE — on zero-alpha entries turning
+  # it off is worth +0.01/trade, at 60% accuracy it is worth +0.13 — which is exactly
+  # what an exit rule that truncates the right tail should look like.
+  partial_tp_enabled: false
   partial_be_buffer_atr: 0.12
 strategy:
   name: composite
