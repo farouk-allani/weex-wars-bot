@@ -69,6 +69,13 @@ class RiskManager:
         # exists to survive, so a calm-market estimate understates the tail. Never
         # count a same-side pair below this, whatever the sample says.
         self.correlation_floor = float(risk_config.get("correlation_floor", 0.5))
+        # Anti-churn margin for swaps. When the book is full the only way the model
+        # can act on a new idea is to close something, which turns position scarcity
+        # into discretionary exits — measured 2026-08-01 as a real, priced leak. A
+        # replacement must therefore be better by this much, not merely different.
+        self.swap_conviction_margin = float(
+            risk_config.get("swap_conviction_margin", 0.15)
+        )
 
         sizing_config = config.get("sizing", {})
         self.sizing_method = sizing_config.get("method", "half_kelly")

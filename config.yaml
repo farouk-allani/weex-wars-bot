@@ -84,11 +84,27 @@ trading:
 risk:
   max_risk_per_trade: 0.012
   max_drawdown: 0.15
-  max_open_positions: 3
+  # Counts are a BACKSTOP, not the working constraint. Measured 2026-08-01: at 3
+  # this cap bound on 15 of 67 decision cycles, and the model's response was to
+  # close live positions to make room — one such close realised -3.03 and the very
+  # same short was re-opened 62 minutes later, paying two extra round trips to
+  # re-enter its own trade. Scarcity was manufacturing the exit leak that was being
+  # blamed on the model. At the sizes this bot actually trades — measured 0.32x
+  # equity of notional per leg over 11 live trades — max_correlated_notional bites
+  # on the FOURTH same-side leg (0.84x at 3 legs, 1.09x at 4, at the measured
+  # median pair correlation of +0.64). So a count of 3 was strictly tighter than
+  # the budget and did all the binding, crudely. Raising it to 5 hands control
+  # back to the budget, which scales a crowded leg down instead of forcing an
+  # exit, and still lets a genuinely diversified book hold five.
+  max_open_positions: 5
   # Counts SYMBOLS, so it cannot tell BTC+ETH (~0.9 correlated, one double-sized
   # bet) from BTC+DOGE. Kept as a coarse backstop; max_portfolio_risk below is the
   # control that actually binds.
-  max_same_side_positions: 2
+  max_same_side_positions: 3
+  # Anti-churn: when the book is full, a close is only honoured if the model also
+  # wants a replacement whose conviction beats the incumbent's by this margin.
+  # Below it the close is capacity-motivated churn and is refused. 0 disables.
+  swap_conviction_margin: 0.15
   # Correlation-aware portfolio budget: the most we accept losing if EVERY open stop
   # fills in the same move. Measured 2026-07-27, the bot held BTC long + ETH long at
   # once — legal under the position count, ~0.9 correlated in fact, and they went

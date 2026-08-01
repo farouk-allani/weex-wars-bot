@@ -387,4 +387,81 @@ _met = TradingEngine._trade_pace(None, _comp, _mk(12, _now - timedelta(days=1)))
 assert _met["trades_still_needed"] == 0 and "pure cost" in _met["status"]
 print("round pace OK (undated trades cannot fake the minimum)")
 
+print("\n=== CAPACITY-MOTIVATED CLOSES ARE REFUSED ===")
+# Measured 2026-08-01: with the book full the model closed a losing SOL short "to
+# free a position slot" and re-opened the same short 62 minutes later. A swap must
+# now beat the incumbent's entry conviction by swap_conviction_margin.
+from types import SimpleNamespace
+
+class _SwapStub:
+    _capacity_only_closes = TradingEngine._capacity_only_closes
+    _entry_conviction = TradingEngine._entry_conviction
+
+def _stub(margin=0.15, cap=3, held=(("SOL/USDT:USDT", 0.40),), pending=None, min_conv=0.35):
+    s = _SwapStub()
+    s.risk = SimpleNamespace(swap_conviction_margin=margin, max_open_positions=cap)
+    s.pending_entries = dict(pending or {})
+    s.position_conviction = {sym: c for sym, c in held}
+    s.ai = SimpleNamespace(min_conviction=min_conv)
+    return s
+
+def _acct(*symbols):
+    return SimpleNamespace(positions=[SimpleNamespace(symbol=s) for s in symbols])
+
+_full = _acct("SOL/USDT:USDT", "ADA/USDT:USDT", "BNB/USDT:USDT")
+_close_sol = {"action": "close", "symbol": "SOL/USDT:USDT"}
+
+# The exact observed churn: a marginal replacement does not buy the slot.
+_r1 = _stub()._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.45}], _full)
+assert "SOL/USDT:USDT" in _r1, _r1
+assert "0.45" in _r1["SOL/USDT:USDT"] and "0.40" in _r1["SOL/USDT:USDT"], _r1
+
+# A genuinely better idea still gets its slot — this must not become a freeze.
+_r2 = _stub()._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.60}], _full)
+assert _r2 == {}, _r2
+
+# A thesis close with nothing competing for the slot is never touched.
+assert _stub()._capacity_only_closes([_close_sol], _full) == {}
+
+# Room to spare: no close is buying a slot, so the guard has no opinion.
+_r3 = _stub(cap=5)._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.36}], _full)
+assert _r3 == {}, _r3
+
+# Resting maker orders are commitments and count toward being full.
+_r4 = _stub(cap=4, pending={"XRP/USDT:USDT": {"side": "short"}})._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.45}], _full)
+assert "SOL/USDT:USDT" in _r4, _r4
+
+# Two closes, one replacement: only the slot actually demanded is priced.
+_r5 = _stub(held=(("SOL/USDT:USDT", 0.40), ("ADA/USDT:USDT", 0.80)))._capacity_only_closes(
+    [_close_sol, {"action": "close", "symbol": "ADA/USDT:USDT"},
+     {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.45}], _full)
+assert _r5 == {"SOL/USDT:USDT": _r5.get("SOL/USDT:USDT")} and "ADA/USDT:USDT" not in _r5, _r5
+
+# Unknown incumbent conviction (opened before tracking) falls back to the floor
+# rather than blocking on missing data.
+_r6 = _stub(held=())._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.51}], _full)
+assert _r6 == {}, _r6
+_r7 = _stub(held=())._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.49}], _full)
+assert "SOL/USDT:USDT" in _r7, _r7
+
+# Margin 0 disables the guard entirely.
+assert _stub(margin=0.0)._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.0}], _full) == {}
+
+# An entry on a symbol already held is not asking for a new slot.
+assert _stub()._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "ADA/USDT:USDT", "conviction": 0.45}], _full) == {}
+
+_live = RiskManager(config)
+assert _live.swap_conviction_margin > 0, "guard must be armed in the shipped config"
+assert _live.max_open_positions >= 5, "count cap must leave the correlation budgets binding"
+print(f"swap guard OK (margin {_live.swap_conviction_margin}, "
+      f"max_open_positions {_live.max_open_positions})")
+
 print("\n=== ALL TESTS PASSED ===")

@@ -1,6 +1,6 @@
 # RESEARCH.md — everything measured, built, and decided (do NOT start from zero)
 
-> Living document. Last full update: **2026-07-29**.
+> Living document. Last full update: **2026-08-01**.
 > Method for ALL hypotheses: measure IC/event-study → out-of-sample split → cost bar →
 > forward validation on fresh data → only then wire into the bot. Never trust one green cell.
 
@@ -123,6 +123,83 @@ Net position: the exits no longer set an impossible bar, and there is still no e
 edge in cheap 1h OHLCV features. That is consistent with §2 and narrows where to look —
 the remaining untested directions (event-reaction latency, order-book microstructure,
 on-chain flows) all require data this scan does not have.
+
+### 2d. The position cap was manufacturing the exit leak (VPS audit 2026-08-01)
+
+Full audit of the running stack, 2.9 days after the §2b exit fix shipped. Infra was
+clean: 3 containers up 2d with **0 restarts**, host 59d, disk 32%, deployed commit ==
+`main`, config byte-identical, AI healthy on `deepseek-v4-pro` (1 parse error in 67
+cycles), compliance 34/34 orders logged, maker fills 12/14 rested (86%).
+
+**Paper result: 992.78 from 1000 (−0.72%), maxDD 1.65%, 11 closed trades, fees 2.65
+(20% of the loss).** The §2b fix has *not* reproduced live, and n is far too small to
+say either way — but it is not yet visible in P&L, and the honest table is:
+
+| | pre-fix live (n=20) | post-fix live (n=11) | §2b predicted |
+|---|---|---|---|
+| payoff | 0.74 | **0.48** | 0.84 → 1.33 |
+| break-even WR | 57.5% | **67.6%** | 62.1% → **54.8%** |
+| win rate | 30.0% | 36.4% | — |
+
+Mechanically the fix did what it said: stop *frequency* fell (35% → 18% of exits) and
+`take_profit` fired for the first time ever. But each surviving stop got bigger
+(−5.57% → −7.46% of margin), so stop damage per trade barely moved (−1.24 → −1.02),
+and in a low-vol chop the right tail never showed up. **Re-judge at n≥40.**
+
+**The finding that is actionable now — `max_open_positions: 3` was binding, and the
+model paid to work around it.** 19 of 67 decision cycles were blocked from entering
+(15 by the cap). On 2026-07-31 00:02 the model closed the SOL short at −3.03 with the
+stated reason *"Closing the short to free a position slot"*, then re-opened the same
+SOL short 62 minutes later. It realised a loss and paid two extra round trips to end
+up holding the position it started with, and only came out ahead by fill luck.
+
+The prompt had explicitly authorised this — EXIT DISCIPLINE listed *"the margin slot
+is needed for a clearly better opportunity"* as a valid close — and nothing anywhere
+checked the *"clearly better"* part. So `ai_close` being the top leak (5 of 11 exits,
+−5.82 = 44% of the period loss) is partly not model twitchiness at all: **scarce slots
+plus a pace requirement equals churn**, and no prompt edit can fix that, because with
+a full book closing is the only way the model can act on a new idea.
+
+Fixed three ways, all shipped together:
+
+1. **Counts stop being the working constraint.** `max_open_positions` 3 → 5,
+   `max_same_side_positions` 2 → 3. Measured at this bot's real sizing (0.32x equity
+   notional per leg, over the 11 live trades) and the measured median pair correlation
+   of +0.64, `max_correlated_notional` bites on the **4th** same-side leg — 0.84x at 3
+   legs, 1.09x at 4. The count of 3 was therefore strictly tighter than the budget and
+   was doing all the binding, crudely. The budget *scales* a crowded leg instead of
+   forcing an exit, and still lets a genuinely diversified book hold five.
+2. **The swap is priced.** With the book full, a `close` proposed alongside a new entry
+   is treated as a swap and only executes if the replacement's conviction beats the
+   incumbent's *entry* conviction by `risk.swap_conviction_margin` (0.15). Entry
+   conviction is now tracked per position and persisted across restarts. Closes with no
+   replacement competing for their slot are untouched — those are ordinary thesis exits.
+   Incumbents from before tracking fall back to `min_conviction`, so the guard never
+   blocks on missing data.
+3. **The prompt tells the truth about it.** The "margin slot" clause is gone, replaced
+   by the rule as enforced, plus `entry_conviction` on each open position so the model
+   can check a swap before proposing one.
+
+Regression-tested in `test_bot.py` (`CAPACITY-MOTIVATED CLOSES ARE REFUSED`): the exact
+observed churn is refused, a genuinely better idea still gets its slot, thesis closes
+are untouched, resting maker orders count toward "full", and margin 0 disables it.
+
+**Still producing nothing, both unchanged:**
+- **Carry paper book: zero positions in 16 days** (`equity 1.0, book null`). The
+  snapshot prints "TRADE 7d" but `paper_step()` is hardcoded `HOLD_DAYS = 3`
+  (run_carry_weex.py:268) — the only cell that passed OOS — and the 3d gate needs
+  >0.10% while it prints 0.039–0.053%. Consistent by design, but it is a permanently
+  closed gate, not a running experiment: it cannot generate evidence either way.
+- **Continuation: 12 days in, still failing its pre-declared bar.** $250k/180s deduped
+  episodes t = 0.6–1.5 (needs |t|≥2), no monotonic dose-response (5m +0.038% →
+  15m +0.059% → 30m +0.032%), net-maker negative at 3 of 4 horizons. $1000k cell n=5.
+
+**Second-order observation, not yet acted on:** pace is bimodal — 11 trades in the
+first 1.6 days, then **35 hours with zero entries** (24 consecutive declines while
+holding one position). Same trade count, much worse *stability*, which is a scored
+metric (§1). Also note the single entry taken under pace pressure justified itself as
+*"acceptable as a range-fade to meet the trade minimum"* and is the book's only
+winner — n=1, but a hint that `min_conviction` may be set too high.
 
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 

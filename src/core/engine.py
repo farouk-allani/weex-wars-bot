@@ -78,6 +78,13 @@ class TradingEngine:
         self.edges = EdgeStrategies(self.config)
         # Which AI decision opened which position, so outcomes link back to reasoning.
         self.position_decisions: dict[str, str] = (state or {}).get("position_decisions") or {}
+        # Entry conviction per open symbol. Needed to price a swap: replacing a
+        # position is only rational if the replacement is genuinely better, and
+        # without the incumbent's conviction there is nothing to compare against.
+        self.position_conviction: dict[str, float] = {
+            str(k): float(v)
+            for k, v in ((state or {}).get("position_conviction") or {}).items()
+        }
         self._last_ai_call: datetime | None = None
         self.ai_interval_min = float(ai_cfg.get("decision_interval_minutes", 60))
         # Oscillators + edge_signals travel together, exactly like the replay's
@@ -328,6 +335,7 @@ class TradingEngine:
             risk=self.risk,
             recent_trades=self.risk.trade_history,
             competition=self._competition_context(),
+            position_conviction=self.position_conviction,
         )
         # Tell the model plainly when it may not open anything, so it reasons about
         # exits and holds instead of proposing entries that will be thrown away.
@@ -360,13 +368,21 @@ class TradingEngine:
             self.logger.info("AI decision_id=%s assessment=%s", decision_id, assessment[:200])
 
         allowed = set(symbols)
-        # Exits first: closing frees a slot that an entry below may want.
+        # Exits first: closing frees a slot that an entry below may want. That
+        # ordering is what makes a swap possible at all, and it is also how
+        # capacity pressure leaks into the exit decision — so the swap has to be
+        # priced before any close is executed.
+        blocked_swaps = self._capacity_only_closes(decisions, account)
         for d in decisions:
             if str(d.get("action", "")).lower() != "close":
                 continue
             sym = d.get("symbol")
             pos = next((p for p in account.positions if p.symbol == sym), None)
             if not pos:
+                continue
+            if sym in blocked_swaps:
+                console.print(f"[yellow]AI close {sym} refused: {blocked_swaps[sym]}[/]")
+                self.logger.info("AI_CLOSE_REFUSED %s: %s", sym, blocked_swaps[sym])
                 continue
             price = prices.get(sym) or pos.entry_price
             console.print(f"[yellow]AI closing {sym}: {d.get('rationale', '')[:100]}[/]")
@@ -467,6 +483,80 @@ class TradingEngine:
                 decision_id=decision_id, atr=atrs.get(sym, 0.0),
             )
             account = self.exchange.get_account_state()
+
+    def _capacity_only_closes(self, decisions: list, account) -> dict[str, str]:
+        """Closes that exist only to free a slot, mapped to why they were refused.
+
+        Measured 2026-08-01: with the book full, the model closed a losing SOL short
+        with the stated reason "Closing the short to free a position slot", then
+        re-opened the same short 62 minutes later — a realised -3.03 and two extra
+        round trips to arrive back at the position it already had. The prompt had
+        explicitly sanctioned this ("the margin slot is needed for a clearly better
+        opportunity"), but nothing ever checked the "clearly better" part.
+
+        So check it. A swap is legitimate when the replacement genuinely beats the
+        incumbent; below that margin the close is capacity pressure wearing a
+        thesis. Closes with no replacement competing for their slot are untouched —
+        those are ordinary thesis exits, and this guard has no opinion on them.
+        """
+        margin = self.risk.swap_conviction_margin
+        if margin <= 0:
+            return {}
+
+        committed = len(account.positions or []) + len(self.pending_entries)
+        if committed < self.risk.max_open_positions:
+            return {}  # a free slot exists; no close is buying one
+
+        open_syms = {p.symbol for p in (account.positions or [])}
+        candidates = []
+        for d in decisions:
+            if str(d.get("action", "")).lower() not in ("long", "short"):
+                continue
+            sym = str(d.get("symbol") or "")
+            if not sym or sym in open_syms or sym in self.pending_entries:
+                continue  # not asking for a new slot
+            try:
+                candidates.append((float(d.get("conviction") or 0.0), sym))
+            except (TypeError, ValueError):
+                continue
+        if not candidates:
+            return {}  # nothing wants the slot, so nothing is being freed for it
+
+        closes = []
+        for d in decisions:
+            if str(d.get("action", "")).lower() != "close":
+                continue
+            sym = str(d.get("symbol") or "")
+            if sym in open_syms:
+                closes.append((self._entry_conviction(sym), sym))
+        if not closes:
+            return {}
+
+        # Pair the cheapest incumbents against the strongest replacements: that is
+        # the most favourable reading of the model's intent, so anything this
+        # pairing still rejects is churn under any reading.
+        candidates.sort(reverse=True)
+        closes.sort()
+        refused: dict[str, str] = {}
+        for (held_conv, held_sym), (new_conv, new_sym) in zip(closes, candidates):
+            if new_conv < held_conv + margin:
+                refused[held_sym] = (
+                    f"capacity swap for {new_sym} at conviction {new_conv:.2f} does not "
+                    f"beat held conviction {held_conv:.2f} by {margin:.2f} — holding"
+                )
+        return refused
+
+    def _entry_conviction(self, symbol: str) -> float:
+        """Conviction this position was opened at.
+
+        Unknown for anything opened before this was tracked, and for those the
+        honest fallback is the lowest conviction that could have opened it — assume
+        the weakest legal incumbent rather than block a swap on missing data.
+        """
+        known = self.position_conviction.get(symbol)
+        if known is not None:
+            return float(known)
+        return float(getattr(self.ai, "min_conviction", 0.0) or 0.0)
 
     def _ai_due(self) -> bool:
         if self._last_ai_call is None:
@@ -856,6 +946,9 @@ class TradingEngine:
                 take_profit=signal.take_profit,
             )
             self.position_decisions[signal.symbol] = decision_id
+        # Recorded regardless of decision linkage: the swap guard needs it even for
+        # positions opened by a non-AI strategy.
+        self.position_conviction[signal.symbol] = float(signal.strength)
         if result.get("sl_placed") is False and self.exchange.mode != "paper":
             console.print("[yellow]   SL not on exchange — software stop active[/]")
         if result.get("tp_placed") is False and self.exchange.mode != "paper":
@@ -923,6 +1016,9 @@ class TradingEngine:
             "partial_fraction": signal.partial_fraction,
             "strategy": signal.strategy,
             "leverage": signal.leverage,
+            # Carried to the fill so a maker-entered position knows what it cost
+            # in conviction — the swap guard prices replacements against it.
+            "strength": float(signal.strength),
             # Chase distances are measured in ATR; when the caller has none
             # (rules path), infer it from the stop, which to_signal keeps at
             # 0.5-4 ATR — the midpoint makes dist/2 a serviceable stand-in.
@@ -1091,6 +1187,7 @@ class TradingEngine:
                 take_profit=float(pe["take_profit"]),
             )
             self.position_decisions[symbol] = decision_id
+        self.position_conviction[symbol] = float(pe.get("strength") or 0.0)
 
         if fin.get("sl_placed") is False and self.exchange.mode != "paper":
             console.print("[yellow]   SL not on exchange — software stop active[/]")
@@ -1281,6 +1378,7 @@ class TradingEngine:
         # Write the realised result back against the decision that opened it, so the
         # log shows not just what the model thought but what it actually earned.
         decision_id = self.position_decisions.pop(position.symbol, None)
+        self.position_conviction.pop(position.symbol, None)
         if decision_id and self.decision_log:
             self.decision_log.record_outcome(
                 decision_id,
@@ -1334,6 +1432,9 @@ class TradingEngine:
                     "last_trade_time": lt,
                     # Survives restart so an open position keeps its provenance.
                     "position_decisions": self.position_decisions,
+                    # Ditto for the conviction it was opened at, without which a
+                    # restart would silently disarm the swap guard.
+                    "position_conviction": self.position_conviction,
                     # Resting maker entries: restored on start, then reconciled
                     # against the venue by the first pending-management pass.
                     "pending_entries": self.pending_entries,

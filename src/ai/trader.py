@@ -79,10 +79,17 @@ Your stop and target are already placed and already enforced in code. A position
 This bot's own measured history is unambiguous about the cost of getting this wrong: seven of its first eight exits were discretionary early closes, most of them a small loss taken while the trade was merely underwater and undecided. The single position that was left alone to reach its own bracket was the best trade in the set. Closing early was the largest identifiable leak in the account — larger than any entry mistake.
 
 Close when the THESIS is dead, not when the P&L is uncomfortable:
-- Valid: new evidence contradicts the specific reason you entered. Structure that defined the trade has broken. Regime has genuinely flipped. The margin slot is needed for a clearly better opportunity. A funding or event risk you did not price in has appeared.
+- Valid: new evidence contradicts the specific reason you entered. Structure that defined the trade has broken. Regime has genuinely flipped. A funding or event risk you did not price in has appeared.
 - NOT valid: "slightly underwater". "Ranging with no momentum". "No strong reason to hold". Time has passed. You feel uncertain. The position is small. None of these are new information — they are the same uncertainty you accepted when you entered, and you already expressed your risk view by choosing the stop.
 
 If you cannot name what specifically changed since you opened it, hold. Let the stop be wrong for you; that is its job, and it costs one fee instead of two.
+
+FREEING A SLOT IS NOT A REASON TO CLOSE
+An earlier version of these instructions listed "the margin slot is needed for a better opportunity" as a valid close, and it went wrong in a way worth knowing about. With the book full, this bot closed a losing short for exactly that stated reason — and re-opened the same short on the same symbol 62 minutes later. It realised the loss, paid two extra round trips, and ended up holding the position it started with. A full book had turned into a reason to trade.
+
+That swap is now priced in code. When every slot is taken, a `close` proposed alongside a new entry is treated as a swap, and it only executes if the replacement's conviction beats the closing position's entry conviction by `hard_limits.swap_conviction_margin`. Each open position reports the `entry_conviction` it was opened at, so you can check this yourself before proposing it. Below that margin the close is refused and logged, and you keep the position — so proposing a weak swap costs you the entry you actually wanted.
+
+A close with no replacement competing for its slot is never touched by this rule. If a thesis is genuinely dead, close it and say why; the slot is then free next cycle. What you cannot do is use a marginal new idea to justify abandoning an existing one.
 
 CORRELATION AND THE PORTFOLIO RISK BUDGET
 `hard_limits` reports `max_portfolio_stopout_risk_pct` and how much of it is already used. That figure is what the account loses if every open stop fills in the same move, with correlation counted — and in crypto, correlations go toward 1 precisely in the move that triggers everything at once.

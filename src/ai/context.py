@@ -205,16 +205,18 @@ def build_context(
     competition: Optional[dict] = None,
     fear_greed: Optional[int] = None,
     macro: Optional[dict] = None,
+    position_conviction: Optional[dict] = None,
 ) -> dict:
     """Full decision context: market + book + risk envelope + own recent results."""
     drawdown = 0.0
     if risk.peak_equity > 0:
         drawdown = max(0.0, (risk.peak_equity - account.equity) / risk.peak_equity)
 
+    convictions = position_conviction or {}
     positions = []
     for p in account.positions:
         age_h = (datetime.utcnow() - p.opened_at).total_seconds() / 3600
-        positions.append({
+        entry = {
             "symbol": p.symbol,
             "side": p.side.value,
             "entry_price": _r(p.entry_price),
@@ -225,7 +227,12 @@ def build_context(
             "unrealized_pnl": _r(p.unrealized_pnl, 2),
             "age_hours": _r(age_h, 1),
             "partial_taken": p.partial_taken,
-        })
+        }
+        # What this position cost in conviction — the number a replacement has to
+        # beat before the engine will accept a swap for its slot.
+        if p.symbol in convictions:
+            entry["entry_conviction"] = _r(float(convictions[p.symbol]), 2)
+        positions.append(entry)
 
     # The model's own recent track record. This is the input that makes adaptation
     # possible — it can see that, say, its last three shorts all stopped out.
@@ -263,6 +270,10 @@ def build_context(
             "max_risk_per_trade_pct": _r(risk.max_risk_per_trade * 100, 2),
             "max_open_positions": risk.max_open_positions,
             "max_same_side_positions": risk.max_same_side_positions,
+            # Only meaningful when the book is full; see EXIT DISCIPLINE.
+            "swap_conviction_margin": _r(
+                getattr(risk, "swap_conviction_margin", 0.0), 2
+            ),
             "max_drawdown_pct": _r(risk.max_drawdown * 100, 1),
             "daily_loss_limit_pct": _r(risk.daily_loss_limit * 100, 2),
             "note": (
