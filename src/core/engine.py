@@ -134,6 +134,14 @@ class TradingEngine:
                 "AI decision layer active: model=%s interval=%smin alarm_after=%d failures",
                 self.ai.client.model, self.ai_interval_min, self.ai_max_failures,
             )
+            # Publish liveness immediately, before the first hourly decision. The
+            # healthcheck must be able to treat a MISSING file as unhealthy — but
+            # it can only do that if the file is guaranteed to exist once the
+            # process is up. Otherwise "no file" means both "booting normally" and
+            # "the writer never ran", and the check has to accept the file's
+            # absence, which is exactly the hole that let a dead decision layer
+            # report healthy.
+            self._record_ai_health(None, decided=False)
 
         sig.signal(sig.SIGINT, self._shutdown)
         sig.signal(sig.SIGTERM, self._shutdown)
@@ -462,7 +470,8 @@ class TradingEngine:
             # full size, because the risk that matters is what happens when every
             # stop fills in the same move.
             scale, why_scale = self.risk.correlation_scale(
-                signal, size, account, correlations
+                signal, size, account, correlations,
+                pending=self._pending_as_legs(),
             )
             if scale <= 0:
                 console.print(f"[yellow]AI {sym} vetoed: {why_scale}[/]")
@@ -572,7 +581,11 @@ class TradingEngine:
         the model never learns that a diversifying trade would have been worth more.
         """
         try:
-            positions = list(account.positions or [])
+            # Resting entries are included for the same reason they are included in
+            # the budget itself: understating what is already committed would show
+            # the model free capacity that the risk engine is about to refuse, and
+            # this context exists precisely so the two agree.
+            positions = list(account.positions or []) + self._pending_as_legs()
             eq = account.equity or 0.0
             used = self.risk.portfolio_risk(positions, correlations)
             used_n = self.risk.correlated_notional(positions, correlations)
@@ -631,19 +644,26 @@ class TradingEngine:
         except Exception as e:  # context enrichment must never break a cycle
             self.logger.warning("correlation context failed: %s", e)
 
-    def _record_ai_health(self, error: str | None):
+    def _record_ai_health(self, error: str | None, *, decided: bool = True):
         """Publish decision-layer liveness so something outside the process can see it.
 
         `bot_state.json` keeps being written on every cycle whether or not the model
         answers, so its mtime cannot distinguish a thinking bot from a brain-dead
         one — which is exactly how a 16h outage passed every healthcheck. This file
         is the signal the container healthcheck actually keys on.
+
+        `decided=False` publishes the file at boot without claiming a decision
+        happened: no counter moves and `last_success` stays None. Stamping boot time
+        into a success field would be the same lie that once put boot timestamps on
+        restored trades — the file exists to say "the writer is alive", and it must
+        not answer "when did the model last work?" with a time it did not work.
         """
-        if error:
-            self._ai_consecutive_failures += 1
-        else:
-            self._ai_consecutive_failures = 0
-            self._last_ai_success = datetime.utcnow()
+        if decided:
+            if error:
+                self._ai_consecutive_failures += 1
+            else:
+                self._ai_consecutive_failures = 0
+                self._last_ai_success = datetime.utcnow()
 
         healthy = self._ai_consecutive_failures < self.ai_max_failures
         try:
@@ -1040,6 +1060,37 @@ class TradingEngine:
             signal.side.value, signal.symbol, size, touch, res["id"],
         )
         self._persist_state()
+
+    def _pending_as_legs(self) -> list[Position]:
+        """Resting entries as position-shaped legs for the correlation budgets.
+
+        Priced at the limit, because that is where they fill if they fill at all.
+        Everything the budgets read — symbol, side, entry, size, stop — is already
+        carried on the pending order; the rest of the Position is scaffolding.
+        """
+        legs: list[Position] = []
+        for sym, pe in self.pending_entries.items():
+            try:
+                size = float(pe["size"])
+                entry = float(pe["limit_price"])
+                if size <= 0 or entry <= 0:
+                    continue
+                legs.append(
+                    Position(
+                        symbol=sym,
+                        side=Side(pe["side"]),
+                        entry_price=entry,
+                        size=size,
+                        leverage=int(pe.get("leverage") or 5),
+                        stop_loss=float(pe.get("stop_loss") or 0),
+                        take_profit=float(pe.get("take_profit") or 0),
+                    )
+                )
+            except (KeyError, ValueError, TypeError) as e:
+                # A malformed pending order must not silently vanish from the
+                # budget — that is the bug this method exists to fix.
+                self.logger.warning("PENDING_LEG_SKIPPED %s: %s", sym, e)
+        return legs
 
     def _manage_pending_entries(self):
         if not self.pending_entries:

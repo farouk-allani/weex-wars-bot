@@ -61,6 +61,10 @@ execution:
   entry_ttl_minutes: 45         # unfilled after this = the setup left without us; fine
   reprice_seconds: 180          # re-quote toward the touch at most this often
   max_chase_atr: 0.5            # never chase price further than this from the signal
+  # Paper realism. Both default ON and exist to be turned OFF only when reproducing
+  # a pre-2026-08-03 run, never to make a new result look better.
+  paper_funding: true           # settle 00/08/16 UTC funding to the paper balance
+  paper_fill_through_ticks: 1   # market must trade THROUGH our limit, not just touch it
 
 trading:
   mode: paper

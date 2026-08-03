@@ -10,7 +10,7 @@ Fixes:
 import ccxt
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -58,6 +58,12 @@ class ExchangeClient:
         # the price is ours by construction; what we risk instead is not filling.
         exec_cfg = config.get("execution", {}) or {}
         self.maker_fee_rate = float(exec_cfg.get("maker_fee_rate", 0.0002))
+        # Defaults ON: the honest simulation is the one that charges what live
+        # charges. The flag exists to reproduce old runs, not to flatter new ones.
+        self.paper_funding_enabled = bool(exec_cfg.get("paper_funding", True))
+        # A resting limit only fills when the market trades THROUGH it — a touch
+        # leaves us at the back of the queue with nothing done. Measured in ticks.
+        self.fill_through_ticks = float(exec_cfg.get("paper_fill_through_ticks", 1))
         self.balance = float(bt.get("initial_capital", 10000))
         self.paper_positions: dict[str, Position] = {}
         self.paper_trades: list = []
@@ -112,6 +118,31 @@ class ExchangeClient:
             except Exception:
                 pass
         return float(price)
+
+    def _tick_size(self, symbol: str, ref_price: float) -> float:
+        """One price increment for `symbol`, in quote units.
+
+        ccxt reports price precision as either a tick (0.01) or a count of decimal
+        places (2), decided by the exchange's `precisionMode` — and the two forms
+        collide at the value 1, which is a $1 tick under one reading and $0.1 under
+        the other. Read the mode rather than guess from the magnitude.
+
+        Falls back to one basis point of the reference price when markets are
+        unreachable. The fallback must never be 0, or the trade-through test
+        silently degrades back into the touch test it replaced.
+        """
+        if self._ensure_markets():
+            try:
+                prec = self.exchange.market(symbol)["precision"]["price"]
+                if prec is not None:
+                    if self.exchange.precisionMode == ccxt.DECIMAL_PLACES:
+                        return 10.0 ** -int(prec)
+                    tick = float(prec)
+                    if tick > 0:
+                        return tick
+            except Exception:
+                pass
+        return abs(ref_price) * 1e-4
 
     # ---- Market Data ----
 
@@ -474,10 +505,24 @@ class ExchangeClient:
         """Poll one resting entry. Returns {status: open|filled|gone, fill_price,
         filled_amount}.
 
-        Paper fill rule: a buy limit fills when the market trades at or below it,
-        a sell limit at or above. Queue-optimistic (a touch counts as a fill) but
-        price-honest — the fill is at OUR price, never an assumed improvement.
-        Polling is 60s, so touches between polls are missed: conservative."""
+        Paper fill rule: the market must trade THROUGH our limit by
+        `execution.paper_fill_through_ticks` before we count a fill — a buy needs
+        last <= limit - ticks, a sell last >= limit + ticks.
+
+        Until 2026-08-03 a mere touch filled us, in full. That is the optimistic end
+        of the queue: at the touch we are behind everyone already resting at that
+        price, and the overwhelming majority of touches reverse without clearing the
+        book down to us. It inflated the fill rate (the Aug 1 audit's 12/14 "rested"
+        is an artifact of it) and, worse, it granted free entries precisely at local
+        reversals — the touches that immediately turn are the ones a real queue does
+        NOT give you, and they are the best-looking entries in the sample.
+
+        Trade-through is still not a queue model; it is the pessimistic bracket. The
+        truth sits between the two, and the honest thing is to be measured by the
+        bracket that cannot flatter us. Price stays honest either way: the fill is at
+        OUR limit, never an assumed improvement. Polling is 60s, so moves that spike
+        through and recover between polls are missed — conservative in the same
+        direction."""
         if self.mode == "paper":
             pending = self.paper_pending.get(order_id)
             if not pending:
@@ -489,7 +534,12 @@ class ExchangeClient:
 
             limit = float(pending["limit_price"])
             side = Side(pending["side"])
-            hit = last <= limit if side == Side.LONG else last >= limit
+            through = self.fill_through_ticks * self._tick_size(symbol, limit)
+            hit = (
+                last <= limit - through
+                if side == Side.LONG
+                else last >= limit + through
+            )
             if not hit:
                 return {"status": "open", "fill_price": 0.0, "filled_amount": 0.0}
 
@@ -670,6 +720,10 @@ class ExchangeClient:
             fees_paid=entry_fee,
             partial_take_profit=partial_take_profit,
             partial_fraction=partial_fraction,
+            # Anchor at the settlement preceding this fill, so the first charge is
+            # the next boundary crossed — never the one that already passed before
+            # the position existed.
+            last_funding_at=self._funding_boundary(datetime.utcnow()),
         )
         self.paper_positions[symbol] = position
         return position
@@ -704,16 +758,25 @@ class ExchangeClient:
             pos = self.paper_positions.pop(symbol)
             ticker = self.fetch_ticker(symbol)
             mark = float(ticker.get("last") or pos.entry_price)
+            # Settle funding owed up to this instant before the position leaves the
+            # book, or a close that lands just after a boundary escapes the charge.
+            self._settle_paper_funding(pos, mark, datetime.utcnow())
             exit_price = self.apply_slippage(mark, pos.side, is_exit=True)
             fee = pos.size * exit_price * self.commission_rate
             pnl = pos.calculate_pnl(exit_price) - fee
             self.balance += pnl
-            self.paper_trades.append({"symbol": symbol, "pnl": pnl})
+            # `pnl` stays execution-only; funding already moved the balance as it
+            # accrued. Reporting it separately keeps the exit research honest —
+            # a hold-longer rule pays more carry without touching the fee line.
+            self.paper_trades.append(
+                {"symbol": symbol, "pnl": pnl, "funding": pos.funding_paid}
+            )
             return {
                 "closed": True,
                 "pnl": pnl,
                 "exit_price": exit_price,
                 "fee": fee,
+                "funding": pos.funding_paid,
             }
 
         try:
@@ -791,12 +854,78 @@ class ExchangeClient:
             "entry_fee": position.entry_fee,
         }
 
+    # ---- Funding ----
+    #
+    # Perpetuals settle funding at 00:00/08:00/16:00 UTC. Until 2026-08-03 the paper
+    # ledger fetched the rate, showed it to the model as context, and never charged
+    # it — so a paper position was free to hold and a live one was not. That biased
+    # every result in one direction (longs in a positive-funding regime looked better
+    # than they were), and it invalidated the one surviving research candidate
+    # outright: a funding-carry book measured in a simulator that does not charge
+    # funding is measuring nothing.
+
+    FUNDING_HOURS = (0, 8, 16)
+
+    @classmethod
+    def _funding_boundary(cls, when: datetime) -> datetime:
+        """Most recent settlement instant at or before `when`.
+
+        Hour 0 is a boundary, so some element always qualifies — no wrap-to-yesterday
+        case exists.
+        """
+        hour = max(h for h in cls.FUNDING_HOURS if h <= when.hour)
+        return when.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+    @classmethod
+    def _boundaries_between(cls, after: datetime, until: datetime) -> list[datetime]:
+        """Settlements strictly after `after` and at or before `until`."""
+        out: list[datetime] = []
+        b = cls._funding_boundary(until)
+        while b > after:
+            out.append(b)
+            b = cls._funding_boundary(b - timedelta(seconds=1))
+        return sorted(out)
+
+    def _settle_paper_funding(self, pos: Position, mark: float, now: datetime) -> float:
+        """Charge every funding settlement this position has slept through.
+
+        Longs pay a positive rate, shorts receive it. Settled straight to balance,
+        the way the venue does it — not folded into unrealised PnL, because it is
+        cash that has already moved and does not come back if price reverses.
+        """
+        if not self.paper_funding_enabled or mark <= 0:
+            return 0.0
+        anchor = pos.last_funding_at or self._funding_boundary(pos.opened_at)
+        due = self._boundaries_between(anchor, now)
+        if not due:
+            return 0.0
+
+        # One rate lookup covers every boundary owed. Rates are only observable as
+        # the venue's current estimate, so a bot that was down for two settlements
+        # prices both at today's rate — approximate, and far closer than zero.
+        rate = self.fetch_funding_rate(pos.symbol)
+        direction = 1.0 if pos.side == Side.LONG else -1.0
+        flow = rate * abs(mark * pos.size) * direction * len(due)
+
+        self.balance -= flow
+        pos.funding_paid += flow
+        pos.last_funding_at = due[-1]
+        if abs(flow) > 0:
+            print(
+                f"[Exchange] funding {pos.symbol} {pos.side.value}: "
+                f"{'paid' if flow > 0 else 'received'} {abs(flow):.4f} "
+                f"({len(due)} settlement(s) @ {rate:+.6f})"
+            )
+        return flow
+
     def update_paper_positions(self):
+        now = datetime.utcnow()
         for symbol, pos in list(self.paper_positions.items()):
             ticker = self.fetch_ticker(symbol)
             if not ticker:
                 continue
             current_price = float(ticker.get("last") or pos.entry_price)
+            self._settle_paper_funding(pos, current_price, now)
             pos.unrealized_pnl = pos.calculate_pnl(current_price)
             pos.update_extremes(current_price)
 
@@ -830,6 +959,13 @@ class ExchangeClient:
                     "realized_pnl": p.realized_pnl,
                     "entry_fee": p.entry_fee,
                     "fees_paid": p.fees_paid,
+                    "funding_paid": p.funding_paid,
+                    # Without this the anchor resets to boot time on restart and
+                    # every settlement slept through gets skipped — free carry,
+                    # which is the bug this whole change exists to remove.
+                    "last_funding_at": (
+                        p.last_funding_at.isoformat() if p.last_funding_at else None
+                    ),
                 }
                 for p in self.paper_positions.values()
             ],
@@ -869,6 +1005,14 @@ class ExchangeClient:
                     realized_pnl=float(raw.get("realized_pnl") or 0),
                     entry_fee=float(raw.get("entry_fee") or 0),
                     fees_paid=float(raw.get("fees_paid") or 0),
+                    funding_paid=float(raw.get("funding_paid") or 0),
+                    last_funding_at=(
+                        datetime.fromisoformat(
+                            str(raw["last_funding_at"]).replace("Z", "")
+                        )
+                        if raw.get("last_funding_at")
+                        else None
+                    ),
                 )
             except Exception as e:
                 print(f"[Exchange] Could not restore paper position: {e}")

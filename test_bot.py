@@ -464,4 +464,139 @@ assert _live.max_open_positions >= 5, "count cap must leave the correlation budg
 print(f"swap guard OK (margin {_live.swap_conviction_margin}, "
       f"max_open_positions {_live.max_open_positions})")
 
+print("\n=== PAPER FUNDING IS CHARGED, ONCE PER SETTLEMENT ===")
+# Funding was fetched, shown to the model, and never billed — so a paper position
+# was free to hold and a live one was not. These pin the arithmetic and, more
+# importantly, the idempotency: get_account_state() runs several times per cycle.
+from src.core.exchange import ExchangeClient
+
+_fx = ExchangeClient.__new__(ExchangeClient)   # no network, no credentials
+_fx.mode = "paper"
+_fx.paper_funding_enabled = True
+_fx.balance = 1000.0
+_fx.fetch_funding_rate = lambda symbol: 0.0001   # +0.01%, longs pay
+
+_b = ExchangeClient._funding_boundary
+assert _b(datetime(2026, 8, 3, 7, 59)) == datetime(2026, 8, 3, 0, 0)
+assert _b(datetime(2026, 8, 3, 8, 0)) == datetime(2026, 8, 3, 8, 0)
+assert _b(datetime(2026, 8, 3, 23, 59)) == datetime(2026, 8, 3, 16, 0)
+# Hour 0 is itself a boundary, so the day never wraps backwards.
+assert _b(datetime(2026, 8, 3, 0, 30)) == datetime(2026, 8, 3, 0, 0)
+
+_between = ExchangeClient._boundaries_between
+assert _between(datetime(2026, 8, 3, 0, 0), datetime(2026, 8, 3, 7, 0)) == []
+assert _between(datetime(2026, 8, 3, 0, 0), datetime(2026, 8, 3, 9, 0)) == [
+    datetime(2026, 8, 3, 8, 0)]
+# Down for a day: every settlement slept through is still owed, not skipped.
+# 08-02 08:00 -> 08-03 09:00 spans three: 08-02 16:00, 08-03 00:00, 08-03 08:00.
+# The anchor itself is excluded — it was already settled when it became the anchor.
+assert _between(datetime(2026, 8, 2, 8, 0), datetime(2026, 8, 3, 9, 0)) == [
+    datetime(2026, 8, 2, 16, 0), datetime(2026, 8, 3, 0, 0), datetime(2026, 8, 3, 8, 0)]
+
+_pos = Position("BTC/USDT:USDT", Side.LONG, 100.0, 0.5, 5, 90.0, 120.0,
+                opened_at=datetime(2026, 8, 3, 6, 0))
+_pos.last_funding_at = _b(_pos.opened_at)
+# 09:00 crosses exactly one settlement: 0.0001 * (100 * 0.5) = 0.005 paid.
+_f1 = _fx._settle_paper_funding(_pos, 100.0, datetime(2026, 8, 3, 9, 0))
+assert abs(_f1 - 0.005) < 1e-12, _f1
+assert abs(_fx.balance - 999.995) < 1e-12, _fx.balance
+# Same cycle, read again: nothing more is owed.
+assert _fx._settle_paper_funding(_pos, 100.0, datetime(2026, 8, 3, 9, 5)) == 0.0
+assert abs(_fx.balance - 999.995) < 1e-12, "a second read double-charged funding"
+# A short on the same positive rate RECEIVES it.
+_short = Position("BTC/USDT:USDT", Side.SHORT, 100.0, 0.5, 5, 110.0, 80.0,
+                  opened_at=datetime(2026, 8, 3, 6, 0))
+_short.last_funding_at = _b(_short.opened_at)
+assert _fx._settle_paper_funding(_short, 100.0, datetime(2026, 8, 3, 9, 0)) < 0
+# A position opened after a boundary is not billed for it retroactively.
+_late = Position("BTC/USDT:USDT", Side.LONG, 100.0, 0.5, 5, 90.0, 120.0,
+                 opened_at=datetime(2026, 8, 3, 8, 30))
+_late.last_funding_at = _b(_late.opened_at)
+assert _fx._settle_paper_funding(_late, 100.0, datetime(2026, 8, 3, 9, 0)) == 0.0
+# The switch reproduces old runs and nothing else.
+_fx.paper_funding_enabled = False
+assert _fx._settle_paper_funding(_pos, 100.0, datetime(2026, 8, 4, 0, 0)) == 0.0
+print("funding OK (charged once per settlement, sign correct, restart-safe)")
+
+print("\n=== A TOUCH IS NOT A FILL ===")
+# The old rule filled in full whenever `last` reached the limit, which handed us
+# free entries at exactly the reversals a real queue never gives you.
+_qx = ExchangeClient.__new__(ExchangeClient)
+_qx.mode = "paper"
+_qx.fill_through_ticks = 1
+_qx._tick_size = lambda symbol, ref: 0.1
+_qx.paper_positions = {}
+_qx.paper_pending = {"o1": {"id": "o1", "symbol": "BTC/USDT:USDT", "side": "long",
+                            "amount": 0.5, "limit_price": 100.0, "stop_loss": 90.0,
+                            "take_profit": 120.0, "strategy": "", "leverage": 5,
+                            "partial_take_profit": None, "partial_fraction": 0.5,
+                            "created": 0}}
+_qx.fetch_ticker = lambda symbol: {"last": 100.0}          # exact touch
+assert _qx.check_entry_fill("o1", "BTC/USDT:USDT")["status"] == "open", "touch must not fill"
+_qx.fetch_ticker = lambda symbol: {"last": 99.95}          # inside one tick
+assert _qx.check_entry_fill("o1", "BTC/USDT:USDT")["status"] == "open"
+
+_filled = {}
+_qx._open_paper_position = lambda **kw: _filled.update(kw)
+_qx.maker_fee_rate = 0.0002
+_qx.fetch_ticker = lambda symbol: {"last": 99.9}           # a full tick through
+_res = _qx.check_entry_fill("o1", "BTC/USDT:USDT")
+assert _res["status"] == "filled", _res
+# Price stays honest: we fill at OUR limit, never at the better price that traded.
+assert _res["fill_price"] == 100.0, _res
+assert _filled["fee_rate"] == 0.0002, "a maker fill must not be charged taker"
+print("fill rule OK (trade-through required, fill price still ours)")
+
+print("\n=== RESTING ORDERS COUNT AGAINST THE CORRELATION BUDGET ===")
+# Pending entries were invisible to both budgets, so N same-side resting orders
+# were each sized as if the others did not exist — then filled together.
+from src.core.models import AccountState
+
+_cfg = copy.deepcopy(config)
+_cfg["risk"]["max_correlated_notional"] = 1.0
+_cfg["risk"]["max_portfolio_risk"] = 0.02
+_cm = RiskManager(_cfg)
+_acct = AccountState(balance=1000, equity=1000, unrealized_pnl=0,
+                     margin_used=0, available_margin=1000, positions=[])
+_sig = Signal(symbol="BTC/USDT:USDT", side=Side.LONG, strength=0.8,
+              entry_price=100.0, stop_loss=96.0, take_profit=112.0,
+              strategy="test", leverage=5, reason="budget test")
+_corr = {("BTC/USDT:USDT", "ETH/USDT:USDT"): 0.9}
+# Sized so the budget BINDS rather than being exhausted outright: a full veto would
+# pass this test even if the leg were only being counted, not priced. A partial
+# scale can only come from the leg entering the quadratic form.
+_leg = Position("ETH/USDT:USDT", Side.LONG, 100.0, 2.0, 5, 96.0, 112.0)
+
+_alone, _ = _cm.correlation_scale(_sig, 5.0, _acct, _corr)
+_with_pending, _why = _cm.correlation_scale(_sig, 5.0, _acct, _corr, pending=[_leg])
+assert _alone == 1.0, f"an empty book must not scale the first leg: {_alone}"
+assert 0 < _with_pending < 1.0, (
+    f"a resting correlated leg must SHRINK the next one, not veto it: {_with_pending}")
+# And a pending leg constrains exactly as hard as the same leg already filled.
+_acct_filled = AccountState(balance=1000, equity=1000, unrealized_pnl=0,
+                            margin_used=0, available_margin=1000, positions=[_leg])
+_as_filled, _ = _cm.correlation_scale(_sig, 5.0, _acct_filled, _corr)
+assert abs(_as_filled - _with_pending) < 1e-12, (
+    f"pending and filled must price identically: {_as_filled} vs {_with_pending}")
+print(f"correlation budget OK (scale {_alone:.3f} -> {_with_pending:.3f} with one resting leg)")
+
+# The conversion the engine feeds those budgets: priced at the limit, not the
+# signal price, because the limit is where a resting order actually fills.
+from src.core.engine import TradingEngine
+import logging
+
+_pe = TradingEngine.__new__(TradingEngine)
+_pe.logger = logging.getLogger("test")
+_pe.pending_entries = {
+    "BTC/USDT:USDT": {"side": "long", "size": 0.5, "limit_price": 100.0,
+                      "stop_loss": 96.0, "take_profit": 112.0, "leverage": 5},
+    "ADA/USDT:USDT": {"side": "short", "size": 0.0, "limit_price": 1.0},   # no size
+    "XRP/USDT:USDT": {"side": "long", "limit_price": 2.0},                 # malformed
+}
+_legs = _pe._pending_as_legs()
+assert len(_legs) == 1, f"only the usable resting order becomes a leg: {_legs}"
+assert _legs[0].symbol == "BTC/USDT:USDT" and _legs[0].side == Side.LONG
+assert _legs[0].entry_price == 100.0 and _legs[0].stop_loss == 96.0
+print("pending->leg conversion OK (limit-priced, junk skipped not crashed)")
+
 print("\n=== ALL TESTS PASSED ===")

@@ -30,12 +30,18 @@ services:
       # a brain-dead bot passed this check for 16h straight. ai_health.json carries
       # the consecutive-failure verdict, and a missing/stale one (> 3 decision
       # intervals) is itself unhealthy.
+      #
+      # A MISSING file used to pass (`d is None or ...`), which contradicted the
+      # paragraph above and reopened the hole it was written to close: delete the
+      # file, or never write it, and the check goes quiet. The engine now publishes
+      # ai_health.json at startup, before the first decision, so its absence can
+      # only mean the writer is not running — and that is a failure, not a boot.
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import json,time; from pathlib import Path; s=Path('data/bot_state.json'); h=Path('data/ai_health.json'); assert s.exists() and time.time()-s.stat().st_mtime<600, 'state stale'; d=json.loads(h.read_text()) if h.exists() else None; assert d is None or (d.get('healthy') and time.time()-h.stat().st_mtime<11000), 'ai unhealthy'",
+          "import json,time; from pathlib import Path; s=Path('data/bot_state.json'); h=Path('data/ai_health.json'); assert s.exists() and time.time()-s.stat().st_mtime<600, 'state stale'; assert h.exists(), 'ai_health.json missing'; d=json.loads(h.read_text()); assert d.get('healthy') and time.time()-h.stat().st_mtime<11000, 'ai unhealthy'",
         ]
       interval: 2m
       timeout: 10s

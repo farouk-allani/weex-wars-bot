@@ -99,6 +99,14 @@ class Position:
     realized_pnl: float = 0.0
     entry_fee: float = 0.0
     fees_paid: float = 0.0  # running total: entry + any partial exits
+    # Funding settled while this position was open. Positive = paid out (a cost),
+    # negative = received. Kept apart from fees_paid because it is not an execution
+    # cost: it accrues with TIME HELD rather than with trading, so an exit rule that
+    # holds longer changes this and not the fee line.
+    funding_paid: float = 0.0
+    # Most recent funding boundary already settled for this position, so repeated
+    # account reads inside one cycle cannot charge the same settlement twice.
+    last_funding_at: Optional[datetime] = None
 
     def update_extremes(self, price: float):
         if price > self.highest_price:

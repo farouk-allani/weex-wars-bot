@@ -314,6 +314,7 @@ class RiskManager:
         size: float,
         account: AccountState,
         correlations: dict | None = None,
+        pending: Optional[list[Position]] = None,
     ) -> tuple[float, str]:
         """Multiplier in [0,1] for `size` honouring BOTH correlation budgets.
 
@@ -321,11 +322,18 @@ class RiskManager:
           - stop-out risk : what if every stop fires at once (risk management)
           - net notional  : how hard does the equity curve swing (stability)
         The binding one wins, so the trade is scaled to satisfy whichever is tighter.
+
+        `pending` is resting maker entries, and they count exactly like filled ones.
+        They were invisible here until 2026-08-03, which quietly disabled the whole
+        feature on the maker path: three same-side orders each sized as if the other
+        two did not exist, then filled together in the one move — a correlated
+        stop-out — that these budgets exist to survive. A commitment to buy is
+        exposure; the only thing "unfilled" changes is the timing.
         """
         if size <= 0 or account.equity <= 0:
             return 1.0, "no size to scale"
 
-        open_positions = list(account.positions or [])
+        open_positions = list(account.positions or []) + list(pending or [])
         d_c = 1.0 if signal.side == Side.LONG else -1.0
         results: list[tuple[float, str]] = []
 

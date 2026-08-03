@@ -201,6 +201,48 @@ metric (§1). Also note the single entry taken under pace pressure justified its
 *"acceptable as a range-fade to meet the trade minimum"* and is the book's only
 winner — n=1, but a hint that `min_conviction` may be set too high.
 
+### 2e. The paper simulator was flattering us in two ways (2026-08-03)
+
+Triggered by an outside code review. Three real defects, verified in the source before
+being believed — and the two that matter both bias **in the same direction**, so the
+paper book has been reporting a book slightly better than the one live would have run.
+
+**1. Funding was never charged.** `fetch_funding_rate` existed and fed the model as
+*context*; the paper ledger never debited it. A paper position was free to hold and a
+live one is not. This is not a rounding error in the research sense — it silently
+invalidated the **carry** arm above (§2, "one surviving candidate"): a funding-carry
+book measured in a simulator that does not charge funding is measuring nothing. Now
+settled to `balance` at 00/08/16 UTC, once per boundary, anchored per position and
+persisted so a restart cannot skip the settlements it slept through.
+
+**2. A touch counted as a full fill.** `check_entry_fill` filled a resting order the
+moment `last` reached the limit. At the touch we are at the *back* of the queue, and
+most touches reverse without clearing the book down to us — so the old rule granted
+free entries at precisely the local reversals a real queue never gives you, which are
+also the best-looking entries in any sample. **The Aug 1 audit's "maker fills 12/14
+rested (86%)" is an artifact of this rule and should not be quoted again.** Now
+requires trade-through by `execution.paper_fill_through_ticks` (default 1). That is
+the pessimistic bracket, not a queue model; truth is between the two, and the honest
+choice is the bracket that cannot flatter us.
+
+**3. Resting orders were invisible to the correlation budgets.** `correlation_scale`
+read only `account.positions`, so N same-side maker orders were each sized as if the
+others did not exist, then filled together in the one correlated move the budgets
+exist to survive. With `max_open_positions` now 5 (§2d) that was up to five unbudgeted
+legs. Fixed at the source (both budgets) *and* in the AI's context, which was showing
+the model free capacity the risk engine was about to refuse.
+
+Also fixed: the container healthcheck treated a **missing** `ai_health.json` as
+healthy (`d is None or ...`) — the exact hole its own comment claimed to close, and
+the same failure mode as the 16h silent outage. The engine now publishes the file at
+startup (without stamping a fake `last_success`), so absence can only mean the writer
+is dead, and the check demands it.
+
+**Consequence for the record: paper results from before this date are not comparable
+to results after it, and the −0.72% / 11 trades in §2d is the optimistic reading.**
+The next audit's numbers should be expected to look *worse*, and that is the fix
+working. Re-measure the maker fill rate before drawing any conclusion from it.
+
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 
 - **bot** — paper trading, AI (DeepSeek) hourly decisions, maker-entry execution

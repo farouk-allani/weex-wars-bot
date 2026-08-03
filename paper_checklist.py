@@ -41,11 +41,37 @@ def main():
     check("Paper mode", mode == "paper", f"mode={mode}")
     symbols = cfg.get("trading", {}).get("symbols") or []
     check("Symbols set", len(symbols) >= 1, str(symbols))
-    check("ETH disabled (WFO)", "ETH" in (cfg.get("competition", {}).get("disabled_pairs") or [])
-          or not any("ETH" in s for s in symbols), "ETH was a drag")
+    # These three used to assert a config we deliberately stopped running — ETH
+    # disabled, partial TP on, keepalive capped — so the preflight cried FIX on
+    # every green run and stopped being read. A checklist that is wrong by default
+    # is worse than no checklist: it trains you to ignore it. Each is replaced by
+    # the invariant the current config actually holds.
+
+    # WEEX permits exactly these 8. Trading anything else is disqualification, which
+    # is the real hazard — not which subset of the 8 is enabled.
+    WEEX_PAIRS = {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "LTC"}
+    bases = {s.split("/")[0] for s in symbols}
+    check("Pairs are WEEX-permitted", bases <= WEEX_PAIRS,
+          f"not permitted: {sorted(bases - WEEX_PAIRS)}" if bases - WEEX_PAIRS else f"{len(bases)} pairs")
     check("Breakouts off", not cfg.get("strategy", {}).get("breakout", {}).get("enabled", False))
-    check("Partial TP on", cfg.get("risk", {}).get("partial_tp_enabled", False))
-    check("KA capped", cfg.get("strategy", {}).get("keepalive", {}).get("max_per_week", 99) <= 3)
+
+    # Keepalive must stay OFF while the AI decides: it only ever ran on the rules
+    # path, and a code-generated order carries no ai-log — non-compliant by §1.
+    ai_on = cfg.get("ai", {}).get("enabled", False)
+    ka_on = cfg.get("strategy", {}).get("keepalive", {}).get("enabled", False)
+    check("Keepalive off under AI", not (ai_on and ka_on),
+          "a heartbeat order has no ai-log" if (ai_on and ka_on) else "")
+
+    # Paper realism (added 2026-08-03). Off means the paper book is being flattered:
+    # free carry and fills at touches a real queue never gives. Only legitimate when
+    # deliberately reproducing a pre-2026-08-03 run.
+    ex = cfg.get("execution", {}) or {}
+    funding_on = ex.get("paper_funding", True)
+    check("Paper funding charged", funding_on,
+          "" if funding_on else "OFF = positions are free to hold, unlike live")
+    ticks = float(ex.get("paper_fill_through_ticks", 1))
+    check("Fills need trade-through", ticks >= 1,
+          f"{ticks} tick(s)" if ticks >= 1 else "0 = a touch fills, inflating the fill rate")
 
     # Modules
     try:
