@@ -312,6 +312,24 @@ the live run.**
 
 ### 2g. RESULT: the bar was missed, and not narrowly (2026-08-07)
 
+> **CORRECTION, same day, before acting on any of this.** This run scored the wrong
+> configuration. `run_ai_replay.py` defaulted `--no-osc` to OFF — i.e. oscillators
+> **ON** — while `config.yaml:51` sets `include_oscillators: false` and the live engine
+> reads it (`engine.py:93`). So this measured a brain the bot does not run, and
+> specifically the one arm already on record for triggering the memorised *"price at
+> upper Bollinger → short to VWAP"* reflex that had the model reciting a fade on ~80%
+> of trades. Corroborating: the earlier 1,266-trade measurement of the live arm gave a
+> ~36% win rate against a ~38.5% random baseline (≈random); this run gave 24.1%
+> (well below). That gap is consistent with the reflex being live in this arm.
+> **The numbers below stand as a measurement of the oscillators-ON arm and nothing
+> more.** Root cause fixed: the replay now defaults to the config value and prints a
+> loud warning when a flag overrides it. The live-configuration arm is re-running; its
+> result lands in §2h and supersedes this section's verdict.
+>
+> What survives the correction regardless of the re-run: the three harness checks
+> (ambiguous-bar, fee overcharge, conviction), the `--offset` truncation bug, and the
+> observation that the live book's break-even stops are doing the work.
+
 `--days 90 --every 6`, window 2026-05-06 → 2026-08-04, 360 decision points, all 8
 pairs. Scored by `run_replay_score.py` (frozen at d2724bc, before the data existed).
 

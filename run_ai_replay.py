@@ -77,20 +77,34 @@ def main():
                     help="withhold positioning/sentiment")
     ap.add_argument("--no-macro", action="store_true",
                     help="withhold macro (dollar, yields, equities, Nikkei)")
-    ap.add_argument("--no-osc", action="store_true",
-                    help="withhold RSI/StochRSI/Bollinger/VWAP + edge signals")
+    ap.add_argument("--no-osc", dest="osc", action="store_false", default=None,
+                    help="withhold RSI/StochRSI/Bollinger/VWAP + edge signals "
+                         "(default: follow ai.include_oscillators in config)")
+    ap.add_argument("--osc", dest="osc", action="store_true", default=None,
+                    help="force oscillators ON regardless of config")
     ap.add_argument("--offset", type=int, default=0,
                     help="end the window N days earlier — for out-of-sample validation")
     ap.add_argument("--tag", default="", help="label for the saved results file")
     args = ap.parse_args()
     use_intel = not args.no_intel
     use_macro = not args.no_macro
-    use_osc = not args.no_osc
 
     cfg = yaml.safe_load(open(args.config)) or {}
     cfg.setdefault("ai", {})["enabled"] = True
     if args.model:
         cfg["ai"]["model"] = args.model
+
+    # Oscillators must DEFAULT TO THE CONFIG the live engine reads (engine.py:93),
+    # not to ON. They previously defaulted ON here while config.yaml has them off, so
+    # an unflagged replay silently scored a different brain than the one deployed —
+    # and specifically the one arm known to trigger the memorised "price at upper BB
+    # -> short to VWAP" reflex. A research rig whose default diverges from production
+    # measures nothing you can act on.
+    cfg_osc = bool((cfg.get("ai") or {}).get("include_oscillators", False))
+    use_osc = cfg_osc if args.osc is None else args.osc
+    if use_osc != cfg_osc:
+        console.print(f"[yellow]oscillators forced {'ON' if use_osc else 'OFF'} by flag "
+                      f"— config says {cfg_osc}. This is NOT the live configuration.[/]")
 
     symbols = cfg["trading"]["symbols"]
     equity = float(cfg["backtest"]["initial_capital"])
