@@ -243,6 +243,73 @@ to results after it, and the −0.72% / 11 trades in §2d is the optimistic read
 The next audit's numbers should be expected to look *worse*, and that is the fix
 working. Re-measure the maker fill rate before drawing any conclusion from it.
 
+### 2f. PRE-DECLARED: does the AI decision layer have a general edge? (registered 2026-08-07, before the run)
+
+**Why this exists.** The live paper book is up **+2.13% ($999.94 → $1021.20) on 18
+trades over 8.6 days** — 50% win rate, payoff 1.63, maxDD 1.65%, net directional beta
+0.02x. It reads well and it means nothing yet:
+
+- Per-trade sd is $6.09, so the 95% CI on the +$18.12 is **−$32.5 to +$68.8**.
+  **t = 0.70.** At this effect size, t=2 needs ~147 trades.
+- **+$15 of the +$18 is ADA** — the one pair that trended in the window (+20.7% while
+  BTC/ETH/SOL moved ±0.2%). Drop the top 3 trades and the book is **−$16.36**. Drop
+  the two ADA take-profits and the break-even win rate rises to 52.4% against an
+  observed 50%, i.e. underwater.
+- **13 of the 18 trades closed before the §2e sim fix** (deployed Aug 3 14:13 UTC).
+  The trustworthy sample is n=5.
+
+At the observed 2.08 trades/day, waiting for n≈150 live is ~20-25 days and the rounds
+are late August. `run_ai_replay.py` is the way to get n without spending the runway:
+no lookahead (context is `candles[:i]`, outcome resolved on `candles[i+1:]`), fees and
+slippage charged at config rates, stop assumed on ambiguous bars, fixed notional per
+decision so it measures the **brain, not the book**.
+
+**Scope, fixed before the run.** Primary: `--days 90 --every 8` (all 8 pairs, intel +
+macro + oscillators on, default model). Out-of-sample: the same command with
+`--offset 90`, run **once**, after the primary is scored, with **zero** prompt or
+config changes in between.
+
+**The bar. All of these are pre-declared; none are negotiable after seeing the output.**
+
+| # | Test | Pass condition |
+|---|------|----------------|
+| 1 | Sample | ≥120 scored trades in the primary window (else the run is void — resample denser, don't judge it) |
+| 2 | **Significance** | **t ≥ 2.0** on per-trade PnL (mean / (sd/√n)). Positive PnL alone is *not* a pass — positive is free at small n |
+| 3 | Generality (a) | Drop the single best-contributing symbol → total PnL still positive **and** t ≥ 1.5 |
+| 4 | Generality (b) | ≥5 of 8 symbols individually net-positive |
+| 5 | Cost survival | Profit factor ≥ 1.25 (a PF near 1.0 dies to any live execution slip) |
+| 6 | Pace | ≥10 trades per 14d (the round minimum; the script prints this) |
+| 7 | **OOS** | Held-out window: **same sign**, and t ≥ 1.0 |
+
+**Pre-declared actions, so the result cannot be rationalised afterwards:**
+
+- **Fails #2** → the decision layer has no demonstrated edge. We do **not** tune the
+  prompt until the window turns green; that is overfitting in English, and the script
+  says so itself. The round strategy instead becomes: minimise drawdown, clear the
+  10-trade minimum, and compete on the risk/stability metrics rather than on profit.
+- **Passes #2, fails #3/#4** → the edge is symbol-specific, not general. Restrict the
+  traded universe to the symbols that carry it; do not claim a general edge.
+- **Passes primary, fails #7** → unproven. Treated exactly as a #2 failure.
+- **Shorts net-negative at t ≤ −2** → declare shorts a structural leak and gate them
+  off in config. (Live currently shows longs +$20.88/8, shorts −$2.76/10 — far too
+  thin to act on, which is the point of measuring it at n in the hundreds.)
+
+**Two limits of this rig, stated before the result so they can't be produced later as
+an excuse:**
+
+1. **The model may carry training-data knowledge of these windows.** That makes a PASS
+   *suggestive, not conclusive* — but it makes a FAIL damning: a model that cannot
+   make money on price action it may have already seen will not make it live. The
+   asymmetry is the reason this test is worth running despite the contamination.
+2. **`resolve()` models only SL / TP / 72h-timeout.** It does not simulate the live
+   book's trailing and break-even stops (§2b), maker entry queue (§2e), position cap
+   (§2d) or correlation budgets. It scores *decision quality* under a simplified exit,
+   which is the intended isolation — but it is not a forecast of live book PnL.
+
+**The live paper book keeps running untouched during all of this — as the control, not
+the experiment. Nothing gets tuned on replay output and then declared "confirmed" by
+the live run.**
+
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 
 - **bot** — paper trading, AI (DeepSeek) hourly decisions, maker-entry execution
