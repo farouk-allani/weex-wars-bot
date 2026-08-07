@@ -112,20 +112,26 @@ def main():
         title="Replay",
     ))
 
-    fng = fetch_fear_greed(args.days + 5) if use_intel else {}
-    macro_hist = fetch_macro_history(args.days + args.offset + 20) if use_macro else {}
+    # Every fetch depth must clear days + offset. Only macro did, so --offset used to
+    # silently hand back a sliver: at --days 90 --offset 90 the candle fetch returned
+    # 105 days, `end` landed at bar 288 and `start` clamped to LOOKBACK, yielding 15
+    # decision points over ~4 days -- and printing them as if that were the window.
+    # A truncated OOS arm that reports no error is worse than none at all.
+    span = args.days + args.offset
+    fng = fetch_fear_greed(span + 5) if use_intel else {}
+    macro_hist = fetch_macro_history(span + 20) if use_macro else {}
     if use_macro:
         console.print(f"[green]  macro: {sum(len(v) for v in macro_hist.values())} rows "
                       f"across {len([k for k,v in macro_hist.items() if v])} series[/]")
 
     data = {}
     for s in symbols:
-        c = fetch_ohlcv(s, "1h", args.days + 15, use_cache=True)
+        c = fetch_ohlcv(s, "1h", span + 15, use_cache=True)
         if len(c) < LOOKBACK + 50:
             console.print(f"[yellow]skip {s}: {len(c)} candles[/]")
             continue
-        fmap = fetch_funding_map(s, args.days + 15, use_cache=True)
-        pos = fetch_positioning_history(s, args.days + 2) if use_intel else {}
+        fmap = fetch_funding_map(s, span + 15, use_cache=True)
+        pos = fetch_positioning_history(s, span + 2) if use_intel else {}
         data[s] = {
             "candles": c,
             "funding": interpolate_funding([x.timestamp for x in c], fmap),
@@ -157,6 +163,16 @@ def main():
         console.print("[red]window is empty — reduce --days or --offset[/]")
         sys.exit(1)
     points = list(range(start, end, args.every))
+    # Belt and braces on the bug above: if the fetch ever comes up short again, say so
+    # loudly rather than scoring a sliver and calling it a 90-day window.
+    want = args.days * 24 // args.every
+    if len(points) < want * 0.9:
+        console.print(
+            f"[red]WINDOW TRUNCATED: {len(points)} decision points, expected ~{want}. "
+            f"Only {n} candles available for days={args.days} offset={args.offset}. "
+            f"Do not score this as the requested window.[/]"
+        )
+        sys.exit(1)
     span_from = data[list(data)[0]]["candles"][points[0]].timestamp
     span_to = data[list(data)[0]]["candles"][points[-1]].timestamp
     console.print(

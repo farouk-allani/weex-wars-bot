@@ -310,6 +310,82 @@ an excuse:**
 the experiment. Nothing gets tuned on replay output and then declared "confirmed" by
 the live run.**
 
+### 2g. RESULT: the bar was missed, and not narrowly (2026-08-07)
+
+`--days 90 --every 6`, window 2026-05-06 → 2026-08-04, 360 decision points, all 8
+pairs. Scored by `run_replay_score.py` (frozen at d2724bc, before the data existed).
+
+| Clause | Measured | |
+|---|---|---|
+| #1 n ≥ 120 | 240 | PASS |
+| **#2 t ≥ 2.0** | **−3.66** | **FAIL** |
+| #3 drop best symbol (ADA) → PnL > 0 | −$552.13 | FAIL |
+| #3 drop best symbol → t ≥ 1.5 | −4.23 | FAIL |
+| #4 ≥5/8 pairs net-positive | **1/8** | FAIL |
+| #5 profit factor ≥ 1.25 | 0.59 | FAIL |
+| #6 pace ≥ 10/14d | 37.3 | PASS |
+
+**−53.78% on 240 trades. Win rate 27.1%. Both directions negative (long −$332 at
+t=−3.37, short −$206 at t=−1.88). Seven of eight pairs negative; the eighth is ADA at
++$14.30, t=+0.21 — noise.**
+
+**It is worse than a coin flip.** Measuring the true geometry from `r_multiple` rather
+than from realised PnL (the realised-outcome estimator is conditional and biased —
+checked because the first pass used it): median stop = 1.119R (the 0.119 is the fee and
+slippage load, which is the estimator's sanity check), median target = 1.755R, so the
+take-profit sits **1.57× the stop distance**. A driftless random entry therefore hits
+its target first **38.9%** of the time. The model managed **24.1%** (55 of 228
+resolved). **z = −4.59, p < 0.0001. All 8 pairs sit below the random-entry win rate.**
+Correcting the estimator made the result worse, not better.
+
+**Three ways it could have been the harness, all checked and all rejected:**
+
+1. *The pessimistic ambiguous-bar rule.* Only **3% of stops resolved on the first bar**
+   (median 11 bars; targets median 22). If the assume-the-stop rule were manufacturing
+   this, stops would fire on bar 1 constantly. They do not.
+2. *Taker fees on both legs.* Replay charges `commission_rate` 0.0006 round-trip while
+   live pays maker 0.0002 on entry. Maximum possible correction is ~**0.02R/trade
+   against a −0.34R average** — it recovers ~6% of the loss and changes no verdict.
+3. *Conviction carrying the signal.* It does not. The 0.50–0.65 bucket holds 169 of
+   240 trades at **t = −4.19**. The only positive bucket is 0.80–1.01: +$59.90 on
+   **n=11, t=+0.97**. That is not a filter, it is eleven trades.
+
+**Why the live book still shows +2.13%.** Not a contradiction — the two measure
+different things, and the gap is itself the finding. Live n=18 against replay n=240,
+and more importantly the live book runs the §2b exit machinery: **5 of its 18 trades
+exited at `be_stop` for a combined +$0.61**, i.e. scratched. In replay those same
+trades take the full −1R. Live avg loss is −$3.18; replay's is −$7.58. **The exits are
+doing the work.** The entry signal is negative and the break-even stop is quietly
+converting losers into scratches. That is a system that loses slowly, not one that
+wins — and it explains why the live equity curve looks calm (maxDD 1.65%) while the
+underlying decisions are actively harmful. The +$15-of-+$18 ADA concentration is the
+same story: ADA is also the only non-negative pair in replay, during a 90d window in
+which it was the only pair that trended.
+
+**PRE-DECLARED CONSEQUENCE, now in force.** The decision layer has no demonstrated
+edge — it has a demonstrated *anti*-edge. Per §2f: **we do not tune the prompt until
+this window turns green.** Round strategy shifts to drawdown-minimisation and clearing
+the trade minimum, competing on the risk and stability metrics that the official
+DoraHacks page confirms are scored ("rankings consider profits, risk management, and
+strategy stability").
+
+**Registered as a hypothesis, NOT acted on: does fading it work?** A signal reliably
+worse than random contains information with the sign flipped. The arithmetic is
+suggestive — but it was generated *from this window*, so testing it here is
+backfitting, and it does not survive naive inversion for free: a faded trade pays the
+same fees, and mirroring the levels inverts the reward:risk to 1/1.57 = 0.64, which
+raises the break-even hit rate to 61.5%. It needs its own pre-declared bar, its own
+`--fade` implementation, and a window that did not generate the hypothesis. See §2h.
+**Do not enable anything resembling this in config before that test exists.**
+
+**Bug found while setting up the held-out arm:** `--offset` was ignored by the candle,
+funding and sentiment fetches (only `fetch_macro_history` accounted for it). At
+`--days 90 --offset 90` the fetch returned 105 days, `end` landed at bar 288, `start`
+clamped to `LOOKBACK`, and the run would have scored **15 decision points over ~4 days
+while printing them as the requested 90-day window** — silently. Fixed, plus a hard
+guard that exits if the realised point count falls below 90% of what was asked for.
+**Any previous `--offset` result in this repo should be treated as void.**
+
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 
 - **bot** — paper trading, AI (DeepSeek) hourly decisions, maker-entry execution
