@@ -404,6 +404,64 @@ while printing them as the requested 90-day window** — silently. Fixed, plus a
 guard that exits if the realised point count falls below 90% of what was asked for.
 **Any previous `--offset` result in this repo should be treated as void.**
 
+### 2h. THE LIVE CONFIGURATION, MEASURED PROPERLY (2026-08-07, supersedes §2g)
+
+Same window (2026-05-06 → 2026-08-04), 360 points, `include_oscillators` now following
+config (false) — i.e. the brain the bot actually runs. **168 trades. −31.61%. t = −2.69.
+Win rate 27.4%. PF 0.64. 7 of 8 pairs negative. Every clause of the §2f bar failed
+except sample size and pace.** The verdict is unchanged by the §2g correction.
+
+**Two claims in §2g were overstated and are withdrawn.** Both came from estimating the
+reward:risk ratio off *realised* outcomes, which is conditional on which level was hit
+and biased toward trades with nearer targets. `to_signal` lets the model choose its own
+R:R per trade (floor `min_rr` 1.35), so the ratio had to be measured unconditionally —
+from the declared `stop_loss`/`take_profit` in `logs/ai_replay.jsonl` across **all 443
+intended entries**, winners and losers alike:
+
+| | conditional (wrong) | unconditional (correct) |
+|---|---|---|
+| declared R:R | 1.59 | **2.26 mean / 2.00 median** |
+| random hit rate | 38.7% | **32.1%** |
+| live-config z | −3.44 | **−1.85 (p = 0.064)** |
+
+**The live decision layer's entries are statistically INDISTINGUISHABLE FROM RANDOM.**
+Not "worse than a coin flip" — that claim was an artifact of the biased estimator, it
+was wrong twice, and it does not survive correct measurement. (The oscillators-ON arm
+*does* stay significantly sub-random at z = −2.58, p = 0.010, which is independent
+corroboration that the memorised Bollinger-fade reflex is real and costly. Turning
+oscillators off changed *what* it traded — shorts fell from 53% to 36% of entries — but
+not *how well*: −0.306R vs −0.337R, t = +0.23, not significant.)
+
+**Why it still loses decisively, which is the finding that matters.** Per-trade
+economics at the measured geometry:
+
+- a **random** entry: `0.321 × 2.26 − 0.679 × 1 − 0.119 fees = −0.073R`
+- the **model**: **−0.306R** (t = −3.00 vs zero)
+- model minus random: −0.234R, t = −2.29 — marginally worse, but the headline is that
+  **random already loses.** The geometry plus costs is a −0.073R/trade tax, and the
+  model adds no directional information to pay it with.
+
+So the correct diagnosis is not "the AI is actively harmful." It is: **the AI has no
+measurable directional edge, and a coin flip cannot fund this cost structure.** That is
+a different and more tractable problem than an inverted signal.
+
+**The fade hypothesis registered in §2g is weakened, not strengthened.** Mirrored-level
+arithmetic gives `0.747 × 1 − 0.253 × 2.26 − 0.119 = +0.056R/trade` — thin, and resting
+entirely on a hit-rate deficit significant only at **p = 0.064**, derived from the same
+window that generated the idea. **Not actionable.** It would need the deficit to
+replicate on a held-out window first, and §2g's larger apparent edge was a product of
+the same estimator error.
+
+**Standing consequence (unchanged from §2f).** No prompt tuning to make a window turn
+green. Round strategy competes on the risk and stability metrics that the DoraHacks
+page confirms are scored, alongside profit. The live paper book's calm equity curve is
+its exit machinery scratching losers, not entries earning.
+
+**Method note worth keeping:** the conditional-estimator trap bit twice in one session
+and in the same direction both times — toward a more dramatic conclusion. Any future
+"better/worse than random" claim in this repo must be computed from **declared** levels
+over **all** intended entries, never from realised winners.
+
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 
 - **bot** — paper trading, AI (DeepSeek) hourly decisions, maker-entry execution
