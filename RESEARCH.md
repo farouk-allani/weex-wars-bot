@@ -509,14 +509,44 @@ and adds variance. The round requires a **10-trade minimum**. Therefore:
 
 > **The optimal trade count is the smallest number that clears the minimum.**
 
-Current pace is far above it: **26.1 trades/14d in replay, 2.08/day live (≈14.6/week)**
-against a 10-per-round floor. Cutting toward the floor is the single highest-expectancy
-change available, and it improves *all three* scored dimensions at once — less bleed
-(profit), smaller cumulative exposure (risk), and a flatter curve (stability).
+**CORRECTED before acting on it — the first draft of this section had a unit error.**
+`risk.min_trades: 10` is per **weekly** round, so the floor is **10 per 7d**, not per
+14d. `run_ai_replay` reported "Trades / 14d" and compared it against 10, flattering
+pace by exactly 2× — it would have called a disqualifying book compliant. §2f bar #6
+inherited the same error. Both fixed; no recorded verdict changes, because every run
+so far cleared the stricter reading anyway.
+
+With the units right, the headroom is **modest, not large**:
+
+| | pace | vs 10/round floor |
+|---|---|---|
+| replay, live config | 168/90d = **13.1/round** | +31% |
+| live paper book | 2.08/day = **14.6/round** | +46% |
+
+So cutting to a safe ~11-12/round removes roughly **3 trades/week**, not the majority
+of them. At `max_risk_per_trade` 0.012 on $1,000, 1R ≈ $12, so the saving is bounded by:
+
+- at the observed −0.306R/trade: ~**$11/week**, ≈ **5.5% of the account** over 5 rounds
+- at the random-entry floor of −0.073R: ~**$2.6/week**, ≈ **1.3%**
+
+Real, worth taking, and nowhere near a fix. **The honest framing is that trade-count
+reduction is a cheap partial mitigation, not a strategy.** Cutting harder is not
+available: the 10-trade floor is a hard disqualification line and a quiet week needs
+buffer above it.
+
+The larger controllable term is inside the bleed itself. Of the −0.073R random-entry
+floor, **0.119R is fees and slippage measured in stop units** — so widening stops
+mechanically shrinks it (same cost over a larger denominator). `min_stop_atr` is
+currently 1.8 while `run_stop_width.py` found the optimum on a **2.0–2.5 plateau**
+across 8 pairs × 120d with both OOS halves agreeing. Moving to ~2.2 is the one config
+change already backed by prior out-of-sample measurement rather than by this window.
+**Not applied yet** — it interacts with the §2i trend-filter test, and both should be
+decided together once the held-out window reports.
 
 Note this inverts the §2 "round pace" note, which worried about trading *too little*.
 That was written when the edge sign was unknown. It is now measured, and the pace
-problem runs the other way.
+problem runs the other way — though by less than the first draft of this section
+claimed.
 
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 

@@ -28,7 +28,7 @@ T_BAR = 2.0            # bar #2
 T_BAR_DROP = 1.5       # bar #3
 SYMS_POSITIVE = 5      # bar #4
 PF_BAR = 1.25          # bar #5
-PACE_BAR = 10.0        # bar #6 — trades per 14d
+PACE_BAR = 10.0        # bar #6 — trades per WEEKLY round (risk.min_trades is per round)
 T_BAR_OOS = 1.0        # bar #7
 
 
@@ -83,7 +83,11 @@ def main():
     total = sum(pnls)
     t_all = tstat(pnls)
     pf = profit_factor(pnls)
-    pace = n / args.days * 14
+    # Per WEEKLY round, not per 14d. The bar as originally written in RESEARCH.md §2f
+    # said "10 per 14d", which inherited a 2x-too-lenient unit bug from the replay
+    # script. Corrected here and in §2j; it does not change any verdict already
+    # recorded, because every run so far cleared the stricter reading too.
+    pace = n / args.days * 7
 
     by_sym = defaultdict(list)
     for tr in trades:
@@ -139,7 +143,7 @@ def main():
             (f"#4 >= {SYMS_POSITIVE}/8 symbols net-positive",
              f"{n_positive}/8 ({len(by_sym)} traded)", n_positive >= SYMS_POSITIVE),
             (f"#5 profit factor >= {PF_BAR}", f"{pf:.2f}", pf >= PF_BAR),
-            (f"#6 pace >= {PACE_BAR}/14d", f"{pace:.1f}", pace >= PACE_BAR),
+            (f"#6 pace >= {PACE_BAR}/weekly round", f"{pace:.1f}", pace >= PACE_BAR),
         ]
 
     bt = Table(title="PRE-DECLARED BAR (RESEARCH.md §2f, registered before the run)")

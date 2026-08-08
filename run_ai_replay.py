@@ -348,8 +348,12 @@ def main():
     t.add_column("Metric"); t.add_column("Value", justify="right")
     t.add_row("Decision points", str(len(points)))
     t.add_row("Trades taken", str(len(trades)))
-    t.add_row("Trades / 14d (competition pace)",
-              f"{len(trades) / args.days * 14:.1f}")
+    # Rounds are WEEKLY and risk.min_trades is per round, so the pace that matters is
+    # per 7 days. This used to report per 14d and compare it against the 10 floor,
+    # which flattered pace by exactly 2x and would have called a disqualifying book
+    # compliant.
+    round_pace = len(trades) / args.days * 7
+    t.add_row("Trades / round (7d; floor 10)", f"{round_pace:.1f}")
     t.add_row("Hold rate", f"{len(holds) / max(len(results), 1) * 100:.0f}%")
     t.add_row("Rejected by guardrails", str(len(rejects)))
     t.add_row("", "")
@@ -365,10 +369,10 @@ def main():
     t.add_row("Shorts", f"{len(shorts)} ({sum(x['pnl'] for x in shorts):+.2f})")
     console.print(t)
 
-    if len(trades) / args.days * 14 < 10:
+    if round_pace < 10:
         console.print(
-            "[yellow]WARNING: pace is below the 10-trade minimum "
-            "— this would be disqualified.[/]"
+            f"[yellow]WARNING: {round_pace:.1f} trades per weekly round is below the "
+            "10-trade minimum — this would be disqualified.[/]"
         )
 
     # --- Does conviction predict anything? If not, there is no signal to select on. ---
