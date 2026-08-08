@@ -462,6 +462,62 @@ and in the same direction both times — toward a more dramatic conclusion. Any 
 "better/worse than random" claim in this repo must be computed from **declared** levels
 over **all** intended entries, never from realised winners.
 
+### 2i. PRE-DECLARED: held-out replication + the one filter worth testing (registered 2026-08-08, before the run)
+
+`--days 90 --every 6 --offset 90` — window ≈2026-02-05 → 2026-05-06, live config
+(oscillators follow config), model and prompt **unchanged** since §2h. This is the
+first `--offset` run since the truncation bug was fixed, so it is also the first
+genuinely out-of-sample window this repo has produced.
+
+**Question 1 — does "no edge" replicate?** §2h could still be one bad quarter.
+- **Overturned if** the held-out window returns PnL t ≥ +2.0. Then the §2f consequence
+  lifts and the whole no-edge reading is wrong.
+- **Confirmed if** t < 2.0 *and* the hit rate again sits within noise of its
+  geometry-implied random baseline (computed from **declared** levels over **all**
+  intended entries — never from realised winners, per §2h).
+
+**Question 2 — the trend-alignment filter.** §2h's live-config run split as
+**WITH 4h trend −0.20R (n=126)** vs **AGAINST/flat −0.63R (n=42)**. That is the only
+split in the data that looks like it separates anything. It was found *in* that window,
+so it is a hypothesis, not a result. Pre-declared bar, on the held-out window only:
+
+| # | Test | Pass condition |
+|---|------|----------------|
+| 1 | Separation is real | (WITH − AGAINST) avg R, **t ≥ 2.0** |
+| 2 | Direction holds | WITH-trend avg R > AGAINST avg R (sign must match §2h) |
+| 3 | Worth acting on | WITH-trend avg R > **−0.073R** (the random-entry bleed rate; a filter that still loses more than a coin flip is not a filter) |
+| 4 | Leaves a viable book | WITH-trend pace ≥ 10 trades/14d, so the round minimum is still reachable |
+
+**Pre-declared honesty clause: passing this does NOT produce an edge.** The best
+available outcome is *bleeding more slowly*. Clause 3 caps the claim deliberately — if
+WITH-trend comes back at, say, −0.05R, that is still a losing book, just a cheaper one.
+Nothing here may be described as an edge without clearing the §2f bar, which this test
+does not attempt.
+
+**Failing it changes nothing** — the §2f consequence is already in force. It only
+removes one candidate.
+
+### 2j. The arithmetic that needs no test: with no edge, trade count IS the strategy
+
+This does not require a held-out window because it is not an empirical claim about
+markets — it follows from §2h plus the round rules.
+
+With entries indistinguishable from random, expected PnL is `−n × bleed`, and the
+measured bleed floor is **−0.073R/trade** even for a perfect coin flip (geometry +
+fees), with the model realising −0.306R. Every additional trade has negative expectancy
+and adds variance. The round requires a **10-trade minimum**. Therefore:
+
+> **The optimal trade count is the smallest number that clears the minimum.**
+
+Current pace is far above it: **26.1 trades/14d in replay, 2.08/day live (≈14.6/week)**
+against a 10-per-round floor. Cutting toward the floor is the single highest-expectancy
+change available, and it improves *all three* scored dimensions at once — less bleed
+(profit), smaller cumulative exposure (risk), and a flatter curve (stability).
+
+Note this inverts the §2 "round pace" note, which worried about trading *too little*.
+That was written when the edge sign was unknown. It is now measured, and the pace
+problem runs the other way.
+
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 
 - **bot** — paper trading, AI (DeepSeek) hourly decisions, maker-entry execution
