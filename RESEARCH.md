@@ -497,6 +497,28 @@ does not attempt.
 **Failing it changes nothing** — the §2f consequence is already in force. It only
 removes one candidate.
 
+> **STATUS 2026-08-08: THIS TEST HAS NOT RUN. The first attempt is VOID.** All 360
+> calls returned `402 Insufficient Balance` — the DeepSeek account is out of credit.
+> Zero decisions were made. **No conclusion of any kind may be drawn from that run**,
+> and in particular the trend filter remains untested.
+>
+> The failure mode is the dangerous part and is now fixed. `AITrader.decide()` fails
+> closed, returning no decisions, so 360 consecutive API failures rendered as *"all
+> hold"* and the script printed a confident verdict: *"The model took ZERO trades
+> across the whole replay. It cannot reach the 10-trade minimum, so it would be
+> disqualified regardless of how good its reasoning reads."* That sentence describes a
+> model that was never asked a single question. It is the same silent-failure class as
+> the 16h dead-model outage in §2/[[ai-mode-silent-failure-modes]]: a fail-closed path
+> that is indistinguishable from a decision.
+>
+> `run_ai_replay` now raises on `trader.last_error` instead of scoring the point, and
+> aborts the whole run with exit code 2 if **any** point failed — a run that lost a
+> share of its decision points is not a smaller sample but a biased one, since API
+> failures are not randomly distributed in time. Verified against the live 402.
+>
+> **Blocked on: topping up the DeepSeek balance.** Re-run unchanged when credit is
+> available; the bar above stands as written and is not to be revised in the meantime.
+
 ### 2j. The arithmetic that needs no test: with no edge, trade count IS the strategy
 
 This does not require a held-out window because it is not an empirical claim about

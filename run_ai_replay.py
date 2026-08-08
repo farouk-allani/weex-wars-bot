@@ -18,6 +18,7 @@ construction — we are measuring the brain, not the book.
 
 import argparse
 import sys
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -243,6 +244,15 @@ def main():
         )
         decisions, _, _ = trader.decide(ctx)
 
+        # A failed call is NOT a hold. AITrader.decide() fails closed and returns no
+        # decisions, so an API outage renders as "all hold" and the run then reports a
+        # confident zero-trade verdict about a model that was never asked. That is how
+        # 360 x "402 Insufficient Balance" once printed as "the model took ZERO trades
+        # ... it would be disqualified". Surface it as an error and let the caller
+        # abort the run.
+        if getattr(trader, "last_error", None):
+            raise RuntimeError(f"AI call failed: {trader.last_error}")
+
         out = []
         for d in decisions:
             sym = str(d.get("symbol") or "")
@@ -299,6 +309,7 @@ def main():
         return out
 
     results = []
+    failures: list[str] = []
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(one_point, i): i for i in points}
         done = 0
@@ -321,7 +332,22 @@ def main():
                 else:
                     console.print(f"[dim]{done}/{len(points)}  all hold[/]")
             except Exception as e:
+                failures.append(str(e))
                 console.print(f"[red]point failed: {e}[/]")
+
+    # Abort rather than score a window the model was never actually asked about. A run
+    # that lost a meaningful share of its decision points is not a smaller sample, it
+    # is a biased one -- the failures are not randomly distributed in time.
+    if failures:
+        share = len(failures) / max(len(points), 1)
+        console.print(Panel(
+            f"[bold red]{len(failures)} of {len(points)} decision points FAILED "
+            f"({share:.0%}).[/]\n\nMost common: {Counter(failures).most_common(1)[0][0]}"
+            "\n\n[bold]No verdict is produced.[/] A failed AI call is not a hold, and "
+            "scoring the remainder would report a window the model never saw.",
+            title="Run aborted",
+        ))
+        sys.exit(2)
 
     trades = [r for r in results if r.get("traded")]
     holds = [r for r in results if not r.get("traded")]
