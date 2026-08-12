@@ -33,6 +33,7 @@
 | **Cascade CONTINUATION (trade WITH the flush)** | run_liq_forward `--since 2026-07-20 --direction with` | **PRE-DECLARED, judging on fresh data only** | Registered 2026-07-20 after the fade's −2.7t. Primary cell: $250k/180s, 60m, beta-neutral deduped episodes. Auto-evaluates every 8h on the VPS → `data/continuation_eval.txt`. NO backfitting to pre-07-20 data. |
 | 1h OHLCV entry families, re-judged under the FIXED exit geometry | run_entry_scan → run_entry_artifact_check | **DEAD** (2026-07-29) | 30 pre-declared cells (momentum/zscore/breakout/ema/rsi/vol-surge × both signs). 3 cleared "net>0 in full sample AND both OOS halves" — **all 3 died to beta + episode dedup**. See §2c. |
 | **Execution cost (not an edge — the controllable term)** | run_exit_lab / run_stop_width + 27 live trades | **SHIPPED** (2026-08-12) | Maker TP exits −17% cost drag; `min_stop_atr` 1.8→2.0 +$0.042/trade. Live fee load measured at **0.049R**, not the replay's 0.119R — which demotes §2j. See §2k. |
+| Longer hold horizon (was the search run in a 1h/3-day box?) | run_horizon_scan | **DEAD** (2026-08-12) | Full sample flattered it (49.9% vs shipped 53.5% break-even); OOS halves **48.1% vs 59.9%**, 14d cells exceed 100%. Basket drift + overlapping samples. Two harness defects found and fixed en route — see §2l. |
 
 **The recurring lesson:** significant IC/t-stat + negative gross PnL = artifact
 (bounce, beta, clustering). Demand *money*, in both halves, after maker cost,
@@ -700,6 +701,94 @@ operational failure that could have zeroed an entire round is instrumented.
 **Still blocked, unchanged:** §2i (held-out replication + trend filter) needs ~360 model
 calls and the balance is $4.60. It stays registered and unrun; the bar above it is not to
 be revised in the meantime.
+
+### 2l. "Was the search run inside a box?" — horizon KILLED, but two harness defects were real (2026-08-12)
+
+Prompted by the fair challenge *"a human trader could do a lot better."* The premise
+worth testing is not that the model is bad — it is that **every hypothesis on the
+scoreboard was judged inside one box: a 1h timeframe, a ~2 ATR stop, a 3-day cap.** If
+that box is not where cost is cheapest, then "edge < cost" was measured against the
+wrong cost. New tool: `run_horizon_scan.py`, sweeping stop width × hold horizon with
+break-even accuracy as the objective.
+
+**Stated plainly: this was exploratory, not pre-declared.** The hypothesis was formed
+and tested in the same session on the same data, which is precisely the setup that
+manufactured every artifact in §2b–§2c. The OOS half-split is what makes it reportable,
+and it is what killed it.
+
+**RESULT: FAILED, and not narrowly.** The full sample looked like a find — the shipped
+cell (2.0 ATR / 72 bars) needs **53.5%** accuracy, and 2.5 ATR / 168 bars needed
+**49.9%**, a 3.6-point saving. It does not replicate:
+
+| cell | full | 1st half | 2nd half |
+|---|---|---|---|
+| shipped 2.0 / 72 (3d) | 53.5% | 55.8% | **56.0%** |
+| best-looking 2.5 / 168 (7d) | 49.9% | 48.1% | **59.9%** |
+| 3.0 / 336 (14d) | 55.2% | 41.2% | **69.3%** |
+| 1.6 / 336 (14d) | 75.4% | 68.8% | **125.1%** |
+
+The winner was carried entirely by the first half, and the failure is **systematic**:
+every width degrades in the second half as the horizon lengthens, with the 14-day rows
+reaching break-evens above 100% — i.e. *no* directional accuracy pays. That is the
+basket-drift signature from §2c, where a −21.9% window manufactured loud results in both
+directions. Long holds with random sides are a bet on the window's drift, and the two
+halves drifted differently. Corroborating: n falls 4624 → 856 → 416 across the horizon
+columns, those samples **overlap** (42-bar step against a 168-bar hold) and sit across 8
+pairs at +0.64 median correlation, so effective independent n at the long end is ~50-70.
+One long-horizon cell even printed a **positive** net at p=0.50, which is impossible for
+a zero-alpha entry and is the clearest possible statement that the noise floor exceeded
+the effect.
+
+**Nothing is being changed on the strength of this. The horizon candidate is closed.**
+The most stable cell in the whole grid is the shipped one (55.8 / 56.0 across halves,
+a 0.2-point spread) — which is a mildly reassuring accident, not a result.
+
+**The durable output is two harness defects, both of which biased every prior verdict.**
+
+1. **`run_stop_width.py` was measuring R:R decay and calling it stop width.** It swept
+   with `replace(geom, stop_atr=w)`, which leaves `target_atr` at its 2.4 default — so
+   the 3.0 row was scored at an R:R of **0.80**, target nearer than stop. The live bot
+   never does this (`to_signal` scales the target with the stop). Re-run with R:R held
+   at 2.0, the **conclusion survives**: 2.0 and 2.5 still tie for the peak (0.5415 /
+   0.5421) and it declines past 3.0. **`min_stop_atr: 2.0` stands** — the confound
+   exaggerated the penalty beyond 2.5 without moving the optimum. Fixed in place.
+2. **`run_exit_lab.CURRENT` is the PRE-§2b geometry.** It is `Geometry()`'s defaults —
+   `be_trigger_r` 1.0, a fixed 0.6% trail, `trail=max()` taking the *tighter* — while
+   config has shipped 1.75 / 0.02 / looser since `d72a6c1`. **Every lab result quoted
+   since §2b was measured against exit rules the bot no longer runs**, and the tight
+   trail specifically truncates winners, which caps long-horizon cells before they can
+   resolve. Both tools now build an explicit `shipped_geometry()`. Re-running the
+   corrected baseline reproduces §2b's 54.8% at 53.5%, so the harness is calibrated.
+
+**The open lead this leaves, and it is the strongest one available: the cost bar has
+fallen 52% and no verdict has been re-judged against it.**
+
+| | round-trip cost |
+|---|---|
+| the scans that produced most "edge < cost" verdicts | **0.220%** |
+| after maker entries | 0.130% |
+| after maker exits (§2k) | **0.107%** |
+
+§2c already established this principle once — fixing the exits "legitimately reopens
+entry hypotheses that were rejected as edge < cost: the cost side of that comparison
+moved." It applies again. Concretely, the **one** signal that survived 2-year OOS
+validation on BTC+ETH+SOL (§2: sp500/vix 1d risk-off shock, **0.126%/trade**) crosses
+the line for the first time: dead at 0.220% (−0.094) and at 0.130% (−0.004), **+0.019%
+at 0.107%**.
+
+**That is not a result and must not be quoted as one.** +0.019%/trade is far inside the
+error on a 0.126% estimate, and §2's own framing calls that signal "real but weak." It is
+a *candidate* — and unlike everything else on the board it already carries an
+out-of-sample pass. If anything gets a pre-declared re-test next, it is this, at a daily
+horizon, with the §2c artifact scrub (beta-neutral + episode dedup) applied before any
+claim. **Do not enable it in config first.**
+
+Second untested direction, named here so it is not lost: **decision TIMING**. Every test
+in this repo — and the live bot — samples entries on a clock (`--every 6`, `--every 8`,
+hourly). Nothing has tested conditioning the decision *moment* on an event. The
+collectors already record ~5k real forced orders/day. That is a different question from
+the continuation rule in §2, which tested a mechanical trade at the event; this would
+test whether the decision layer does better when asked at an event than at a random tick.
 
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 

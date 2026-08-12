@@ -27,11 +27,44 @@ from run_exit_lab import make_oracle, run
 
 WIDTHS = [0.8, 1.0, 1.2, 1.6, 2.0, 2.5, 3.0]
 SEEDS = [7, 11, 23, 41]
+
+# Reward:risk is held CONSTANT as the stop moves. Corrected 2026-08-12: this file
+# used to sweep width with `replace(geom, stop_atr=w)` alone, which leaves
+# `target_atr` at its 2.4 default — so the 3.0 row was scored at an R:R of 0.80,
+# the target sitting NEARER than the stop. That is not what the live bot does:
+# AITrader.to_signal scales the target with the stop precisely so the model's
+# intended R:R survives widening. The old sweep was measuring R:R decay at the
+# wide end and reading it as a stop-width effect.
+#
+# Re-measured with the target scaled, the conclusion SURVIVES — 2.0 (0.5415) and
+# 2.5 (0.5421) still tie for the peak and it declines past 3.0 — so `min_stop_atr:
+# 2.0` stands. The confound exaggerated the penalty beyond 2.5 without moving the
+# optimum. Kept as a warning: an unscaled `replace` on one geometry field can
+# silently change a second one.
+TARGET_RR = 2.0
+
+
+# lab.CURRENT is Geometry()'s DEFAULTS, i.e. the PRE-§2b exit rules (be_trigger_r
+# 1.0, a fixed 0.6% trail, trail=max() taking the tighter). config.yaml has shipped
+# 1.75 / 0.02 / looser since d72a6c1, so the old baseline here was a geometry the
+# bot no longer runs — and the tight trail it modelled truncates winners early.
+def shipped_geometry():
+    return replace(
+        lab.CURRENT, name="current", partial_enabled=False, be_trigger_r=1.75,
+        trail_pct=0.02, trail_act=0.012, chand_atr=2.3, trail_takes_tighter=False,
+    )
+
+
 GEOMS = {
-    "current": lab.CURRENT,
-    "pure_bracket": replace(lab.CURRENT, name="pure_bracket", partial_enabled=False,
-                            be_trigger_r=99, trail_act=99),
+    "current": shipped_geometry(),
+    "pure_bracket": replace(shipped_geometry(), name="pure_bracket",
+                            partial_enabled=False, be_trigger_r=99, trail_act=99),
 }
+
+
+def at_width(g, w: float):
+    """Widen the stop AND carry the target with it, so only width changes."""
+    return replace(g, stop_atr=w, target_atr=TARGET_RR * w)
 
 
 def mean_net(g, key: str, seeds=SEEDS) -> float:
@@ -62,8 +95,8 @@ def main():
     for w in WIDTHS:
         n = notional_at(w)
         capped = "YES" if n >= lab.EQUITY * lab.MAX_POSITION_PCT - 1e-9 else ""
-        g_cur = replace(GEOMS["current"], stop_atr=w)
-        g_pure = replace(GEOMS["pure_bracket"], stop_atr=w)
+        g_cur = at_width(GEOMS["current"], w)
+        g_pure = at_width(GEOMS["pure_bracket"], w)
         flat = mean_net(g_cur, "_flat", seeds=SEEDS[:2])
         a = mean_net(g_cur, "_p")
         b = mean_net(g_pure, "_p")
@@ -88,7 +121,7 @@ def main():
 
     print(f"{'stop_atr':>9}{'1st half':>12}{'2nd half':>12}{'full':>12}")
     for w in WIDTHS:
-        g = replace(GEOMS["pure_bracket"], stop_atr=w)
+        g = at_width(GEOMS["pure_bracket"], w)
         lab.load_pair = halved("first")
         a = mean_net(g, "_p", seeds=SEEDS[:2])
         lab.load_pair = halved("second")
@@ -104,7 +137,7 @@ def main():
     prefer_wide = 0
     for p in all_pairs:
         lab.PAIRS = [p]
-        vals = [mean_net(replace(GEOMS["pure_bracket"], stop_atr=w), "_p", seeds=SEEDS[:2])
+        vals = [mean_net(at_width(GEOMS["pure_bracket"], w), "_p", seeds=SEEDS[:2])
                 for w in WIDTHS]
         lab.PAIRS = all_pairs
         best = WIDTHS[int(np.argmax(vals))]
