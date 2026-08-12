@@ -64,6 +64,13 @@ class ExchangeClient:
         # A resting limit only fills when the market trades THROUGH it — a touch
         # leaves us at the back of the queue with nothing done. Measured in ticks.
         self.fill_through_ticks = float(exec_cfg.get("paper_fill_through_ticks", 1))
+        # Rest the take-profit leg as a post-only limit instead of firing a market
+        # order at it. A TP is a FAVOURABLE price by construction — for a long it
+        # sits above the market — so a limit there can never cross the spread and
+        # is maker by definition. Until 2026-08-12 it was placed as
+        # `take_profit_market`, i.e. we paid taker + slippage to exit at a price we
+        # had already chosen and could simply have rested at.
+        self.maker_exits = bool(exec_cfg.get("maker_exits", True))
         self.balance = float(bt.get("initial_capital", 10000))
         self.paper_positions: dict[str, Position] = {}
         self.paper_trades: list = []
@@ -403,15 +410,35 @@ class ExchangeClient:
 
         if take_profit and take_profit > 0:
             tp_side = "sell" if side == Side.LONG else "buy"
-            try:
-                self.exchange.create_order(
-                    symbol, "take_profit_market", tp_side, amount,
-                    params={"stopPrice": take_profit, "reduceOnly": True},
-                )
-                tp_ok = True
-            except Exception as e:
-                tp_err = str(e)
-                print(f"[Exchange] WARNING: TP order failed for {symbol}: {e}")
+            # A take-profit is a favourable price by construction, so a limit there
+            # rests as maker and cannot cross the spread. `take_profit_market` paid
+            # taker + slippage to reach a price we had already named. Post-only, so
+            # the venue rejects rather than silently converting us to a taker if the
+            # market has already moved past it.
+            placed = False
+            if self.maker_exits:
+                try:
+                    self.exchange.create_order(
+                        symbol, "limit", tp_side, amount, take_profit,
+                        params={"reduceOnly": True, "postOnly": True},
+                    )
+                    placed = tp_ok = True
+                except Exception as e:
+                    # Not fatal, and not worth failing the entry over: fall back to
+                    # the old stop-market so the position is never left without a
+                    # venue-side TP. Softer money beats an unprotected position.
+                    tp_err = f"maker TP rejected ({e}); fell back to stop-market"
+                    print(f"[Exchange] NOTE: maker TP rejected for {symbol}: {e}")
+            if not placed:
+                try:
+                    self.exchange.create_order(
+                        symbol, "take_profit_market", tp_side, amount,
+                        params={"stopPrice": take_profit, "reduceOnly": True},
+                    )
+                    tp_ok = True
+                except Exception as e:
+                    tp_err = str(e)
+                    print(f"[Exchange] WARNING: TP order failed for {symbol}: {e}")
 
         return sl_ok, tp_ok, sl_err, tp_err
 
@@ -751,7 +778,32 @@ class ExchangeClient:
             "fees_paid": position.fees_paid,
         }
 
-    def close_position(self, symbol: str) -> dict:
+    def maker_exit_price(self, position: Position, last: float) -> Optional[float]:
+        """The TP price, if a post-only limit resting there would have filled.
+
+        Same trade-through test as `check_entry_fill`, and for the same reason: a
+        touch is not a fill. The sides mirror the entry case — the exit leg of a
+        long is a SELL, so it needs `last >= tp + ticks`; the exit of a short is a
+        BUY and needs `last <= tp - ticks`.
+
+        Returns None when the rule is off, the position has no TP, or price has
+        only touched it — and None means the caller takes the ordinary taker close.
+        That asymmetry is deliberate: a maker exit is an OPPORTUNITY to save the
+        spread, never a reason to leave a position open longer than the geometry
+        says. If we cannot prove the resting fill, we pay to get out.
+        """
+        if not self.maker_exits:
+            return None
+        tp = float(getattr(position, "take_profit", 0) or 0)
+        if tp <= 0 or last <= 0:
+            return None
+        through = self.fill_through_ticks * self._tick_size(position.symbol, tp)
+        filled = last >= tp + through if position.side == Side.LONG else last <= tp - through
+        return tp if filled else None
+
+    def close_position(self, symbol: str, *, maker_price: Optional[float] = None) -> dict:
+        """Close at market, or — when `maker_price` is given — book the fill as a
+        resting limit that the caller has already proven would have executed."""
         if self.mode == "paper":
             if symbol not in self.paper_positions:
                 return {"closed": True, "reason": "no_position"}
@@ -761,8 +813,14 @@ class ExchangeClient:
             # Settle funding owed up to this instant before the position leaves the
             # book, or a close that lands just after a boundary escapes the charge.
             self._settle_paper_funding(pos, mark, datetime.utcnow())
-            exit_price = self.apply_slippage(mark, pos.side, is_exit=True)
-            fee = pos.size * exit_price * self.commission_rate
+            if maker_price:
+                # Our own resting price, so no slippage: the fill cannot be worse
+                # than the limit. Charging the maker rate here is the whole saving.
+                exit_price = float(maker_price)
+                fee = pos.size * exit_price * self.maker_fee_rate
+            else:
+                exit_price = self.apply_slippage(mark, pos.side, is_exit=True)
+                fee = pos.size * exit_price * self.commission_rate
             pnl = pos.calculate_pnl(exit_price) - fee
             self.balance += pnl
             # `pnl` stays execution-only; funding already moved the balance as it
@@ -777,6 +835,7 @@ class ExchangeClient:
                 "exit_price": exit_price,
                 "fee": fee,
                 "funding": pos.funding_paid,
+                "maker": bool(maker_price),
             }
 
         try:

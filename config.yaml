@@ -31,7 +31,16 @@ ai:
   max_retries: 1
   # Consecutive failed calls before the bot is declared brain-dead: logs at ERROR
   # and fails the container healthcheck instead of holding forever in silence.
+  # NOTE this counter only governs TRANSIENT failures now. A 402/401/404 is
+  # terminal on the first occurrence and alarms immediately — see client.py
+  # TERMINAL_ERROR_KINDS.
   max_consecutive_failures: 3
+  # Provider credit watchdog. The account hit zero on 2026-08-07 22:19 and the bot
+  # sat blind for 65 hours (39% of a weekly round) before anyone noticed, because
+  # nothing watched the balance and /models answers fine at zero. GET /user/balance
+  # is free, so it is polled on this cadence and alarms BEFORE the wall, not after.
+  balance_warn_usd: 2.0
+  balance_check_hours: 6
   # Every call writes an AI log entry, trade or no trade. 60min keeps us far inside
   # the 8h inactivity rule even if several calls fail in a row.
   decision_interval_minutes: 60
@@ -41,9 +50,21 @@ ai:
   # 0.5 was low enough to be inert: live stops landed at 0.4-1.6x ATR and 7 of 20
   # trades were noise-stopped. Measured over 8 pairs x 120d with risk-based sizing,
   # both OOS halves agreeing, 7/8 pairs preferred >= 1.6x ATR and the optimum was a
-  # plateau at 2.0-2.5x (run_stop_width.py). 1.8 sits inside that plateau while
-  # still letting the model choose wider when it has reason to.
-  min_stop_atr: 1.8
+  # plateau at 2.0-2.5x (run_stop_width.py).
+  #
+  # 1.8 -> 2.0 on 2026-08-12. RESEARCH.md §2j proposed 2.2; measuring it properly
+  # says 2.0. The floor is NOT the realised stop — it only moves the trades that
+  # declare tighter. Over the 74 real entry decisions in logs/ai_decisions.jsonl the
+  # model declares a median 1.59x ATR stop, so each floor produces a distribution:
+  #   floor 1.8 -> widens 57% of entries, realised mean 2.03x, cost -$0.4622/trade
+  #   floor 2.0 -> widens 68%,            realised mean 2.15x, cost -$0.4205  (+0.042)
+  #   floor 2.2 -> widens 85%,            realised mean 2.30x, cost -$0.4197  (+0.043)
+  #   floor 2.5 -> widens 88%,            realised mean 2.56x, cost -$0.4184  (+0.044)
+  # (cost = each trade's effective width priced against run_stop_width.py's measured
+  # zero-alpha curve.) 2.0 captures 98% of the available gain while overriding the
+  # model's own choice on 17% fewer trades than 2.2 — the cheapest version of the
+  # change, not the largest-sounding one.
+  min_stop_atr: 2.0
   max_stop_atr: 4.0             # wider than this is not a trade
   # RSI/Bollinger/StochRSI/VWAP + edge_signals in the AI context. Measured: triggers
   # a memorised "fade to VWAP" reflex (~80% of decisions) with no PnL benefit in any
@@ -61,6 +82,18 @@ execution:
   entry_ttl_minutes: 45         # unfilled after this = the setup left without us; fine
   reprice_seconds: 180          # re-quote toward the touch at most this often
   max_chase_atr: 0.5            # never chase price further than this from the signal
+  # Rest the TAKE-PROFIT leg too, instead of firing a market order at a price we
+  # already chose. A TP is favourable by construction (above the market for a long),
+  # so a limit there is maker by definition and can never cross the spread — the old
+  # `take_profit_market` was paying taker 0.06% + 0.05% slippage for nothing.
+  # Measured on zero-alpha entries (run_exit_lab.py --entries random, n=4584):
+  # net/trade -1.2161 -> -1.0071, i.e. +$0.209/trade, a 17% cut in the cost drag.
+  # Stops stay taker — a stop crosses the book by construction and cannot rest.
+  # Paper applies the SAME trade-through test as maker entries, so a touch that
+  # reverses does not count as a fill; live places it post-only and falls back to
+  # the old stop-market if the venue rejects, so a position is never left with no
+  # venue-side TP.
+  maker_exits: true
   # Paper realism. Both default ON and exist to be turned OFF only when reproducing
   # a pre-2026-08-03 run, never to make a new result look better.
   paper_funding: true           # settle 00/08/16 UTC funding to the paper balance

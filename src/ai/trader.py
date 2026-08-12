@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ..core.models import Candle, Side, Signal
+from .client import classify_error
 
 SYSTEM_PROMPT = """You are the decision engine of a crypto perpetual-futures trading bot competing in the WEEX AI Wars hackathon.
 
@@ -148,6 +149,10 @@ class AITrader:
         # model look identical from the caller's side, and the caller needs to alarm
         # on one and not the other.
         self.last_error: Optional[str] = None
+        # Which CLASS of failure, so the engine can tell "the network hiccupped"
+        # from "the account is out of money". The second needs a human now; the
+        # first usually fixes itself by the next cycle.
+        self.last_error_kind: Optional[str] = None
 
     def decide(self, context: dict) -> tuple[list[dict], str, str]:
         """Call the model. Returns (raw_decisions, assessment, decision_id).
@@ -168,10 +173,12 @@ class AITrader:
             {"role": "user", "content": user_prompt},
         ]
         self.last_error = None
+        self.last_error_kind = None
         try:
             result = self.client.decide(SYSTEM_PROMPT, user_prompt)
         except Exception as e:
             self.last_error = str(e)
+            self.last_error_kind = getattr(e, "kind", None) or classify_error(e)
             decision_id = self.log.record(
                 model=self.client.model,
                 context=context,
@@ -189,8 +196,10 @@ class AITrader:
             assessment = parsed.get("market_assessment", "")
         except Exception as e:
             decisions, assessment = [], ""
-            # Unparseable output is a brain failure too, not a quiet market.
+            # Unparseable output is a brain failure too, not a quiet market. It is
+            # transient by nature — the next call gets a fresh sample.
             self.last_error = f"parse error: {e}"
+            self.last_error_kind = "transient"
             result["content"] += f"\n\n[PARSE ERROR: {e}]"
 
         decision_id = self.log.record(

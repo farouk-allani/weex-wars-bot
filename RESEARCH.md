@@ -1,6 +1,6 @@
 # RESEARCH.md — everything measured, built, and decided (do NOT start from zero)
 
-> Living document. Last full update: **2026-08-01**.
+> Living document. Last full update: **2026-08-12** (§2k).
 > Method for ALL hypotheses: measure IC/event-study → out-of-sample split → cost bar →
 > forward validation on fresh data → only then wire into the bot. Never trust one green cell.
 
@@ -32,6 +32,7 @@
 | Liquidation-cascade FADE (real forced orders) | run_liq_forward | **DEAD** (2026-07-20) | 89.5h, 15,393 real forced orders: raw fade "profit" (60m +0.18%, t 3.3) is **pure market beta** — beta-neutral deduped: −0.077%, t=−2.7 at $250k. Bigger flush → CONTINUES, not reverts. |
 | **Cascade CONTINUATION (trade WITH the flush)** | run_liq_forward `--since 2026-07-20 --direction with` | **PRE-DECLARED, judging on fresh data only** | Registered 2026-07-20 after the fade's −2.7t. Primary cell: $250k/180s, 60m, beta-neutral deduped episodes. Auto-evaluates every 8h on the VPS → `data/continuation_eval.txt`. NO backfitting to pre-07-20 data. |
 | 1h OHLCV entry families, re-judged under the FIXED exit geometry | run_entry_scan → run_entry_artifact_check | **DEAD** (2026-07-29) | 30 pre-declared cells (momentum/zscore/breakout/ema/rsi/vol-surge × both signs). 3 cleared "net>0 in full sample AND both OOS halves" — **all 3 died to beta + episode dedup**. See §2c. |
+| **Execution cost (not an edge — the controllable term)** | run_exit_lab / run_stop_width + 27 live trades | **SHIPPED** (2026-08-12) | Maker TP exits −17% cost drag; `min_stop_atr` 1.8→2.0 +$0.042/trade. Live fee load measured at **0.049R**, not the replay's 0.119R — which demotes §2j. See §2k. |
 
 **The recurring lesson:** significant IC/t-stat + negative gross PnL = artifact
 (bounce, beta, clustering). Demand *money*, in both halves, after maker cost,
@@ -521,6 +522,14 @@ removes one candidate.
 
 ### 2j. The arithmetic that needs no test: with no edge, trade count IS the strategy
 
+> **DEMOTED 2026-08-12 by §2k — read that first.** This section's conclusion rests on
+> the −0.073R random-entry bleed, and 0.119R of that was a *fee* term taken from the
+> replay harness rather than from the live book. Measured on 27 live trades the real
+> load is **0.049R**, which moves the bleed to ≈ −0.003R. The direction of the argument
+> survives; the magnitude does not. Trimming trade count now saves close to nothing and
+> still costs pace, which is a hard DQ line. Left in full below because the unit-error
+> correction inside it is still worth reading.
+
 This does not require a held-out window because it is not an empirical claim about
 markets — it follows from §2h plus the round rules.
 
@@ -569,6 +578,128 @@ Note this inverts the §2 "round pace" note, which worried about trading *too li
 That was written when the edge sign was unknown. It is now measured, and the pace
 problem runs the other way — though by less than the first draft of this section
 claimed.
+
+### 2k. The cost model was 2.4x too harsh, and the VPS was blind for 65 hours (2026-08-12)
+
+VPS audit, 9 days after §2e. Two findings, one operational and one that revises §2j's
+arithmetic. **Neither required a DeepSeek call** — both came from artifacts already on
+disk (`bot_state.json`, `logs/trading.log`, `logs/ai_decisions.jsonl`).
+
+**1. The decision layer was dead for 65 hours and nothing said so.** The DeepSeek
+account hit zero on **2026-08-07 22:19**; every hourly call returned `402 Insufficient
+Balance` until it was topped up at **2026-08-10 15:43**. 64 consecutive failures. The
+bot failed closed correctly — it opened nothing rather than trading blind, and there is
+an **80.2h hole in the trade history** (08-08 03:51 → 08-11 12:06) with no bad trades in
+it. That is the good half.
+
+The bad half is that this is the *third* instance of the class in
+[[ai-mode-silent-failure-modes]] (dead model id, swapped alias, now billing) and the
+third time it was found by a human looking rather than by an alarm. **In a weekly round,
+65h is 39% of the clock**, and at the observed 2.08 trades/day it would have cost ~5.6
+of the 10 required trades — a plausible disqualification, which scores worse than any
+drawdown.
+
+Three defects, all fixed:
+
+- **`validate_model()` could not see it.** The model-id preflight (built after the 16h
+  outage) calls `/models`, which answers perfectly well on a zero balance. Money is a
+  dependency that expires exactly like a model id, and nothing watched it. Now
+  `DeepSeekClient.check_balance()` polls `GET /user/balance` — **free, no tokens** — at
+  startup and every `ai.balance_check_hours` (6), alarming at `balance_warn_usd` (2.0)
+  *before* the wall. **At audit time the balance was $4.60**, i.e. this was days from
+  happening again.
+- **A 402 was retried like a network blip.** Each dead cycle burned its full retry
+  ladder against a wall that was not going to move. `classify_error()` now separates
+  `billing`/`auth`/`model` (terminal — a human must act) from `transient`, and terminal
+  kinds abort the ladder immediately.
+- **Worst: the alarm waited for `max_consecutive_failures`.** A 402 is terminal on the
+  *first* occurrence; making it clear a 3-strike counter bought two more hours of
+  silence and no information. Terminal kinds now fail the healthcheck and alert at n=1.
+  Alerts fire on the state *edge* (not once per cycle), land in `data/alerts.json` and
+  `/api/health`, and POST to `ALERT_WEBHOOK_URL` if it is set (opt-in, best-effort —
+  the repo carries no secret and an alerting outage must never stop the loop).
+
+**2. The replay charged 2.4x the fees the live book actually pays — which weakens §2j.**
+Measured over the 27 closed live trades: total fees **$7.35**, median notional **$349**
+(0.35x equity), realised round-trip cost **0.080% of notional**. Calibrating 1R from the
+stop exits themselves (7 `stop_loss` closes average **−$5.57**, i.e. a full stop, so
+1R ≈ $5.57 — *not* the $12 that `max_risk_per_trade: 0.012` implies, because conviction
+and the correlation budgets scale most positions to about half the cap):
+
+| | fee load per trade |
+|---|---|
+| `run_ai_replay` assumption (§2h) | **0.119R** |
+| live book, measured | **0.049R** |
+
+The replay charges taker on both legs plus slippage at a fixed notional; the live book
+pays maker on entry and sizes by risk. §2h flagged this as worth "~0.02R against a
+−0.34R average" and dismissed it, which was right for judging *that* verdict — the model
+still had no edge. But §2j then reused the same 0.119R to build the **−0.073R/trade
+random-entry bleed**, and that number is load-bearing for a strategy conclusion rather
+than an entry verdict. Substituting the measured fee load moves it to roughly **−0.003R
+— break-even.**
+
+**Consequence: "with no edge, trade count IS the strategy" is much weaker than §2j
+states.** Its own saving estimate (~$2.6/week at the random floor) was computed against a
+bleed 24x larger than the corrected one. Trimming trades to the minimum now saves close
+to nothing, while costing pace — which is both a hard DQ line and a scored stability
+input. **§2j is not overturned but it is demoted: it is a rounding error, not a
+strategy.** The honest statement of where the book stands is that the live cost structure
+is already near the point where a coin flip breaks even, and the binding problem remains
+the one §2 has always named — there is no entry edge.
+
+*Caveat, stated because §2h's own method note demands it:* the fee term is measured
+precisely (fees are deterministic and there are 27 of them). The gross term it is
+subtracted from is inherited from §2h's window and keeps that window's error bars. The
+live book's own per-trade result is **+0.030R at t = 0.34 (n=27, 95% CI −0.143..+0.202)**
+— consistent with zero edge and a small cost, and not distinguishable from anything else
+in that range. No edge is being claimed here.
+
+**3. Two cost changes shipped, both measured, neither touching entry logic.**
+
+| change | measured on | effect |
+|---|---|---|
+| **maker take-profit exits** | `run_exit_lab --entries random`, n=4584 | net/trade **−1.2161 → −1.0071**, +$0.209/trade (**−17% cost drag**) |
+| **`min_stop_atr` 1.8 → 2.0** | 74 real entry decisions × `run_stop_width` curve | **+$0.042/trade** |
+
+The TP leg was being placed as `take_profit_market` — a market order fired at a price we
+had *already chosen*. A take-profit is favourable by construction (above the market for a
+long), so a limit resting there is maker by definition and cannot cross the spread. We
+were paying taker 0.06% + 0.05% slippage for nothing. Now post-only, with the old
+stop-market kept as a fallback so a rejected post-only never leaves a position without a
+venue-side TP. **Paper applies the same trade-through test as maker entries** — §2e's
+lesson is that a touch is not a fill, and crediting a maker exit on a touch would be
+exactly the flattery that inflated the old entry fill rate. When the fill cannot be
+proven, the position takes the ordinary taker close; the rule is an opportunity to save
+the spread, never a reason to hold longer. Every close now logs `exit=maker|taker` so the
+realised rate is measured from the start rather than reconstructed later.
+
+**`min_stop_atr` went to 2.0, not the 2.2 §2j proposed, and the reason generalises: the
+floor is not the realised stop.** It only moves trades that declare tighter. Over the 74
+real entry decisions the model declares a median 1.59x ATR stop, so each floor yields a
+distribution, priced here against `run_stop_width.py`'s measured zero-alpha curve:
+
+| floor | widens | realised mean stop | modelled cost/trade | vs 1.8 |
+|---|---|---|---|---|
+| 1.8 (was) | 57% | 2.03x | −$0.4622 | — |
+| **2.0 (now)** | 68% | 2.15x | −$0.4205 | **+0.042** |
+| 2.2 (§2j) | 85% | 2.30x | −$0.4197 | +0.043 |
+| 2.5 | 88% | 2.56x | −$0.4184 | +0.044 |
+
+2.0 captures **98%** of the available gain while overriding the model's own choice on 17%
+fewer trades. Re-confirmed in the same run: 8/8 pairs prefer ≥1.6x, both OOS halves agree
+at 2.0+, and the tight-stop rows are *flattered* by `max_position_pct` truncating their
+size.
+
+**What none of this does.** It does not create alpha, and the §2f/§2h consequence stands
+unchanged: no prompt tuning to make a window turn green, and the round strategy still
+competes on risk and stability alongside profit. What changed is that the cost side —
+the one input fully under our control — is now ~19% cheaper per round trip, and the
+operational failure that could have zeroed an entire round is instrumented.
+
+**Still blocked, unchanged:** §2i (held-out replication + trend filter) needs ~360 model
+calls and the balance is $4.60. It stays registered and unrun; the bar above it is not to
+be revised in the meantime.
 
 ## 3. Live systems (VPS 45.88.191.129, docker compose: bot / dashboard / collectors)
 
@@ -680,6 +811,15 @@ VPS. Verify the fix, not just the bug.
    tune AI gating to multi-metric, **code freeze before round 1**.
 5. Watch DoraHacks for the official event link, round durations, metric weights,
    and task list; re-read rules for keepalive/wash-trading implications.
+6. **Keep the DeepSeek balance funded and watch the alert.** §2k: at $4.60 the account
+   is days from a repeat of the 65h outage, and a mid-round one costs the trade minimum
+   — a worse outcome than any drawdown this bot can produce. `/api/health` now carries
+   `ai_credit_balance`; set `ALERT_WEBHOOK_URL` on the VPS to get pushed the warning.
+7. **Set `competition.round_started`** at the top of each live round so `_trade_pace`
+   measures against the real clock instead of a trailing window.
+8. Re-measure the maker-exit fill rate from `exit=maker|taker` in `trading.log` once
+   there are enough TP exits — the offline +$0.209/trade assumes the limit always
+   fills, which is the optimistic bracket (§2e).
 
 ## 7. Where the numbers live
 

@@ -8,7 +8,9 @@
 
 import json
 import logging
+import os
 import time
+import urllib.request
 import yaml
 import signal as sig
 from datetime import datetime, timedelta
@@ -27,6 +29,7 @@ from ..indicators.technical import calculate_atr
 from ..utils.logger import setup_logger
 from ..utils.state import save_state, load_state, DEFAULT_STATE_PATH
 from ..ai import AITrader, DecisionLog, DeepSeekClient, build_context
+from ..ai.client import TERMINAL_ERROR_KINDS
 from ..ai.context import symbol_snapshot
 import numpy as np  # noqa: E402
 
@@ -114,6 +117,17 @@ class TradingEngine:
         self._ai_consecutive_failures = 0
         self._last_ai_success: datetime | None = None
         self.ai_health_path = self.state_path.parent / "ai_health.json"
+        # Provider credit. Measured 2026-08-12: the account hit zero on 08-07 and
+        # the bot sat blind for 65 hours — 39% of a weekly round — because nothing
+        # watched the one dependency that expires on a clock nobody reads. The
+        # model-id preflight could not see it: /models answers fine at zero balance.
+        self.ai_balance_warn_usd = float(ai_cfg.get("balance_warn_usd", 2.0))
+        self.ai_balance_check_hours = float(ai_cfg.get("balance_check_hours", 6))
+        self._ai_balance: dict | None = None
+        self._last_balance_check: datetime | None = None
+        # Alarm de-duplication: alert on the EDGE, not once per cycle. A brain-dead
+        # bot that pages every hour for three days trains you to ignore the page.
+        self._alerted_state: str | None = None
         # ai-log coverage, published next to it. Alarms on change, not every cycle.
         self.compliance_path = self.state_path.parent / "compliance.json"
         self._last_compliance_gap = -1
@@ -129,6 +143,9 @@ class TradingEngine:
             except Exception as e:
                 self.logger.error("AI MODEL VALIDATION FAILED: %s", e)
                 console.print(f"[bold red]AI model validation failed: {e}[/]")
+            # The second half of the preflight: is there money behind the key? Free
+            # to ask, and it is the check that the 65h outage needed.
+            self._check_ai_balance(client, force=True)
             self.ai = AITrader(self.config, client, self.decision_log)
             self.logger.info(
                 "AI decision layer active: model=%s interval=%smin alarm_after=%d failures",
@@ -356,6 +373,9 @@ class TradingEngine:
         self._last_ai_call = datetime.utcnow()
         self._record_ai_health(self.ai.last_error)
         self._record_compliance()
+        # Cheap, throttled, and on the success path too: the whole point is to see
+        # the balance falling while the bot is still working.
+        self._check_ai_balance()
 
         if self.ai.last_error:
             # Deliberately ERROR, not INFO. The previous outage was invisible because
@@ -644,6 +664,101 @@ class TradingEngine:
         except Exception as e:  # context enrichment must never break a cycle
             self.logger.warning("correlation context failed: %s", e)
 
+    def _check_ai_balance(self, client=None, *, force: bool = False) -> dict | None:
+        """Poll remaining provider credit, at most every `balance_check_hours`.
+
+        Deliberately cheap and deliberately separate from the decision call: the
+        point is to see the wall BEFORE we hit it, and a probe that only runs when
+        a decision fails is just a slower way of finding out too late.
+        """
+        client = client or (self.ai.client if self.ai else None)
+        if client is None or not hasattr(client, "check_balance"):
+            return None
+
+        now = datetime.utcnow()
+        if not force and self._last_balance_check is not None:
+            elapsed_h = (now - self._last_balance_check).total_seconds() / 3600.0
+            if elapsed_h < self.ai_balance_check_hours:
+                return self._ai_balance
+
+        result = client.check_balance()
+        self._last_balance_check = now
+        if result.get("error"):
+            # An unreachable balance endpoint is not evidence of an empty account;
+            # keep the last known reading rather than overwriting it with a blank.
+            self.logger.warning("AI balance check failed: %s", result["error"])
+            return self._ai_balance
+
+        self._ai_balance = result
+        bal, avail = result.get("balance"), result.get("available")
+        if avail is False or (bal is not None and bal <= 0):
+            self._alert(
+                "ai_credit_exhausted",
+                f"DeepSeek credit is EXHAUSTED (balance {bal} {result.get('currency') or ''}). "
+                "The bot cannot think and will not open a position until it is topped up.",
+            )
+        elif bal is not None and bal <= self.ai_balance_warn_usd:
+            self._alert(
+                "ai_credit_low",
+                f"DeepSeek credit is LOW: {bal} {result.get('currency') or ''} left "
+                f"(warn threshold {self.ai_balance_warn_usd}). "
+                "Top up before the next round — a mid-round outage costs the trade minimum.",
+            )
+        else:
+            self._clear_alert("ai_credit_low")
+            self._clear_alert("ai_credit_exhausted")
+            self.logger.info(
+                "AI balance OK: %s %s", bal, result.get("currency") or "",
+            )
+        return result
+
+    def _alert(self, key: str, message: str):
+        """Raise an operational alarm once per state transition.
+
+        Writes to `data/alerts.json` (the dashboard reads it) and, if
+        `ALERT_WEBHOOK_URL` is set, POSTs there. The webhook is opt-in because the
+        repo must not carry a secret, and it is best-effort because an alerting
+        outage must never stop the trading loop.
+        """
+        if self._alerted_state == key:
+            return
+        self._alerted_state = key
+        self.logger.critical("ALERT[%s] %s", key, message)
+        console.print(Panel.fit(f"[bold red]{message}[/]", title=f"ALERT: {key}"))
+
+        payload = {
+            "key": key,
+            "message": message,
+            "at": datetime.utcnow().isoformat() + "Z",
+            "bot": self.config.get("trading", {}).get("mode", "paper"),
+        }
+        try:
+            path = self.state_path.parent / "alerts.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            history = []
+            if path.exists():
+                history = json.loads(path.read_text() or "[]")
+            history.append(payload)
+            path.write_text(json.dumps(history[-50:], indent=1))
+        except Exception as e:
+            self.logger.warning("could not write alerts.json: %s", e)
+
+        url = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+        if not url:
+            return
+        try:
+            body = json.dumps({"text": f"[weex-bot] {message}", **payload}).encode()
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=10).close()
+        except Exception as e:
+            self.logger.warning("alert webhook failed: %s", e)
+
+    def _clear_alert(self, key: str):
+        if self._alerted_state == key:
+            self._alerted_state = None
+
     def _record_ai_health(self, error: str | None, *, decided: bool = True):
         """Publish decision-layer liveness so something outside the process can see it.
 
@@ -665,7 +780,12 @@ class TradingEngine:
                 self._ai_consecutive_failures = 0
                 self._last_ai_success = datetime.utcnow()
 
-        healthy = self._ai_consecutive_failures < self.ai_max_failures
+        kind = getattr(self.ai, "last_error_kind", None) if self.ai else None
+        # A billing wall, a revoked key or a retired model is terminal on the FIRST
+        # occurrence — waiting for three of them buys nothing but two more hours of
+        # blindness, and the counter was the reason the 65h outage stayed quiet.
+        terminal = bool(error) and kind in TERMINAL_ERROR_KINDS
+        healthy = (not terminal) and self._ai_consecutive_failures < self.ai_max_failures
         try:
             self.ai_health_path.parent.mkdir(parents=True, exist_ok=True)
             self.ai_health_path.write_text(json.dumps({
@@ -676,13 +796,29 @@ class TradingEngine:
                     self._last_ai_success.isoformat() + "Z" if self._last_ai_success else None
                 ),
                 "last_error": error,
+                "last_error_kind": kind,
+                "terminal": terminal,
+                "balance": self._ai_balance,
                 "model": self.ai.client.model if self.ai else None,
                 "updated_at": datetime.utcnow().isoformat() + "Z",
             }, indent=1))
         except Exception as e:  # never let telemetry break the trading loop
             self.logger.warning("could not write ai_health: %s", e)
 
-        if not healthy:
+        if terminal:
+            # Re-probe the balance so the alert carries the actual number rather
+            # than the reader having to go and look it up.
+            self._check_ai_balance(force=True)
+            self._alert(
+                f"ai_{kind}",
+                f"AI DECISION LAYER DOWN ({kind}): {error}. "
+                + {
+                    "billing": "Top up the DeepSeek account — the bot is blind until you do.",
+                    "auth": "The API key is rejected. Check DEEPSEEK_API_KEY in .env on the VPS.",
+                    "model": "The configured model id is gone. Update ai.model in config.yaml.",
+                }.get(kind, "Human intervention required."),
+            )
+        elif not healthy:
             self.logger.critical(
                 "AI DECISION LAYER DOWN: %d consecutive failures (>= %d). "
                 "The bot is holding everything and cannot trade. Last error: %s",
@@ -694,6 +830,10 @@ class TradingEngine:
                 f"{error}",
                 title="ALARM",
             ))
+        elif not error:
+            self._clear_alert("ai_billing")
+            self._clear_alert("ai_auth")
+            self._clear_alert("ai_model")
 
     def _record_compliance(self):
         """Publish ai-log coverage: every linked order must have an ai-log file.
@@ -1366,7 +1506,13 @@ class TradingEngine:
                     self._close_position(position, current_price, reason)
                 elif position.should_take_profit(current_price):
                     console.print(f"[green]Take-profit: {position.symbol}[/]")
-                    self._close_position(position, current_price, "take_profit")
+                    # Only the TP leg can be maker: it is the one exit whose price
+                    # we chose in advance and can rest at. Stops and trailing stops
+                    # cross the book by construction and stay taker.
+                    self._close_position(
+                        position, current_price, "take_profit",
+                        maker_price=self.exchange.maker_exit_price(position, current_price),
+                    )
                 elif position.should_trailing_stop(current_price):
                     console.print(f"[yellow]Trailing stop: {position.symbol}[/]")
                     self._close_position(position, current_price, "trailing_stop")
@@ -1375,8 +1521,15 @@ class TradingEngine:
                 console.print(f"[red]Error managing {position.symbol}: {e}[/]")
                 self.logger.exception("Manage %s: %s", position.symbol, e)
 
-    def _close_position(self, position: Position, current_price: float, reason: str):
-        result = self.exchange.close_position(position.symbol)
+    def _close_position(
+        self,
+        position: Position,
+        current_price: float,
+        reason: str,
+        *,
+        maker_price: float | None = None,
+    ):
+        result = self.exchange.close_position(position.symbol, maker_price=maker_price)
         if isinstance(result, dict) and result.get("error"):
             console.print(f"[red]   Close failed: {result['error']}[/]")
             return
@@ -1392,7 +1545,15 @@ class TradingEngine:
             final_leg = float(result["pnl"])
             exit_fee = float(result.get("fee") or 0.0)
         else:
-            exit_fee = position.size * exit_price * self.exchange.commission_rate
+            # Live: a proven maker exit rested at our own price, so it pays the
+            # maker rate. Charging taker here would understate the live book
+            # against the paper one and re-open the §2e comparability problem.
+            rate = (
+                self.exchange.maker_fee_rate
+                if maker_price
+                else self.exchange.commission_rate
+            )
+            exit_fee = position.size * exit_price * rate
             final_leg = position.calculate_pnl(exit_price) - exit_fee
 
         # Round trip = partial legs already banked + this leg, net of every fee
@@ -1447,10 +1608,15 @@ class TradingEngine:
 
         color = "green" if pnl >= 0 else "red"
         console.print(f"[{color}]   PnL: ${pnl:.2f} ({pnl_pct:.1f}%) — {reason}[/]")
+        # `exit=maker|taker` is what makes the maker-exit rule auditable after the
+        # fact. §2e's lesson was that a fill rate nobody measured turned out to be
+        # an artifact of the rule that granted it — so this one is recorded per
+        # trade from the start, not reconstructed later.
         self.logger.info(
-            "CLOSE %s %s pnl=%.2f banked=%.2f fees=%.4f reason=%s strategy=%s",
+            "CLOSE %s %s pnl=%.2f banked=%.2f fees=%.4f reason=%s strategy=%s exit=%s",
             position.symbol, position.side.value, pnl,
             position.realized_pnl, fees, reason, position.strategy,
+            "maker" if maker_price else "taker",
         )
         self._persist_state()
 

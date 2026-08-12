@@ -560,6 +560,13 @@ def health():
     ai = _sidecar("ai_health.json")
     comp = _sidecar("compliance.json")
     gap = comp.get("orders_without_ai_log")
+    # Provider credit, surfaced next to liveness because it is the dependency that
+    # took the bot down for 65h while every other field here stayed green.
+    bal = ai.get("balance") or {}
+    try:
+        alerts = json.loads((st.parent / "alerts.json").read_text() or "[]")
+    except Exception:
+        alerts = []
     return {
         "ok": True,
         "config_exists": _config_path().exists(),
@@ -572,6 +579,12 @@ def health():
         "ai_model": ai.get("model"),
         "ai_last_success": ai.get("last_success"),
         "ai_consecutive_failures": ai.get("consecutive_failures"),
+        "ai_error_kind": ai.get("last_error_kind"),
+        "ai_terminal_failure": ai.get("terminal"),
+        "ai_credit_balance": bal.get("balance"),
+        "ai_credit_currency": bal.get("currency"),
+        "ai_credit_available": bal.get("available"),
+        "recent_alerts": alerts[-5:],
         "compliance_ok": comp.get("compliant"),
         "orders_linked": comp.get("orders_linked"),
         "ai_logs_on_disk": comp.get("ai_logs_on_disk"),

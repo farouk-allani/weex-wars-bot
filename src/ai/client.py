@@ -23,6 +23,8 @@ bot that guesses when its brain is unreachable is worse than one that sits still
 import json
 import os
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -41,9 +43,44 @@ REASONING_MODELS = STRICT_REASONING_MODELS | {"deepseek-v4-pro", "deepseek-v4-fl
 # 8-symbol decision object is ~700 tokens; the rest is the model's reasoning.
 MIN_REASONING_TOKENS = 8000
 
+# Error classes that RETRYING CANNOT FIX. Measured 2026-08-12: the account ran out
+# of credit on 08-07 22:19 and every hourly call 402'd for 65 hours until someone
+# happened to top it up. Each of those cycles burned its full retry ladder first.
+# Retries exist for a flaky network; a billing wall, a revoked key or a retired
+# model id are all human-intervention states, and treating them as transient
+# costs latency, hides the diagnosis behind a generic "failed after N attempts",
+# and — worst — makes them wait for the consecutive-failure counter before anyone
+# is told. They are separated here so the engine can alarm on the FIRST one.
+TERMINAL_ERROR_KINDS = {"billing", "auth", "model"}
+
+
+def classify_error(exc: Exception) -> str:
+    """Map a provider exception to billing / auth / model / transient.
+
+    Matches on HTTP status where the SDK exposes it and falls back to message
+    text, because the OpenAI-compatible shim does not guarantee a typed error for
+    every provider-specific condition (DeepSeek returns its billing wall as a bare
+    402 with `code: invalid_request_error`, which is indistinguishable from a bad
+    request by type alone).
+    """
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    text = str(exc).lower()
+
+    if status == 402 or "insufficient balance" in text or "quota" in text:
+        return "billing"
+    if status in (401, 403) or "invalid api key" in text or "authentication" in text:
+        return "auth"
+    if status == 404 or "does not exist" in text or "model not found" in text:
+        return "model"
+    return "transient"
+
 
 class AIError(Exception):
-    pass
+    """Provider failure. `kind` is one of billing / auth / model / transient."""
+
+    def __init__(self, message: str, kind: str = "transient"):
+        super().__init__(message)
+        self.kind = kind
 
 
 class DeepSeekClient:
@@ -59,11 +96,16 @@ class DeepSeekClient:
         if not api_key:
             raise AIError(
                 "DEEPSEEK_API_KEY is not set. Add it to .env — the bot will not "
-                "trade without a reachable decision model."
+                "trade without a reachable decision model.",
+                "auth",
             )
+        # Kept for check_balance(), which talks to a REST path the chat SDK does
+        # not model.
+        self.api_key = api_key
+        self.base_url = ai.get("base_url", DEFAULT_BASE_URL)
         self.client = OpenAI(
             api_key=api_key,
-            base_url=ai.get("base_url", DEFAULT_BASE_URL),
+            base_url=self.base_url,
             timeout=self.timeout,
         )
 
@@ -99,7 +141,8 @@ class DeepSeekClient:
             raise AIError(
                 f"configured ai.model={self.model!r} no longer exists at the "
                 f"provider. Available: {', '.join(models)}. "
-                f"Update ai.model in config.yaml."
+                f"Update ai.model in config.yaml.",
+                "model",
             )
         return models
 
@@ -131,6 +174,7 @@ class DeepSeekClient:
             kwargs["response_format"] = {"type": "json_object"}
 
         last_err: Optional[Exception] = None
+        last_kind = "transient"
         for attempt in range(self.max_retries + 1):
             started = time.time()
             try:
@@ -153,10 +197,54 @@ class DeepSeekClient:
                 }
             except Exception as e:
                 last_err = e
+                last_kind = classify_error(e)
+                # A billing wall, a dead key or a retired model will still be there
+                # in two seconds. Stop immediately so the engine gets the diagnosis
+                # on the first cycle instead of after the full ladder.
+                if last_kind in TERMINAL_ERROR_KINDS:
+                    raise AIError(f"DeepSeek {last_kind} error: {last_err}", last_kind) from e
                 if attempt < self.max_retries:
                     time.sleep(2 ** attempt)
 
-        raise AIError(f"DeepSeek call failed after {self.max_retries + 1} attempts: {last_err}")
+        raise AIError(
+            f"DeepSeek call failed after {self.max_retries + 1} attempts: {last_err}",
+            last_kind,
+        )
+
+    def check_balance(self) -> dict[str, Any]:
+        """Query remaining provider credit. Free — no tokens are billed for this.
+
+        This is the probe that would have caught the 65h outage on its first hour.
+        `validate_model()` already guards a retired model id, but a listing call
+        succeeds perfectly well on a zero balance, so the existing preflight was
+        blind to the one failure that actually happened. Money is a dependency that
+        expires exactly like a model id, and it expires with no warning at all.
+
+        Returns {available, balance, currency, checked_at} or {error} — never
+        raises, because a telemetry probe must not be able to stop a trading loop.
+        """
+        url = self.base_url.rstrip("/") + "/user/balance"
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:  # network, auth, schema — all just "unknown balance"
+            return {"error": str(e), "checked_at": time.time()}
+
+        infos = payload.get("balance_infos") or []
+        primary = infos[0] if infos else {}
+        try:
+            balance = float(primary.get("total_balance"))
+        except (TypeError, ValueError):
+            balance = None
+        return {
+            "available": bool(payload.get("is_available")),
+            "balance": balance,
+            "currency": primary.get("currency"),
+            "checked_at": time.time(),
+        }
 
     @staticmethod
     def parse_json(content: str) -> dict:

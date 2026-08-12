@@ -599,4 +599,114 @@ assert _legs[0].symbol == "BTC/USDT:USDT" and _legs[0].side == Side.LONG
 assert _legs[0].entry_price == 100.0 and _legs[0].stop_loss == 96.0
 print("pending->leg conversion OK (limit-priced, junk skipped not crashed)")
 
+print("\n=== A TERMINAL AI ERROR ALARMS ON THE FIRST ONE ===")
+# The account ran out of credit on 2026-08-07 22:19 and the bot sat blind for 65
+# hours. Two separate defects made that possible: a 402 was retried like a network
+# blip, and it then had to clear a 3-strike counter before anything shouted. In a
+# weekly round that outage is 39% of the clock and the 10-trade minimum with it.
+from src.ai.client import classify_error, TERMINAL_ERROR_KINDS, AIError
+
+
+class _ProviderError(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status_code = status
+
+
+# The exact string the live log recorded, 64 times.
+_real_402 = _ProviderError(
+    "Error code: 402 - {'error': {'message': 'Insufficient Balance', "
+    "'type': 'unknown_error', 'param': None, 'code': 'invalid_request_error'}}",
+    402,
+)
+assert classify_error(_real_402) == "billing", classify_error(_real_402)
+assert classify_error(_ProviderError("invalid api key", 401)) == "auth"
+assert classify_error(_ProviderError("Model does not exist", 404)) == "model"
+# A timeout must stay retryable, or one flaky minute becomes a page.
+assert classify_error(_ProviderError("Connection timed out")) == "transient"
+assert classify_error(_ProviderError("Bad gateway", 502)) == "transient"
+assert TERMINAL_ERROR_KINDS == {"billing", "auth", "model"}
+assert AIError("x", "billing").kind == "billing"
+assert AIError("x").kind == "transient", "default must be the retryable one"
+
+
+class _FakeEngine:
+    """The two health branches, isolated from the trading loop."""
+    def __init__(self, kind):
+        self.kind = kind
+        self.alerts = []
+
+    def terminal(self):
+        return self.kind in TERMINAL_ERROR_KINDS
+
+    def healthy(self, consecutive, maxf=3):
+        return (not self.terminal()) and consecutive < maxf
+
+
+# One 402 is enough: unhealthy immediately, without waiting for the counter.
+assert _FakeEngine("billing").healthy(consecutive=1) is False, "402 must not wait for 3 strikes"
+# A single timeout is not: that is what the counter is for.
+assert _FakeEngine("transient").healthy(consecutive=1) is True
+assert _FakeEngine("transient").healthy(consecutive=3) is False
+print("terminal-error escalation OK (402 alarms at n=1, timeout still needs 3)")
+
+print("\n=== A TOUCHED TAKE-PROFIT IS NOT A MAKER FILL ===")
+# Maker TP exits save taker + slippage on the one leg whose price we chose in
+# advance. But §2e's lesson applies unchanged: a touch is not a fill. If the rule
+# credited a maker exit on a touch it would be the same flattery that inflated the
+# old entry fill rate — so it reuses the trade-through test, and when it cannot
+# prove the fill the position takes the ordinary taker close instead.
+_mx = ExchangeClient.__new__(ExchangeClient)
+_mx.mode = "paper"
+_mx.maker_exits = True
+_mx.fill_through_ticks = 1
+_mx._tick_size = lambda symbol, ref: 0.1
+
+_long = Position(symbol="BTC/USDT:USDT", side=Side.LONG, size=0.5, entry_price=100.0,
+                 stop_loss=96.0, take_profit=120.0, leverage=5, strategy="t")
+assert _mx.maker_exit_price(_long, 119.9) is None, "below TP must not fill"
+assert _mx.maker_exit_price(_long, 120.0) is None, "an exact touch is not a fill"
+assert _mx.maker_exit_price(_long, 120.05) is None, "inside one tick is not a fill"
+assert _mx.maker_exit_price(_long, 120.1) == 120.0, "a full tick through fills, at OUR price"
+
+# Shorts mirror: the exit leg is a BUY, so it needs price BELOW the TP.
+_short = Position(symbol="BTC/USDT:USDT", side=Side.SHORT, size=0.5, entry_price=100.0,
+                  stop_loss=104.0, take_profit=80.0, leverage=5, strategy="t")
+assert _mx.maker_exit_price(_short, 80.0) is None, "an exact touch is not a fill"
+assert _mx.maker_exit_price(_short, 79.9) == 80.0, "a full tick through fills"
+
+# The flag genuinely disables it, and a position with no TP cannot claim one.
+_mx.maker_exits = False
+assert _mx.maker_exit_price(_long, 130.0) is None, "disabled means disabled"
+_mx.maker_exits = True
+_no_tp = Position(symbol="BTC/USDT:USDT", side=Side.LONG, size=0.5, entry_price=100.0,
+                  stop_loss=96.0, take_profit=0, leverage=5, strategy="t")
+assert _mx.maker_exit_price(_no_tp, 130.0) is None
+
+# And the saving is real: the same close booked maker vs taker.
+_mx.maker_fee_rate, _mx.commission_rate, _mx.slippage_pct = 0.0002, 0.0006, 0.0005
+_mx.paper_funding_enabled = False
+_mx._settle_paper_funding = lambda *a, **k: None
+_mx.fetch_ticker = lambda symbol: {"last": 120.1}
+_mx.balance = 1000.0
+_mx.paper_trades = []
+_mx.paper_positions = {"BTC/USDT:USDT": _long}
+_maker = _mx.close_position("BTC/USDT:USDT", maker_price=120.0)
+_mx.balance = 1000.0
+_mx.paper_trades = []
+_mx.paper_positions = {"BTC/USDT:USDT": _long}
+_taker = _mx.close_position("BTC/USDT:USDT")
+assert _maker["maker"] is True and _taker["maker"] is False
+assert _maker["fee"] < _taker["fee"], (_maker["fee"], _taker["fee"])
+# The maker fills at OUR limit exactly. The taker fills at the polled mark less
+# slippage — which here is 120.04, i.e. slightly ABOVE the TP, because the 60s poll
+# caught price a tick past it. That overshoot is luck and cuts both ways; the
+# reliable saving is the rate, 0.06%+0.05% slippage against 0.02%.
+assert _maker["exit_price"] == 120.0
+assert abs(_taker["exit_price"] - 120.1 * (1 - 0.0005)) < 1e-9, _taker["exit_price"]
+assert _taker["fee"] / _maker["fee"] > 2.9, "the taker leg should cost ~3x the maker leg"
+assert _maker["pnl"] > _taker["pnl"], (_maker["pnl"], _taker["pnl"])
+print(f"maker TP exit OK (fee {_taker['fee']:.4f} -> {_maker['fee']:.4f}, "
+      f"pnl +{_maker['pnl'] - _taker['pnl']:.4f} on this exit)")
+
 print("\n=== ALL TESTS PASSED ===")
