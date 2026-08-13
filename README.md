@@ -109,6 +109,8 @@ docker compose up -d --build
 - Resting live entries carry an atomic venue stop
 - Live closes are accounted from the actual taker/maker result
 - Official `UploadAiLog` delivery is durable and blocks new live entries on a gap
+- Live readiness requires authenticated funds and a successful no-order AI-log
+  allowlist probe; populated environment variables alone cannot turn the gate green
 - Dashboard/deploy health fails on stale AI, compliance, or execution state
 - **Walk-forward** mode comparison (`run_walk_forward.py`)
 - **Wick quality** boosts size (not a hard gate)
@@ -129,8 +131,10 @@ docker compose up -d --build
 
 1. `python paper_checklist.py`  
 2. `python -m src.main` (mode: paper)  
-3. `python check_ready.py --target live` while mode is still `paper`
-4. Verify the account is on the AI Wars allowlist
+3. `python probe_ai_log.py` (uploads the latest authentic decision with
+   `orderId: null`; it cannot place an order)
+4. `python check_ready.py --target live` while mode is still `paper`; this makes
+   read-only private calls and requires positive USDT futures balance
 5. Supervise one minimum-notional live rehearsal: venue SL visible and UploadAiLog successful
 6. Return to paper if either check fails; never retry the trade to retry a log
 7. Arm live only after the rehearsal and watch the first three round trips

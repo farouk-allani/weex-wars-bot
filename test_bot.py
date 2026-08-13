@@ -908,7 +908,9 @@ _payload = {
 _ai_file = _upload_root / "ai.json"
 _ai_file.write_text(json.dumps(_payload), encoding="utf-8")
 _uploader = wars_log.WeexAILogUploader(
-    enabled=True, status_dir=_upload_root / "status"
+    enabled=True,
+    status_dir=_upload_root / "status",
+    allowlist_status_path=_upload_root / "allowlist.json",
 )
 _uploader.api_key = "k"
 _uploader.api_secret = "s"
@@ -931,7 +933,25 @@ assert _upload_status["uploaded"] is True
 assert _captured_request[0].full_url.endswith("/capi/v3/order/uploadAiLog")
 assert _captured_request[0].headers.get("Access-sign")
 assert _uploader.status()["pending"] == 0
-print("successful upload is recorded; retries can distinguish log delivery from trade execution")
+assert _uploader.status()["ready"] is False, "configured is not the same as allowlisted"
+_probe_decision = {
+    "model": "deepseek-v4-pro",
+    "messages": [{"role": "user", "content": "decide from this snapshot"}],
+    "context": {"markets": [{"symbol": "BTC/USDT:USDT", "price": 100}]},
+    "raw_response": json.dumps({
+        "market_assessment": "No edge.",
+        "decisions": [{"symbol": "BTC/USDT:USDT", "action": "hold"}],
+    }),
+}
+with patch.object(wars_log.request, "urlopen", _fake_urlopen):
+    _probe_status = _uploader.probe_allowlist(_probe_decision)
+assert _probe_status["verified"] is True
+assert _uploader.status()["ready"] is True
+assert len(_captured_request) == 2
+_probe_body = json.loads(_captured_request[1].data)
+assert _probe_body["orderId"] is None
+assert _probe_body["output"]["decisions"][0]["action"] == "hold"
+print("delivery and no-order allowlist probe are signed, durable, and independently gated")
 
 print("\n=== DASHBOARD HEALTH FAILS CLOSED ===")
 import os as _os

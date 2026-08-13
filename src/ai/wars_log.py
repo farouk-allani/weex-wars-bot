@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 
 AI_LOGS_DIR = Path("data/ai_logs")
 UPLOAD_STATUS_DIR = Path("data/ai_log_upload_status")
+ALLOWLIST_STATUS_PATH = Path("data/ai_log_allowlist_status.json")
 DEFAULT_UPLOAD_BASE = "https://api-contract.weex.com"
 UPLOAD_PATH = "/capi/v3/order/uploadAiLog"
 SUCCESS_CODES = {"0", "00000"}
@@ -219,11 +220,13 @@ class WeexAILogUploader:
         *,
         enabled: bool,
         status_dir: str | Path = UPLOAD_STATUS_DIR,
+        allowlist_status_path: str | Path = ALLOWLIST_STATUS_PATH,
         base_url: Optional[str] = None,
         timeout: float = 15.0,
     ) -> None:
         self.enabled = bool(enabled)
         self.status_dir = Path(status_dir)
+        self.allowlist_status_path = Path(allowlist_status_path)
         self.base_url = (base_url or os.getenv("WEEX_AI_API_BASE") or DEFAULT_UPLOAD_BASE).rstrip("/")
         self.timeout = float(timeout)
         self.api_key = os.getenv("WEEX_API_KEY", "")
@@ -281,6 +284,131 @@ class WeexAILogUploader:
             return self.upload(ai_log_path)
         return status
 
+    def _post_payload(self, payload: dict) -> tuple[bool, Optional[int], Optional[str]]:
+        """Sign and submit one payload, returning only non-secret delivery state."""
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        timestamp = str(int(time.time() * 1000))
+        message = f"{timestamp}POST{UPLOAD_PATH}{body}"
+        signature = base64.b64encode(
+            hmac.new(
+                self.api_secret.encode("utf-8"),
+                message.encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+        ).decode("ascii")
+        req = request.Request(
+            self.base_url + UPLOAD_PATH,
+            data=body.encode("utf-8"),
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "locale": "en-US",
+                "ACCESS-KEY": self.api_key,
+                "ACCESS-PASSPHRASE": self.passphrase,
+                "ACCESS-TIMESTAMP": timestamp,
+                "ACCESS-SIGN": signature,
+                "User-Agent": "weex-ai-wars-bot/1.0",
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout) as response:
+                http_status = response.status
+                raw = response.read().decode("utf-8", errors="replace")
+                response_payload = json.loads(raw)
+        except error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            return False, exc.code, f"HTTP {exc.code}: {raw[:500]}"
+        except Exception as exc:
+            return False, None, str(exc)
+
+        raw_code = response_payload.get("code")
+        code = str(raw_code) if raw_code is not None else ""
+        if code not in SUCCESS_CODES:
+            return False, http_status, (
+                f"WEEX code {code or '<missing>'}: "
+                f"{response_payload.get('msg') or response_payload.get('message') or 'unknown error'}"
+            )
+        return True, http_status, None
+
+    def probe_allowlist(self, decision: dict) -> dict:
+        """Prove AI-Wars allowlisting with an authentic no-order decision log.
+
+        WEEX explicitly permits ``orderId: null``.  This writes a compliance log
+        but cannot create/cancel an order or move funds.  A successful probe is
+        persisted and becomes a prerequisite for live uploader readiness, so the
+        first real order is never used to discover a missing UID allowlist entry.
+        """
+        status = {
+            "verified": False,
+            "last_attempt": datetime.now(timezone.utc).isoformat(),
+            "http_status": None,
+            "last_error": None,
+        }
+        config_error = self._configuration_error()
+        if config_error:
+            status["last_error"] = config_error
+            self._atomic_write(self.allowlist_status_path, status)
+            return status
+
+        try:
+            output = json.loads(decision.get("raw_response") or "{}")
+        except Exception:
+            output = {"decisions": decision.get("decisions") or []}
+        explanation = str(
+            output.get("market_assessment")
+            or decision.get("reasoning")
+            or "No-order AI decision compliance probe."
+        )[:1000]
+        payload = {
+            "orderId": None,
+            "stage": "Decision Making",
+            "model": decision.get("model") or "",
+            "input": {
+                "messages": decision.get("messages") or [],
+                "market_context": decision.get("context") or {},
+            },
+            "output": output,
+            "explanation": explanation,
+        }
+        missing = []
+        if not payload["model"]:
+            missing.append("model")
+        if not payload["input"]["messages"]:
+            missing.append("input.messages")
+        if not payload["input"]["market_context"]:
+            missing.append("input.market_context")
+        if not payload["output"]:
+            missing.append("output")
+        if missing:
+            status["last_error"] = "probe decision missing " + ", ".join(missing)
+        else:
+            ok, http_status, last_error = self._post_payload(payload)
+            status.update(
+                verified=ok,
+                http_status=http_status,
+                last_error=last_error,
+            )
+            if ok:
+                status["verified_at"] = datetime.now(timezone.utc).isoformat()
+        self._atomic_write(self.allowlist_status_path, status)
+        return status
+
+    def allowlist_status(self) -> dict:
+        if not self.enabled:
+            return {"required": False, "verified": True, "last_error": None}
+        row = self._read_json(self.allowlist_status_path)
+        return {
+            "required": True,
+            "verified": bool(row.get("verified")),
+            "last_attempt": row.get("last_attempt"),
+            "verified_at": row.get("verified_at"),
+            "http_status": row.get("http_status"),
+            "last_error": row.get("last_error") or (
+                None if row.get("verified") else "AI-Wars allowlist has not been verified"
+            ),
+        }
+
     def upload(self, ai_log_path: str | Path) -> dict:
         path = Path(ai_log_path)
         status_path = self._status_path(path)
@@ -310,50 +438,15 @@ class WeexAILogUploader:
             self._atomic_write(status_path, status)
             return status
 
-        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        timestamp = str(int(time.time() * 1000))
-        message = f"{timestamp}POST{UPLOAD_PATH}{body}"
-        signature = base64.b64encode(
-            hmac.new(
-                self.api_secret.encode("utf-8"),
-                message.encode("utf-8"),
-                hashlib.sha256,
-            ).digest()
-        ).decode("ascii")
-        req = request.Request(
-            self.base_url + UPLOAD_PATH,
-            data=body.encode("utf-8"),
-            method="POST",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "locale": "en-US",
-                "ACCESS-KEY": self.api_key,
-                "ACCESS-PASSPHRASE": self.passphrase,
-                "ACCESS-TIMESTAMP": timestamp,
-                "ACCESS-SIGN": signature,
-                "User-Agent": "weex-ai-wars-bot/1.0",
-            },
-        )
         try:
-            with request.urlopen(req, timeout=self.timeout) as response:
-                status["http_status"] = response.status
-                raw = response.read().decode("utf-8", errors="replace")
-                response_payload = json.loads(raw)
-            raw_code = response_payload.get("code")
-            code = str(raw_code) if raw_code is not None else ""
-            if code not in SUCCESS_CODES:
-                raise RuntimeError(
-                    f"WEEX code {code or '<missing>'}: "
-                    f"{response_payload.get('msg') or response_payload.get('message') or 'unknown error'}"
-                )
-            status["uploaded"] = True
-            status["uploaded_at"] = datetime.now(timezone.utc).isoformat()
-            status["last_error"] = None
-        except error.HTTPError as exc:
-            status["http_status"] = exc.code
-            raw = exc.read().decode("utf-8", errors="replace")
-            status["last_error"] = f"HTTP {exc.code}: {raw[:500]}"
+            uploaded, http_status, last_error = self._post_payload(payload)
+            status["http_status"] = http_status
+            if uploaded:
+                status["uploaded"] = True
+                status["uploaded_at"] = datetime.now(timezone.utc).isoformat()
+                status["last_error"] = None
+            else:
+                status["last_error"] = last_error
         except Exception as exc:
             status["last_error"] = str(exc)
         self._atomic_write(status_path, status)
@@ -380,6 +473,7 @@ class WeexAILogUploader:
         required = [r for r in rows if r.get("required")]
         pending = [r for r in required if not r.get("uploaded")]
         config_error = self._configuration_error()
+        allowlist = self.allowlist_status()
         return {
             "enabled": self.enabled,
             "configured": config_error is None,
@@ -388,7 +482,13 @@ class WeexAILogUploader:
             "uploaded": sum(1 for r in required if r.get("uploaded")),
             "pending": len(pending),
             "pending_items": pending[-10:],
-            "ready": (not self.enabled) or (config_error is None and not pending),
+            "allowlist": allowlist,
+            "allowlist_verified": bool(allowlist.get("verified")),
+            "ready": (not self.enabled) or (
+                config_error is None
+                and not pending
+                and bool(allowlist.get("verified"))
+            ),
         }
 
     def readiness(self) -> tuple[bool, str]:
@@ -397,4 +497,9 @@ class WeexAILogUploader:
             return True, "ready"
         if status.get("configuration_error"):
             return False, str(status["configuration_error"])
+        if not status.get("allowlist_verified"):
+            return False, str(
+                (status.get("allowlist") or {}).get("last_error")
+                or "AI-Wars allowlist has not been verified"
+            )
         return False, f"{status['pending']} WEEX AI-log upload(s) pending"

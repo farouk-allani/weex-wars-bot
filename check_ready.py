@@ -85,6 +85,73 @@ def main():
         except Exception as e:
             check("official WEEX AI-log delivery ready", False, str(e))
 
+        # Credentials being non-empty proves almost nothing.  These are private,
+        # read-only requests: they cannot place/cancel an order or move funds, but
+        # they distinguish a configured bot from an account that can actually run.
+        if key and secret and phrase:
+            try:
+                import ccxt
+
+                venue = ccxt.weex({
+                    "apiKey": key,
+                    "secret": secret,
+                    "password": phrase,
+                    "enableRateLimit": True,
+                    "options": {"defaultType": "swap"},
+                })
+                balance = venue.fetch_balance({"type": "swap"})
+                usdt = balance.get("USDT") or {}
+                total = float(usdt.get("total") or 0)
+                check(
+                    "authenticated WEEX futures balance",
+                    True,
+                    f"USDT total={total:.2f}",
+                )
+                check(
+                    "positive WEEX futures balance",
+                    total > 0,
+                    f"USDT total={total:.2f}; fund/transfer into USDT futures",
+                )
+
+                account_cfg = venue.contractprivate_get_capi_v3_account_accountconfig()
+                check(
+                    "WEEX account can trade futures",
+                    account_cfg.get("canTrade") is True,
+                    f"canTrade={account_cfg.get('canTrade')}",
+                )
+
+                response = venue.contract_get_capi_v3_market_apitradingsymbols()
+                raw_symbols = response.get("symbols") if isinstance(response, dict) else response
+                tradable = set()
+                for row in raw_symbols or []:
+                    if isinstance(row, str):
+                        tradable.add(row)
+                    elif isinstance(row, dict):
+                        tradable.add(str(row.get("symbol") or ""))
+                configured = {
+                    str(s).split("/")[0] + "USDT"
+                    for s in (cfg.get("trading", {}).get("symbols") or [])
+                }
+                missing = sorted(configured - tradable)
+                check(
+                    "configured symbols allow API trading",
+                    not missing,
+                    "missing=" + str(missing) if missing else f"{len(configured)} checked",
+                )
+            except Exception as e:
+                check("authenticated WEEX futures balance", False, str(e))
+                check("positive WEEX futures balance", False, "private probe failed")
+                check("WEEX account can trade futures", False, "private probe failed")
+                check("configured symbols allow API trading", False, "private probe failed")
+        else:
+            for name in (
+                "authenticated WEEX futures balance",
+                "positive WEEX futures balance",
+                "WEEX account can trade futures",
+                "configured symbols allow API trading",
+            ):
+                check(name, False, "credentials missing; probe not attempted")
+
     # Imports
     try:
         from src.strategies.composite import CompositeStrategy
