@@ -69,27 +69,33 @@ def main():
 
     market, atrs, prices = [], {}, {}
     for sym in symbols:
-        candles = exchange.fetch_candles(sym, tf, cfg["trading"].get("lookback_periods", 120))
+        lookback = cfg["trading"].get("lookback_periods", 120)
+        raw_candles = exchange.fetch_candles(sym, tf, lookback + 1)
+        candles = exchange.closed_candles(raw_candles, tf)[-lookback:]
         if len(candles) < 100:
             console.print(f"[yellow]skip {sym}: {len(candles)} candles[/]")
             continue
-        htf_c = exchange.fetch_candles(sym, htf, 80)
+        raw_htf = exchange.fetch_candles(sym, htf, 81)
+        htf_c = exchange.closed_candles(raw_htf, htf)[-80:]
         funding = exchange.fetch_funding_rate(sym)
         highs = np.array([c.high for c in candles])
         lows = np.array([c.low for c in candles])
         closes = np.array([c.close for c in candles])
         atrs[sym] = float(calculate_atr(highs, lows, closes)[-1])
-        prices[sym] = float(closes[-1])
+        prices[sym] = float(raw_candles[-1].close if raw_candles else closes[-1])
         e = edges.analyze_all_edges(candles, funding, higher_tf_candles=htf_c or None) if use_osc else None
         market.append(symbol_snapshot(sym, candles, funding, htf_c or None, e,
-                                      include_oscillators=use_osc))
+                                      include_oscillators=use_osc,
+                                      current_price=prices[sym]))
         console.print(f"[green]  {sym:20s} ${prices[sym]:>10,.4f}  ATR={atrs[sym]:.4f}[/]")
 
     account = exchange.get_account_state()
     context = build_context(
         symbols_data=market, account=account, risk=risk,
         recent_trades=risk.trade_history,
-        competition={"ranking_metric": "cumulative PnL", "trades_executed": 0,
+        competition={"ranking_metric": (
+                         "realised profit + risk management + strategy stability"
+                     ), "trades_executed": 0,
                      "minimum_trades_required": 10},
     )
 

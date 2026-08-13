@@ -470,6 +470,57 @@ print("\n=== PAPER FUNDING IS CHARGED, ONCE PER SETTLEMENT ===")
 # importantly, the idempotency: get_account_state() runs several times per cycle.
 from src.core.exchange import ExchangeClient
 
+print("\n=== AI CONTEXT USES CLOSED CANDLES HONESTLY ===")
+# WEEX/CCXT returns the current, still-forming bar.  At 12:15 the 12:00 1h bar is
+# useful as a live price but must not be allowed into completed-bar volume, ATR,
+# ADX or MACD.  Otherwise 15 minutes of volume is compared with 60-minute bars.
+class _TimeframeParser:
+    @staticmethod
+    def parse_timeframe(value):
+        return {"1h": 3600, "4h": 14400}[value]
+
+
+_clock = datetime(2026, 8, 13, 12, 15, tzinfo=timezone.utc)
+_cx = ExchangeClient.__new__(ExchangeClient)
+_cx.exchange = _TimeframeParser()
+_bars = []
+for i in range(33):
+    opened = datetime(2026, 8, 12, 4, 0, tzinfo=timezone.utc) + timedelta(hours=i)
+    # The final completed bar has 2x the previous-20 volume.  The forming bar has
+    # only 0.1x; if it leaks into the snapshot the test catches the distortion.
+    volume = 200.0 if i == 31 else 10.0 if i == 32 else 100.0
+    close = 100.0 + i
+    _bars.append(Candle(opened, close - 0.5, close + 1.0, close - 1.0, close, volume))
+
+_closed = _cx.closed_candles(_bars, "1h", now=_clock)
+assert len(_closed) == 32 and _closed[-1].timestamp.hour == 11
+assert _bars[-1].timestamp.hour == 12, "fixture must include the forming candle"
+
+from src.ai.context import symbol_snapshot
+from unittest.mock import patch as _mock_patch
+from src.core.models import MarketRegime
+
+_expected_highs = np.array([c.high for c in _closed], dtype=float)
+_expected_lows = np.array([c.low for c in _closed], dtype=float)
+_expected_closes = np.array([c.close for c in _closed], dtype=float)
+with _mock_patch("src.ai.context.detect_regime", return_value=MarketRegime.TRENDING_UP) as _regime:
+    _snap = symbol_snapshot(
+        "BTC/USDT:USDT", _closed, current_price=_bars[-1].close
+    )
+_regime_args = _regime.call_args.args
+assert np.array_equal(_regime_args[0], _expected_highs), "regime arg 1 must be highs"
+assert np.array_equal(_regime_args[1], _expected_lows), "regime arg 2 must be lows"
+assert np.array_equal(_regime_args[2], _expected_closes), "regime arg 3 must be closes"
+assert _snap["price"] == _bars[-1].close, "execution price should stay live"
+assert _snap["last_closed_candle"] == "2026-08-13T11:00:00Z"
+assert _snap["change_pct"]["1h"] != 0.0, "1h change cannot compare a close to itself"
+assert _snap["volume"]["ratio_vs_20"] == 2.0, _snap["volume"]
+assert _snap["volume"]["anomaly"] is False, "anomaly threshold is strictly over 2x"
+assert _snap["live_move_from_last_close_pct"] == round(
+    (_bars[-1].close / _closed[-1].close - 1) * 100, 2
+)
+print("forming bar excluded from evidence; live price, changes, volume and regime are correct")
+
 _fx = ExchangeClient.__new__(ExchangeClient)   # no network, no credentials
 _fx.mode = "paper"
 _fx.paper_funding_enabled = True

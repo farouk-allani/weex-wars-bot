@@ -64,6 +64,13 @@ def _clean(obj: Any) -> Any:
     return obj
 
 
+def _utc_iso(value: datetime) -> str:
+    """Render candle time once, without producing the invalid ``+00:00Z`` form."""
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.isoformat() + "Z"
+
+
 def symbol_snapshot(
     symbol: str,
     candles: list[Candle],
@@ -72,8 +79,15 @@ def symbol_snapshot(
     edges: Optional[dict] = None,
     positioning: Optional[dict] = None,
     include_oscillators: bool = False,
+    current_price: Optional[float] = None,
 ) -> dict:
-    """
+    """Build one symbol's decision features from *completed* candles.
+
+    ``current_price`` may come from the still-forming candle (or a ticker), so the
+    order validator and displayed price remain current.  Every statistical input
+    below must use completed bars: a partial bar has only a fraction of an hour's
+    volume and range and is not comparable with its historical denominator.
+
     include_oscillators: RSI / StochRSI / Bollinger z-score / VWAP deviation.
 
     Off by default, and that is not an aesthetic choice.
@@ -88,7 +102,8 @@ def symbol_snapshot(
     lows = np.array([c.low for c in candles], dtype=float)
     vols = np.array([c.volume for c in candles], dtype=float)
 
-    price = float(closes[-1])
+    analysis_price = float(closes[-1])
+    price = float(current_price) if current_price is not None else analysis_price
     rsi = calculate_rsi(closes, 14)
     macd_line, signal_line, hist = calculate_macd(closes)
     upper, mid, lower = calculate_bollinger_bands(closes, 20, 2.0)
@@ -100,19 +115,31 @@ def symbol_snapshot(
     band_width = float(upper[-1] - lower[-1])
     # Z-score of price within the Bollinger channel: the single most decision-relevant
     # number for a mean-reversion call, so give it to the model directly.
-    z = (price - float(mid[-1])) / (band_width / 4) if band_width > 0 else 0.0
+    z = (analysis_price - float(mid[-1])) / (band_width / 4) if band_width > 0 else 0.0
     atr_val = float(atr[-1]) if len(atr) else 0.0
 
     vol_ratio = (
-        float(vols[-1] / np.mean(vols[-20:])) if len(vols) >= 20 and np.mean(vols[-20:]) > 0 else 1.0
+        float(vols[-1] / np.mean(vols[-21:-1]))
+        if len(vols) >= 21 and np.mean(vols[-21:-1]) > 0
+        else 1.0
     )
 
     def pct_change(n: int) -> Optional[float]:
-        return _r((price / float(closes[-n]) - 1) * 100, 2) if len(closes) > n else None
+        # Latest completed close versus the completed close N bars earlier.  The
+        # old n=1 expression compared closes[-1] with itself and reported 0.0% on
+        # every market, every hour.
+        return (
+            _r((analysis_price / float(closes[-(n + 1)]) - 1) * 100, 2)
+            if len(closes) > n else None
+        )
 
     snap = {
         "symbol": symbol,
         "price": _r(price),
+        "last_closed_candle": _utc_iso(candles[-1].timestamp),
+        "live_move_from_last_close_pct": _r(
+            (price / analysis_price - 1) * 100, 2
+        ) if analysis_price else None,
         "change_pct": {
             "1h": pct_change(1),
             "4h": pct_change(4),
@@ -120,7 +147,7 @@ def symbol_snapshot(
             "7d": pct_change(168),
         },
         "trend": {
-            "regime": str(detect_regime(closes, highs, lows)).split(".")[-1].lower(),
+            "regime": str(detect_regime(highs, lows, closes)).split(".")[-1].lower(),
             "adx": _r(adx[-1], 1) if len(adx) else None,
             "ema_fast": _r(calculate_ema(closes, 9)[-1]),
             "ema_slow": _r(calculate_ema(closes, 21)[-1]),
@@ -138,7 +165,7 @@ def symbol_snapshot(
             # ATR as a % of price is what actually sizes the stop, so surface it
             # pre-computed rather than making the model divide.
             "atr": _r(atr_val),
-            "atr_pct": _r(atr_val / price * 100, 2) if price else None,
+            "atr_pct": _r(atr_val / analysis_price * 100, 2) if analysis_price else None,
         },
         "volume": {
             "ratio_vs_20": _r(vol_ratio, 2),
@@ -169,7 +196,7 @@ def symbol_snapshot(
             "bb_lower": _r(lower[-1]),
             "bb_zscore": _r(z, 2),
             "vwap_20": _r(vwap[-1]) if len(vwap) else None,
-            "vwap_deviation_pct": _r((price / float(vwap[-1]) - 1) * 100, 2)
+            "vwap_deviation_pct": _r((analysis_price / float(vwap[-1]) - 1) * 100, 2)
             if len(vwap) and vwap[-1]
             else None,
         }

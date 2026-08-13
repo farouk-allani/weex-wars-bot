@@ -20,7 +20,7 @@ import argparse
 import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import yaml
@@ -217,8 +217,14 @@ def main():
             if len(hist) < LOOKBACK:
                 continue
             win = hist[-LOOKBACK:]
-            now = win[-1].timestamp
-            htf = [h for h in d["htf"] if h.timestamp <= now][-80:]
+            # The replay's resampler stamps an aggregate with its LAST 1h bar's
+            # open time (unlike exchange-native 4h OHLCV, which stamps the first).
+            # Treat it as complete one hour later, at this decision timestamp.
+            now = win[-1].timestamp + timedelta(hours=1)
+            htf = [
+                h for h in d["htf"]
+                if h.timestamp + timedelta(hours=1) <= now
+            ][-80:]
             fr = d["funding"][i] if i < len(d["funding"]) else 0.0
 
             highs = np.array([c.high for c in win])
@@ -233,7 +239,7 @@ def main():
             if use_intel and d.get("pos"):
                 at_ms = int(now.replace(tzinfo=timezone.utc).timestamp() * 1000)
                 chg24 = (
-                    (float(closes[-1]) / float(closes[-24]) - 1) * 100
+                    (float(closes[-1]) / float(closes[-25]) - 1) * 100
                     if len(closes) > 24 else None
                 )
                 posn = positioning_snapshot(d["pos"], at_ms, chg24)
@@ -243,7 +249,7 @@ def main():
         if not market:
             return []
 
-        _ts = data[list(data)[0]]["candles"][i].timestamp
+        _ts = data[list(data)[0]]["candles"][i].timestamp + timedelta(hours=1)
         day = _ts.strftime("%Y-%m-%d")
         at_ms_point = int(_ts.replace(tzinfo=timezone.utc).timestamp() * 1000)
         account = AccountState(
@@ -326,7 +332,7 @@ def main():
                 "reason": reason, "bars": bars,
                 "adx": adx, "htf": htf, "regime": regime,
                 "with_htf_trend": with_trend,
-                "at": str(data[sym]["candles"][i].timestamp),
+                "at": str(data[sym]["candles"][i].timestamp + timedelta(hours=1)),
             })
         return out
 

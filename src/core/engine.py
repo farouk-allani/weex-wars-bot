@@ -346,7 +346,15 @@ class TradingEngine:
         closes_by_symbol: dict[str, np.ndarray] = {}
         for symbol in symbols:
             try:
-                candles = self.exchange.fetch_candles(symbol, timeframe, lookback)
+                # The newest CCXT candle is still forming.  Keep its close as the
+                # executable/current price, but never compare its partial volume,
+                # range or indicators with completed bars.
+                raw_candles = self.exchange.fetch_candles(
+                    symbol, timeframe, lookback + 1
+                )
+                candles = self.exchange.closed_candles(
+                    raw_candles, timeframe
+                )[-lookback:]
                 if len(candles) < 100:
                     # Never silent: a symbol missing here is invisible to the model,
                     # and if we hold it, the model reasons about holding or closing
@@ -357,21 +365,28 @@ class TradingEngine:
                         symbol, len(candles), held,
                     )
                     continue
-                htf_candles = self.exchange.fetch_candles(symbol, htf, htf_lookback)
+                raw_htf = self.exchange.fetch_candles(
+                    symbol, htf, htf_lookback + 1
+                )
+                htf_candles = self.exchange.closed_candles(
+                    raw_htf, htf
+                )[-htf_lookback:]
                 funding = self.exchange.fetch_funding_rate(symbol)
 
                 highs = np.array([c.high for c in candles])
                 lows = np.array([c.low for c in candles])
                 closes = np.array([c.close for c in candles])
                 atrs[symbol] = float(calculate_atr(highs, lows, closes)[-1])
-                prices[symbol] = float(closes[-1])
+                prices[symbol] = float(
+                    raw_candles[-1].close if raw_candles else closes[-1]
+                )
                 closes_by_symbol[symbol] = closes
 
                 positioning = None
                 if self.ai_include_positioning:
                     try:
                         change_24h = (
-                            (float(closes[-1]) / float(closes[-24]) - 1) * 100
+                            (float(closes[-1]) / float(closes[-25]) - 1) * 100
                             if len(closes) > 24 else None
                         )
                         positioning = live_positioning(symbol, change_24h)
@@ -392,6 +407,7 @@ class TradingEngine:
                         symbol, candles, funding, htf_candles or None, edges,
                         positioning,
                         include_oscillators=self.ai_include_osc,
+                        current_price=prices[symbol],
                     )
                 )
             except Exception as e:

@@ -203,6 +203,49 @@ class ExchangeClient:
             print(f"[Exchange] Error fetching candles for {symbol} {timeframe}: {e}")
             return self._candle_cache.get(cache_key, [])
 
+    def closed_candles(
+        self,
+        candles: list[Candle],
+        timeframe: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> list[Candle]:
+        """Return only candles whose full interval has elapsed.
+
+        CCXT exchanges normally include the candle that is forming right now.
+        Its close is a useful live price, but its volume, range and indicators are
+        not comparable with completed bars.  Feeding that partial bar to the AI
+        made an hourly decision at minute 7 see roughly 7/60 of normal volume and
+        repeatedly conclude that the whole market had no participation.
+
+        Keep this separate from :meth:`fetch_candles`: position monitoring still
+        needs the freshest price.  Decision features opt in to closed bars while
+        execution can keep using the latest partial close.
+        """
+        if not candles:
+            return []
+        try:
+            seconds = float(self.exchange.parse_timeframe(timeframe))
+        except Exception:
+            units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+            try:
+                seconds = float(timeframe[:-1]) * units[timeframe[-1].lower()]
+            except Exception as exc:
+                raise ValueError(f"unsupported candle timeframe: {timeframe!r}") from exc
+
+        clock = now or datetime.utcnow()
+        if clock.tzinfo is not None:
+            clock = clock.astimezone(timezone.utc).replace(tzinfo=None)
+
+        closed = []
+        for candle in candles:
+            opened = candle.timestamp
+            if opened.tzinfo is not None:
+                opened = opened.astimezone(timezone.utc).replace(tzinfo=None)
+            if opened + timedelta(seconds=seconds) <= clock:
+                closed.append(candle)
+        return closed
+
     def fetch_ticker(self, symbol: str) -> dict:
         try:
             return self.exchange.fetch_ticker(symbol)
