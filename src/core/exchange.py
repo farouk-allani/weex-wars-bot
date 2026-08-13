@@ -10,7 +10,7 @@ Fixes:
 import ccxt
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -80,6 +80,9 @@ class ExchangeClient:
 
         # Live: remember SL/TP we set (exchange position fetch often omits them)
         self._local_brackets: dict[str, dict] = {}
+        self._last_account_state: Optional[AccountState] = None
+        self._last_protection_check = 0.0
+        self._last_protection_error: Optional[str] = None
 
         # Cache
         self._candle_cache: dict[str, list[Candle]] = {}
@@ -247,6 +250,18 @@ class ExchangeClient:
                 bracket = self._local_brackets.get(symbol, {})
                 side = Side.LONG if p.get("side") == "long" else Side.SHORT
                 entry = float(p.get("entryPrice") or 0)
+                if bracket and entry > 0 and float(bracket.get("entry_price") or 0) <= 0:
+                    bracket["entry_price"] = entry
+                    bracket["size"] = contracts
+                    if float(bracket.get("entry_fee") or 0) <= 0:
+                        bracket["entry_fee"] = contracts * entry * self.commission_rate
+                        bracket["fees_paid"] = bracket["entry_fee"]
+                try:
+                    opened_at = datetime.fromisoformat(
+                        str(bracket.get("opened_at") or "").replace("Z", "")
+                    )
+                except ValueError:
+                    opened_at = datetime.utcnow()
                 pos_list.append(
                     Position(
                         symbol=symbol,
@@ -273,13 +288,14 @@ class ExchangeClient:
                         realized_pnl=float(bracket.get("realized_pnl") or 0),
                         entry_fee=float(bracket.get("entry_fee") or 0),
                         fees_paid=float(bracket.get("fees_paid") or 0),
+                        opened_at=opened_at,
                     )
                 )
 
             free = float(usdt.get("free") or 0)
             total = float(usdt.get("total") or free)
             used = float(usdt.get("used") or 0)
-            return AccountState(
+            account = AccountState(
                 balance=free,
                 equity=total,
                 unrealized_pnl=sum(p.unrealized_pnl for p in pos_list),
@@ -287,6 +303,9 @@ class ExchangeClient:
                 available_margin=free,
                 positions=pos_list,
             )
+            self._last_account_state = account
+            self._verify_live_protection(pos_list)
+            return account
         except Exception as e:
             print(f"[Exchange] Error fetching account: {e}")
             return AccountState(0, 0, 0, 0, 0)
@@ -324,6 +343,10 @@ class ExchangeClient:
             return {"error": "amount rounds to zero at venue precision"}
         if price:
             price = self.normalize_price(symbol, price)
+        if stop_loss and stop_loss > 0:
+            stop_loss = self.normalize_price(symbol, stop_loss)
+        if take_profit and take_profit > 0:
+            take_profit = self.normalize_price(symbol, take_profit)
 
         if self.mode == "paper":
             return self._paper_order(
@@ -334,18 +357,31 @@ class ExchangeClient:
 
         try:
             ccxt_side = "buy" if side == Side.LONG else "sell"
+            # Attach the catastrophic stop to the ENTRY request. A resting maker
+            # order can fill while the process is restarting; creating its stop on
+            # the next poll leaves a real, avoidable unprotected window.
+            entry_params = {}
+            if stop_loss and stop_loss > 0:
+                entry_params["stopLoss"] = {
+                    "triggerPrice": self.normalize_price(symbol, stop_loss),
+                    "triggerPriceType": "mark",
+                }
             if order_type == OrderType.LIMIT and price:
                 order = self.exchange.create_order(
-                    symbol, "limit", ccxt_side, amount, price
+                    symbol, "limit", ccxt_side, amount, price, params=entry_params
                 )
             else:
                 order = self.exchange.create_order(
-                    symbol, "market", ccxt_side, amount
+                    symbol, "market", ccxt_side, amount, params=entry_params
                 )
 
-            sl_ok, tp_ok, sl_err, tp_err = self._create_live_brackets(
-                symbol, side, amount, stop_loss, take_profit
+            bracket_result = self._create_live_brackets(
+                symbol, side, amount, None, take_profit
             )
+            sl_ok = bool(stop_loss and stop_loss > 0)
+            tp_ok = bool(bracket_result["tp_placed"])
+            sl_err = None if sl_ok else "no stop loss was attached to the entry"
+            tp_err = bracket_result.get("tp_error")
 
             # Cache brackets so software management still works
             fill_price = float(
@@ -354,6 +390,43 @@ class ExchangeClient:
                 or price
                 or 0
             )
+            if fill_price <= 0:
+                try:
+                    settled = self.exchange.fetch_order(str(order.get("id")), symbol)
+                    fill_price = float(
+                        settled.get("average") or settled.get("price") or 0
+                    )
+                    order = {**order, **settled}
+                except Exception:
+                    pass
+            if fill_price <= 0:
+                try:
+                    venue_positions = self.exchange.fetch_positions([symbol])
+                    live_position = next(
+                        (
+                            p for p in venue_positions
+                            if abs(float(p.get("contracts") or 0)) > 0
+                        ),
+                        {},
+                    )
+                    fill_price = float(live_position.get("entryPrice") or 0)
+                except Exception:
+                    pass
+            if fill_price <= 0:
+                try:
+                    fill_price = float(self.fetch_ticker(symbol).get("last") or 0)
+                except Exception:
+                    pass
+            if fill_price <= 0:
+                # Do not turn an already-successful order into an apparent failed
+                # order (which could tempt a retry). Mark it for reconciliation;
+                # the next position read supplies the venue entry price.
+                order = {**dict(order), "fill_price_pending": True}
+            fee_obj = order.get("fee") or {}
+            try:
+                entry_fee = float(fee_obj.get("cost"))
+            except (TypeError, ValueError):
+                entry_fee = amount * fill_price * self.commission_rate
             self._local_brackets[symbol] = {
                 "stop_loss": stop_loss or 0,
                 "take_profit": take_profit or 0,
@@ -365,14 +438,30 @@ class ExchangeClient:
                 "exchange_tp_set": tp_ok,
                 "side": side.value,
                 "initial_size": amount,
-                "entry_fee": amount * fill_price * self.commission_rate,
-                "fees_paid": amount * fill_price * self.commission_rate,
+                "entry_fee": entry_fee,
+                "fees_paid": entry_fee,
                 "realized_pnl": 0.0,
+                "entry_price": fill_price,
+                "size": amount,
+                "leverage": int(leverage or self.config.get("trading", {}).get("default_leverage", 5)),
+                "opened_at": datetime.utcnow().isoformat(),
+                "sl_attached": sl_ok,
+                "sl_order_id": None,
+                "sl_trigger": True,
+                "tp_order_id": bracket_result.get("tp_order_id"),
+                "tp_trigger": bool(bracket_result.get("tp_trigger")),
+                "entry_order_id": str(order.get("id") or ""),
             }
 
             order = dict(order)
             order["sl_placed"] = sl_ok
             order["tp_placed"] = tp_ok
+            order["stop_loss"] = stop_loss
+            order["take_profit"] = take_profit
+            order["sl_order_id"] = bracket_result.get("sl_order_id")
+            order["tp_order_id"] = bracket_result.get("tp_order_id")
+            order["sl_trigger"] = True
+            order["tp_trigger"] = bool(bracket_result.get("tp_trigger"))
             if sl_err:
                 order["sl_error"] = sl_err
             if tp_err:
@@ -390,20 +479,27 @@ class ExchangeClient:
         amount: float,
         stop_loss: Optional[float],
         take_profit: Optional[float],
-    ) -> tuple[bool, bool, Optional[str], Optional[str]]:
+    ) -> dict:
         """Place venue-side SL/TP reduce-only orders. Failures are surfaced, not
         raised — the caller keeps the position and falls back to software stops."""
         sl_ok, tp_ok = False, False
         sl_err, tp_err = None, None
+        sl_order_id, tp_order_id = None, None
+        tp_trigger = False
 
         if stop_loss and stop_loss > 0:
             sl_side = "sell" if side == Side.LONG else "buy"
             try:
-                self.exchange.create_order(
-                    symbol, "stop_market", sl_side, amount,
-                    params={"stopPrice": stop_loss, "reduceOnly": True},
+                order = self.exchange.create_order(
+                    symbol, "market", sl_side, amount,
+                    params={
+                        "stopLossPrice": self.normalize_price(symbol, stop_loss),
+                        "stopLossPriceType": "mark",
+                        "reduceOnly": True,
+                    },
                 )
                 sl_ok = True
+                sl_order_id = str(order.get("id") or "") or None
             except Exception as e:
                 sl_err = str(e)
                 print(f"[Exchange] WARNING: SL order failed for {symbol}: {e}")
@@ -418,11 +514,12 @@ class ExchangeClient:
             placed = False
             if self.maker_exits:
                 try:
-                    self.exchange.create_order(
+                    order = self.exchange.create_order(
                         symbol, "limit", tp_side, amount, take_profit,
-                        params={"reduceOnly": True, "postOnly": True},
+                        params={"reduceOnly": True, "timeInForce": "POST_ONLY"},
                     )
                     placed = tp_ok = True
+                    tp_order_id = str(order.get("id") or "") or None
                 except Exception as e:
                     # Not fatal, and not worth failing the entry over: fall back to
                     # the old stop-market so the position is never left without a
@@ -431,16 +528,31 @@ class ExchangeClient:
                     print(f"[Exchange] NOTE: maker TP rejected for {symbol}: {e}")
             if not placed:
                 try:
-                    self.exchange.create_order(
-                        symbol, "take_profit_market", tp_side, amount,
-                        params={"stopPrice": take_profit, "reduceOnly": True},
+                    order = self.exchange.create_order(
+                        symbol, "market", tp_side, amount,
+                        params={
+                            "takeProfitPrice": self.normalize_price(symbol, take_profit),
+                            "takeProfitPriceType": "mark",
+                            "reduceOnly": True,
+                        },
                     )
                     tp_ok = True
+                    tp_trigger = True
+                    tp_order_id = str(order.get("id") or "") or None
                 except Exception as e:
                     tp_err = str(e)
                     print(f"[Exchange] WARNING: TP order failed for {symbol}: {e}")
 
-        return sl_ok, tp_ok, sl_err, tp_err
+        return {
+            "sl_placed": sl_ok,
+            "tp_placed": tp_ok,
+            "sl_error": sl_err,
+            "tp_error": tp_err,
+            "sl_order_id": sl_order_id,
+            "tp_order_id": tp_order_id,
+            "sl_trigger": bool(sl_ok),
+            "tp_trigger": tp_trigger,
+        }
 
     # ---- Maker (post-only) entries ----
     #
@@ -488,6 +600,10 @@ class ExchangeClient:
         # agree with what was actually submitted.
         amount = self.normalize_amount(symbol, amount)
         limit_price = self.normalize_price(symbol, limit_price)
+        if stop_loss and stop_loss > 0:
+            stop_loss = self.normalize_price(symbol, stop_loss)
+        if take_profit and take_profit > 0:
+            take_profit = self.normalize_price(symbol, take_profit)
         if amount <= 0:
             return {"error": "amount rounds to zero at venue precision"}
 
@@ -509,18 +625,36 @@ class ExchangeClient:
                 "partial_fraction": partial_fraction,
                 "created": time.time(),
             }
-            return {"id": order_id, "status": "open", "limit_price": limit_price}
+            return {
+                "id": order_id,
+                "status": "open",
+                "limit_price": limit_price,
+                "amount": amount,
+                "stop_loss": float(stop_loss or 0),
+                "take_profit": float(take_profit or 0),
+                "sl_attached": bool(stop_loss and stop_loss > 0),
+            }
 
         try:
             ccxt_side = "buy" if side == Side.LONG else "sell"
+            params = {"timeInForce": "POST_ONLY"}
+            if stop_loss and stop_loss > 0:
+                params["stopLoss"] = {
+                    "triggerPrice": self.normalize_price(symbol, stop_loss),
+                    "triggerPriceType": "mark",
+                }
             order = self.exchange.create_order(
                 symbol, "limit", ccxt_side, amount, limit_price,
-                params={"postOnly": True},
+                params=params,
             )
             return {
                 "id": str(order.get("id")),
                 "status": order.get("status") or "open",
                 "limit_price": limit_price,
+                "amount": amount,
+                "stop_loss": float(stop_loss or 0),
+                "take_profit": float(take_profit or 0),
+                "sl_attached": bool(stop_loss and stop_loss > 0),
             }
         except Exception as e:
             # A post-only order that would cross is rejected by the venue — that is
@@ -635,16 +769,29 @@ class ExchangeClient:
             return {"cancelled": existed, "filled_amount": 0.0}
 
         filled = 0.0
+        cancelled = False
+        cancel_error = None
         try:
             self.exchange.cancel_order(order_id, symbol)
+            cancelled = True
         except Exception as e:
+            cancel_error = str(e)
             print(f"[Exchange] cancel_entry {symbol} {order_id}: {e}")
         try:
             order = self.exchange.fetch_order(order_id, symbol)
             filled = float(order.get("filled") or 0)
+            status = str(order.get("status") or "").lower()
+            if status in ("open", "new", "pending"):
+                cancelled = False
+            elif status in ("canceled", "cancelled", "expired", "rejected", "closed"):
+                cancelled = True
         except Exception:
             pass
-        return {"cancelled": True, "filled_amount": filled}
+        return {
+            "cancelled": cancelled,
+            "filled_amount": filled,
+            "error": cancel_error if not cancelled else None,
+        }
 
     def finalize_entry_fill(
         self,
@@ -657,6 +804,7 @@ class ExchangeClient:
         strategy: str = "",
         partial_take_profit: Optional[float] = None,
         partial_fraction: float = 0.5,
+        stop_attached: bool = False,
     ) -> dict:
         """Attach brackets to a just-filled maker entry.
 
@@ -666,9 +814,13 @@ class ExchangeClient:
         if self.mode == "paper":
             return {"sl_placed": True, "tp_placed": True}
 
-        sl_ok, tp_ok, sl_err, tp_err = self._create_live_brackets(
-            symbol, side, amount, stop_loss, take_profit
+        bracket_result = self._create_live_brackets(
+            symbol, side, amount, None if stop_attached else stop_loss, take_profit
         )
+        sl_ok = bool(stop_attached) or bool(bracket_result["sl_placed"])
+        tp_ok = bool(bracket_result["tp_placed"])
+        sl_err = None if stop_attached else bracket_result.get("sl_error")
+        tp_err = bracket_result.get("tp_error")
         entry_fee = amount * fill_price * self.maker_fee_rate
         self._local_brackets[symbol] = {
             "stop_loss": stop_loss or 0,
@@ -686,8 +838,24 @@ class ExchangeClient:
             "realized_pnl": 0.0,
             "partial_take_profit": partial_take_profit,
             "partial_fraction": partial_fraction,
+            "entry_price": fill_price,
+            "size": amount,
+            "leverage": int(self.config.get("trading", {}).get("default_leverage", 5)),
+            "opened_at": datetime.utcnow().isoformat(),
+            "sl_attached": bool(stop_attached),
+            "sl_order_id": bracket_result.get("sl_order_id"),
+            "sl_trigger": True,
+            "tp_order_id": bracket_result.get("tp_order_id"),
+            "tp_trigger": bool(bracket_result.get("tp_trigger")),
         }
-        out = {"sl_placed": sl_ok, "tp_placed": tp_ok}
+        out = {
+            "sl_placed": sl_ok,
+            "tp_placed": tp_ok,
+            "sl_order_id": bracket_result.get("sl_order_id"),
+            "tp_order_id": bracket_result.get("tp_order_id"),
+            "sl_trigger": True,
+            "tp_trigger": bool(bracket_result.get("tp_trigger")),
+        }
         if sl_err:
             out["sl_error"] = sl_err
         if tp_err:
@@ -759,7 +927,11 @@ class ExchangeClient:
         """Sync software-managed stops back into local cache (live)."""
         if self.mode == "paper":
             return
-        self._local_brackets[position.symbol] = {
+        # Merge instead of replace: order ids, the original entry timestamp and
+        # venue verification metadata are restart-safety state, not disposable
+        # presentation fields.
+        bracket = dict(self._local_brackets.get(position.symbol) or {})
+        bracket.update({
             "stop_loss": position.stop_loss,
             "take_profit": position.take_profit,
             "trailing_stop": position.trailing_stop,
@@ -776,7 +948,12 @@ class ExchangeClient:
             "realized_pnl": position.realized_pnl,
             "entry_fee": position.entry_fee,
             "fees_paid": position.fees_paid,
-        }
+            "entry_price": position.entry_price,
+            "size": position.size,
+            "leverage": position.leverage,
+            "opened_at": position.opened_at.isoformat(),
+        })
+        self._local_brackets[position.symbol] = bracket
 
     def maker_exit_price(self, position: Position, last: float) -> Optional[float]:
         """The TP price, if a post-only limit resting there would have filled.
@@ -800,6 +977,355 @@ class ExchangeClient:
         through = self.fill_through_ticks * self._tick_size(position.symbol, tp)
         filled = last >= tp + through if position.side == Side.LONG else last <= tp - through
         return tp if filled else None
+
+    @staticmethod
+    def _trigger_price(order: dict) -> float:
+        info = order.get("info") or {}
+        for value in (
+            order.get("stopPrice"),
+            order.get("triggerPrice"),
+            info.get("triggerPrice"),
+            info.get("stopPrice"),
+            info.get("slTriggerPrice"),
+        ):
+            try:
+                number = float(value)
+                if number > 0:
+                    return number
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    @staticmethod
+    def _same_price(a: float, b: float) -> bool:
+        return a > 0 and b > 0 and abs(a - b) <= max(abs(b) * 1e-6, 1e-8)
+
+    def _verify_live_protection(self, positions: list[Position]) -> None:
+        """Verify venue stops from the exchange, not from our own old boolean.
+
+        A persisted ``exchange_sl_set=True`` only proves that placement succeeded
+        once. It does not prove the order still exists after a restart, manual
+        cancellation or venue-side rejection, so live health is based on current
+        open algo orders and expires when that check goes stale.
+        """
+        if self.mode == "paper" or time.time() - self._last_protection_check < 30:
+            return
+        self._last_protection_check = time.time()
+        try:
+            trigger_orders = self.exchange.fetch_open_orders(
+                None, params={"type": "swap", "trigger": True}
+            )
+            self._last_protection_error = None
+        except Exception as exc:
+            self._last_protection_error = str(exc)
+            return
+
+        now = datetime.utcnow().isoformat()
+        ids = {str(o.get("id") or "") for o in trigger_orders}
+        for position in positions:
+            bracket = self._local_brackets.get(position.symbol) or {}
+            target = float(bracket.get("stop_loss") or position.stop_loss or 0)
+            expected_side = "sell" if position.side == Side.LONG else "buy"
+            known_id = str(bracket.get("sl_order_id") or "")
+            matched = None
+            for order in trigger_orders:
+                if known_id and str(order.get("id") or "") == known_id:
+                    matched = order
+                    break
+                order_symbol = str(order.get("symbol") or "")
+                order_side = str(order.get("side") or "").lower()
+                if (
+                    order_symbol == position.symbol
+                    and order_side == expected_side
+                    and self._same_price(self._trigger_price(order), target)
+                ):
+                    matched = order
+                    break
+            verified = matched is not None or (known_id and known_id in ids)
+            bracket["exchange_sl_set"] = verified
+            bracket["protection_verified_at"] = now
+            if matched is not None:
+                bracket["sl_order_id"] = str(matched.get("id") or "") or known_id or None
+                bracket["sl_trigger"] = True
+            self._local_brackets[position.symbol] = bracket
+            position.exchange_sl_set = verified
+
+    def protection_status(self) -> dict:
+        if self.mode == "paper":
+            return {
+                "healthy": True,
+                "mode": "paper",
+                "positions": 0,
+                "venue_protected": 0,
+                "unprotected": [],
+            }
+        account_checked = self._last_account_state is not None
+        positions = list((self._last_account_state or AccountState(0, 0, 0, 0, 0)).positions)
+        unprotected = []
+        active_symbols = {p.symbol for p in positions}
+        unresolved = [
+            symbol
+            for symbol, bracket in self._local_brackets.items()
+            if symbol not in active_symbols and bracket.get("missing_since")
+        ]
+        verified = 0
+        now = datetime.utcnow()
+        for position in positions:
+            bracket = self._local_brackets.get(position.symbol) or {}
+            try:
+                checked = datetime.fromisoformat(
+                    str(bracket.get("protection_verified_at") or "").replace("Z", "")
+                )
+                fresh = (now - checked).total_seconds() <= 180
+            except ValueError:
+                fresh = False
+            if position.stop_loss > 0 and position.exchange_sl_set and fresh:
+                verified += 1
+            else:
+                unprotected.append(position.symbol)
+        return {
+            "healthy": (
+                account_checked
+                and not unprotected
+                and not unresolved
+                and self._last_protection_error is None
+            ),
+            "mode": self.mode,
+            "account_checked": account_checked,
+            "positions": len(positions),
+            "venue_protected": verified,
+            "unprotected": unprotected,
+            "unresolved_external_closures": unresolved,
+            "verification_error": self._last_protection_error,
+            "verified_at": self._last_protection_check or None,
+        }
+
+    def _cancel_live_brackets(self, symbol: str, *, include_stop: bool = True) -> dict:
+        if self.mode == "paper":
+            return {"cancelled": [], "errors": []}
+        bracket = self._local_brackets.get(symbol) or {}
+        cancelled, errors = [], []
+        seen = set()
+
+        def cancel(order_id, trigger: bool):
+            oid = str(order_id or "")
+            if not oid or (oid, trigger) in seen:
+                return
+            seen.add((oid, trigger))
+            try:
+                self.exchange.cancel_order(
+                    oid, symbol, params={"type": "swap", "trigger": trigger}
+                )
+                cancelled.append(oid)
+            except Exception as exc:
+                errors.append(f"{oid}: {exc}")
+
+        if include_stop:
+            cancel(bracket.get("sl_order_id"), True)
+        cancel(bracket.get("tp_order_id"), bool(bracket.get("tp_trigger")))
+
+        # An SL attached to an entry may not return its child order id. Match only
+        # this bot's exact symbol/side/trigger price; never mass-cancel a user's
+        # unrelated reduce-only orders.
+        if (
+            include_stop
+            and not bracket.get("sl_order_id")
+            and float(bracket.get("stop_loss") or 0) > 0
+        ):
+            try:
+                orders = self.exchange.fetch_open_orders(
+                    symbol, params={"type": "swap", "trigger": True}
+                )
+                expected_side = "sell" if bracket.get("side") == Side.LONG.value else "buy"
+                stop = float(bracket.get("stop_loss") or 0)
+                for order in orders:
+                    if (
+                        str(order.get("side") or "").lower() == expected_side
+                        and self._same_price(self._trigger_price(order), stop)
+                    ):
+                        cancel(order.get("id"), True)
+            except Exception as exc:
+                errors.append(f"discover attached stop: {exc}")
+        unresolved = []
+        try:
+            regular = self.exchange.fetch_open_orders(
+                symbol, params={"type": "swap"}
+            )
+            triggers = self.exchange.fetch_open_orders(
+                symbol, params={"type": "swap", "trigger": True}
+            )
+            open_ids = {
+                str(order.get("id") or "") for order in (regular + triggers)
+            }
+            for key in ("sl_order_id", "tp_order_id"):
+                oid = str(bracket.get(key) or "")
+                if oid and oid in open_ids:
+                    unresolved.append(oid)
+            if not bracket.get("sl_order_id"):
+                expected_side = "sell" if bracket.get("side") == Side.LONG.value else "buy"
+                stop = float(bracket.get("stop_loss") or 0)
+                for order in triggers:
+                    if (
+                        str(order.get("side") or "").lower() == expected_side
+                        and self._same_price(self._trigger_price(order), stop)
+                    ):
+                        unresolved.append(str(order.get("id") or "attached-stop"))
+        except Exception as exc:
+            errors.append(f"verify cancellation: {exc}")
+            unresolved.append("verification-unavailable")
+        return {
+            "cancelled": cancelled,
+            "errors": errors,
+            "unresolved": unresolved,
+            "safe": not unresolved,
+        }
+
+    def detect_external_closures(self, active_positions: list[Position]) -> list[dict]:
+        """Recover venue-side SL/TP fills that happened between bot polls.
+
+        Without this, a position that disappears from ``fetch_positions`` simply
+        vanishes from local performance/risk history. The first missing poll is a
+        grace marker; the next confirms it from private fills before anything is
+        booked or the symbol is allowed to open again.
+        """
+        if self.mode == "paper":
+            return []
+        active = {p.symbol for p in active_positions}
+        now = datetime.utcnow()
+        events = []
+        for symbol, bracket in list(self._local_brackets.items()):
+            if symbol in active:
+                bracket.pop("missing_since", None)
+                bracket.pop("closure_error", None)
+                continue
+            if bracket.get("closed_locally"):
+                cleanup = self._cancel_live_brackets(symbol)
+                if cleanup.get("safe"):
+                    self._local_brackets.pop(symbol, None)
+                else:
+                    bracket.setdefault("missing_since", now.isoformat())
+                    bracket["closure_error"] = (
+                        "local close succeeded but bracket cleanup is unresolved"
+                    )
+                continue
+            if not bracket.get("entry_price") or not bracket.get("size"):
+                # Legacy live state cannot be settled honestly. Keep it visible and
+                # block entries instead of inventing a PnL.
+                bracket.setdefault("missing_since", now.isoformat())
+                bracket["closure_error"] = "missing persisted entry metadata"
+                continue
+            if not bracket.get("missing_since"):
+                bracket["missing_since"] = now.isoformat()
+                continue
+            try:
+                missing_at = datetime.fromisoformat(
+                    str(bracket["missing_since"]).replace("Z", "")
+                )
+            except ValueError:
+                missing_at = now
+            if (now - missing_at).total_seconds() < 10:
+                continue
+            event = self._recover_external_close(symbol, bracket)
+            if event:
+                events.append(event)
+            else:
+                bracket["closure_error"] = "position absent but no closing fill is visible yet"
+        return events
+
+    def _recover_external_close(self, symbol: str, bracket: dict) -> Optional[dict]:
+        try:
+            opened = datetime.fromisoformat(
+                str(bracket.get("opened_at") or "").replace("Z", "")
+            )
+        except ValueError:
+            opened = datetime.utcnow() - timedelta(days=7)
+        since = int(opened.replace(tzinfo=timezone.utc).timestamp() * 1000) - 1000
+        expected_side = "sell" if bracket.get("side") == Side.LONG.value else "buy"
+        try:
+            trades = self.exchange.fetch_my_trades(symbol, since=since, limit=100)
+        except Exception as exc:
+            bracket["closure_error"] = f"fetch_my_trades failed: {exc}"
+            return None
+
+        exits = []
+        for trade in trades:
+            if str(trade.get("side") or "").lower() != expected_side:
+                continue
+            try:
+                amount = float(trade.get("amount") or 0)
+                price = float(trade.get("price") or 0)
+            except (TypeError, ValueError):
+                continue
+            if amount > 0 and price > 0:
+                exits.append((trade, amount, price))
+        if not exits:
+            return None
+
+        total_amount = sum(amount for _, amount, _ in exits)
+        exit_price = sum(amount * price for _, amount, price in exits) / total_amount
+        fee = 0.0
+        fee_known = False
+        for trade, _, _ in exits:
+            try:
+                fee += float((trade.get("fee") or {}).get("cost"))
+                fee_known = True
+            except (TypeError, ValueError):
+                pass
+        order_ids = [str(t.get("order") or "") for t, _, _ in exits if t.get("order")]
+        makers = [str(t.get("takerOrMaker") or "").lower() for t, _, _ in exits]
+        maker = bool(makers) and all(value == "maker" for value in makers)
+
+        reason = "external_close"
+        if str(bracket.get("tp_order_id") or "") in order_ids:
+            reason = "take_profit"
+        elif str(bracket.get("sl_order_id") or "") in order_ids:
+            reason = "stop_loss"
+        elif self._same_price(exit_price, float(bracket.get("take_profit") or 0)):
+            reason = "take_profit"
+        elif self._same_price(exit_price, float(bracket.get("stop_loss") or 0)):
+            reason = "stop_loss"
+
+        side = Side(str(bracket.get("side") or Side.LONG.value))
+        try:
+            opened_at = datetime.fromisoformat(
+                str(bracket.get("opened_at") or "").replace("Z", "")
+            )
+        except ValueError:
+            opened_at = opened
+        position = Position(
+            symbol=symbol,
+            side=side,
+            entry_price=float(bracket["entry_price"]),
+            size=float(bracket["size"]),
+            leverage=int(bracket.get("leverage") or 1),
+            stop_loss=float(bracket.get("stop_loss") or 0),
+            take_profit=float(bracket.get("take_profit") or 0),
+            opened_at=opened_at,
+            strategy=str(bracket.get("strategy") or ""),
+            initial_size=float(bracket.get("initial_size") or bracket["size"]),
+            realized_pnl=float(bracket.get("realized_pnl") or 0),
+            entry_fee=float(bracket.get("entry_fee") or 0),
+            fees_paid=float(bracket.get("fees_paid") or 0),
+        )
+        return {
+            "position": position,
+            "exit_price": exit_price,
+            "fee": fee if fee_known else None,
+            "maker": maker,
+            "order_id": order_ids[-1] if order_ids else "",
+            "reason": reason,
+        }
+
+    def acknowledge_external_close(self, symbol: str) -> None:
+        cleanup = self._cancel_live_brackets(symbol)
+        if cleanup.get("safe"):
+            self._local_brackets.pop(symbol, None)
+            return
+        bracket = self._local_brackets.get(symbol) or {}
+        bracket["closed_locally"] = True
+        bracket["missing_since"] = datetime.utcnow().isoformat()
+        bracket["closure_error"] = "external close booked; bracket cleanup unresolved"
+        self._local_brackets[symbol] = bracket
 
     def close_position(self, symbol: str, *, maker_price: Optional[float] = None) -> dict:
         """Close at market, or — when `maker_price` is given — book the fill as a
@@ -839,6 +1365,10 @@ class ExchangeClient:
             }
 
         try:
+            # Pull the TP first so it cannot race our discretionary market close,
+            # but leave the catastrophic SL active until the close succeeds. A
+            # failed market request must not turn a protected position stopless.
+            pre_cancellation = self._cancel_live_brackets(symbol, include_stop=False)
             positions = self.exchange.fetch_positions([symbol])
             for pos in positions:
                 contracts = abs(float(pos.get("contracts") or 0))
@@ -848,10 +1378,64 @@ class ExchangeClient:
                         symbol, "market", side, contracts,
                         params={"reduceOnly": True},
                     )
-                    self._local_brackets.pop(symbol, None)
+                    order = dict(order)
+                    if not order.get("average") or not (order.get("fee") or {}).get("cost"):
+                        try:
+                            settled = self.exchange.fetch_order(str(order.get("id")), symbol)
+                            order = {**order, **settled}
+                        except Exception:
+                            pass
+                    exit_price = float(
+                        order.get("average") or order.get("price")
+                        or (self.fetch_ticker(symbol).get("last") or 0)
+                    )
+                    fee_obj = order.get("fee") or {}
+                    try:
+                        actual_fee = float(fee_obj.get("cost"))
+                    except (TypeError, ValueError):
+                        actual_fee = None
+                    order.update({
+                        "closed": True,
+                        "exit_price": exit_price,
+                        "fee": actual_fee,
+                        # Live always sends MARKET here. A passed maker_price only
+                        # describes what paper could have filled; it cannot turn a
+                        # market request into a maker fill after the fact.
+                        "maker": False,
+                        "execution": "taker",
+                    })
+                    cancellation = self._cancel_live_brackets(symbol, include_stop=True)
+                    order["bracket_cancellation"] = {
+                        "before_close": pre_cancellation,
+                        "after_close": cancellation,
+                    }
+                    if cancellation.get("safe"):
+                        self._local_brackets.pop(symbol, None)
+                    else:
+                        bracket = self._local_brackets.get(symbol) or {}
+                        bracket["closed_locally"] = True
+                        bracket["missing_since"] = datetime.utcnow().isoformat()
+                        bracket["closure_error"] = "bracket cleanup unresolved after local close"
+                        self._local_brackets[symbol] = bracket
                     return order
-            self._local_brackets.pop(symbol, None)
-            return {"closed": True, "reason": "no_position"}
+            cancellation = self._cancel_live_brackets(symbol, include_stop=True)
+            bracket = self._local_brackets.get(symbol)
+            if bracket is not None:
+                bracket.setdefault("missing_since", datetime.utcnow().isoformat())
+                bracket["closure_error"] = "close raced a venue fill; awaiting trade reconciliation"
+                close_reason = "no_position_reconciliation_pending"
+            else:
+                close_reason = "no_position"
+            return {
+                "closed": True,
+                "reason": close_reason,
+                "maker": False,
+                "execution": "unknown",
+                "bracket_cancellation": {
+                    "before_close": pre_cancellation,
+                    "after_close": cancellation,
+                },
+            }
         except Exception as e:
             return {"error": str(e)}
 
@@ -989,10 +1573,20 @@ class ExchangeClient:
             pos.update_extremes(current_price)
 
     def to_state(self) -> dict:
-        """Paper ledger for restart recovery (live mode reads truth from the API)."""
+        """Restart state.
+
+        The venue is the source of truth for live size and entry price, but it does
+        not know our software trail, original open time, fee basis or the ids of
+        sibling protection orders. Those are safety-critical and must survive a
+        deploy just as the paper ledger does.
+        """
+        state = {
+            "state_version": 2,
+            "local_brackets": self._local_brackets,
+        }
         if self.mode != "paper":
-            return {}
-        return {
+            return state
+        state.update({
             "balance": self.balance,
             # Resting entries survive a restart with their brackets intact — a fill
             # after recovery must still produce a stopped position.
@@ -1028,10 +1622,20 @@ class ExchangeClient:
                 }
                 for p in self.paper_positions.values()
             ],
-        }
+        })
+        return state
 
     def load_state(self, state: dict) -> None:
-        if self.mode != "paper" or not state:
+        if not state:
+            return
+        brackets = state.get("local_brackets") or {}
+        if isinstance(brackets, dict):
+            self._local_brackets = {
+                str(symbol): dict(value)
+                for symbol, value in brackets.items()
+                if isinstance(value, dict)
+            }
+        if self.mode != "paper":
             return
         if state.get("balance") is not None:
             self.balance = float(state["balance"])

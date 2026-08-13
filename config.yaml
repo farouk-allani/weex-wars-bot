@@ -70,6 +70,11 @@ ai:
   # a memorised "fade to VWAP" reflex (~80% of decisions) with no PnL benefit in any
   # replay arm. Do not enable without re-running run_ai_replay A/B first.
   include_oscillators: false
+  # These default OFF to preserve the exact deployed decision surface. The replay
+  # now follows these same flags unless an experiment explicitly overrides them.
+  # Turn either on only after an out-of-sample replay shows it helps.
+  include_positioning: false
+  include_macro: false
   log_file: logs/ai_decisions.jsonl
 
 # Execution: how orders reach the venue. Round-trip cost with market orders

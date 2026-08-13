@@ -1,8 +1,14 @@
 # WEEX AI Wars II — Trading Bot v8.5
 
-Competition futures bot: portfolio risk, partial take-profit runners, walk-forward mode selection, adaptive weights.
+AI-driven competition futures bot with hard portfolio-risk vetoes, restart-safe
+venue protection, durable WEEX decision logs, and supervised live arming.
 
-## Results snapshot
+## Historical rules-engine benchmark
+
+The table below is a legacy mechanical portfolio backtest. It is useful for cost
+and risk plumbing, but it is **not** a backtest of the deployed DeepSeek decision
+layer and must not be used as proof that the live AI bot is profitable. Use
+`run_ai_replay.py` for point-in-time AI decision scoring.
 
 ### 90d portfolio (BTC + SOL, shared $10k) — current config
 
@@ -31,7 +37,7 @@ Competition futures bot: portfolio risk, partial take-profit runners, walk-forwa
 
 | Profile | File | Use |
 |---------|------|-----|
-| **Competition** (default) | `config.yaml` | BTC+SOL, tiny KA activity |
+| **Competition** (default) | `config.yaml` | AI decisions across the 8 permitted pairs; keepalive off |
 | Pure edge BTC | `config.edge.yaml` | No KA, max edge research |
 
 ```bash
@@ -48,6 +54,7 @@ python -m src.main
 pip install -r requirements.txt
 python test_bot.py
 python paper_checklist.py
+python check_ready.py --target live
 python run_portfolio_backtest.py --days 90
 python run_walk_forward.py --days 120 --apply-best
 python -m src.main
@@ -83,7 +90,7 @@ If the bot hasn’t written state yet, the UI shows **demo metrics** so you can 
 
 ```bash
 # local
-git push origin main   # CI tests + auto-deploy to VPS
+git push origin main   # CI must pass before the exact tested commit deploys
 ```
 
 Deploy notes live in local **`DEPLOY.md`** (gitignored — not pushed to GitHub).
@@ -98,6 +105,11 @@ docker compose up -d --build
 
 ## What’s new in v8.5
 
+- Live bracket metadata and software trails survive restarts
+- Resting live entries carry an atomic venue stop
+- Live closes are accounted from the actual taker/maker result
+- Official `UploadAiLog` delivery is durable and blocks new live entries on a gap
+- Dashboard/deploy health fails on stale AI, compliance, or execution state
 - **Walk-forward** mode comparison (`run_walk_forward.py`)
 - **Wick quality** boosts size (not a hard gate)
 - **Tighter runner trail** after partial TP
@@ -110,16 +122,18 @@ docker compose up -d --build
 
 - 1.2% risk × strength × pair × strategy weights  
 - 15% kill-switch, 6h time-based loss cooldown  
-- KA losses do **not** trigger cooldown  
-- Partial TP 50% @ 1R → BE + tight trail  
+- Mechanical keepalive is disabled in AI mode
+- Partial TP is disabled by measurement; venue SL and full target stay active
 
 ## Paper → live
 
 1. `python paper_checklist.py`  
 2. `python -m src.main` (mode: paper)  
-3. First fill must log Stop + TP + Partial  
-4. Review `logs/trading.log` after 24h  
-5. Live only when clean — leverage 3–5  
+3. `python check_ready.py --target live` while mode is still `paper`
+4. Verify the account is on the AI Wars allowlist
+5. Supervise one minimum-notional live rehearsal: venue SL visible and UploadAiLog successful
+6. Return to paper if either check fails; never retry the trade to retry a log
+7. Arm live only after the rehearsal and watch the first three round trips
 
 ## Author
 

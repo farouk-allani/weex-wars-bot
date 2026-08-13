@@ -23,7 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 class DecisionLog:
-    def __init__(self, path: str | Path = "logs/ai_decisions.jsonl"):
+    def __init__(
+        self,
+        path: str | Path = "logs/ai_decisions.jsonl",
+        *,
+        live_upload: bool = False,
+        uploader=None,
+    ):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -33,6 +39,12 @@ class DecisionLog:
         self.ailog_emitted = 0
         self.ailog_failed = 0
         self.last_ailog_error: Optional[str] = None
+        self.live_upload = bool(live_upload)
+        if uploader is None:
+            from .wars_log import WeexAILogUploader
+
+            uploader = WeexAILogUploader(enabled=self.live_upload)
+        self.uploader = uploader
 
     def record(
         self,
@@ -87,7 +99,11 @@ class DecisionLog:
         entry_price: float,
         stop_loss: float,
         take_profit: float,
-    ) -> None:
+        order_type: str = "LIMIT",
+        intent: str = "entry",
+        position_side: Optional[str] = None,
+        trigger_price: Optional[float] = None,
+    ) -> Optional[dict]:
         """Bind an exchange OrderId back to the decision that produced it.
 
         Written as a separate linkage record rather than by rewriting the original
@@ -102,6 +118,10 @@ class DecisionLog:
             "entry_price": entry_price,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
+            "order_type": str(order_type).upper(),
+            "intent": intent,
+            "position_side": position_side,
+            "trigger_price": trigger_price,
         }
         self._append({
             "type": "order_link",
@@ -109,7 +129,7 @@ class DecisionLog:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "order": order,
         })
-        self._emit_ai_log(decision_id, order)
+        return self._emit_ai_log(decision_id, order)
 
     def _lookup(self, decision_id: str) -> Optional[dict]:
         """The decision behind an order, from memory or from disk."""
@@ -148,7 +168,7 @@ class DecisionLog:
             logger.error("ai-log: could not read decision log for %s: %s", decision_id, e)
         return found
 
-    def _emit_ai_log(self, decision_id: str, order: dict) -> Optional[Path]:
+    def _emit_ai_log(self, decision_id: str, order: dict) -> Optional[dict]:
         """Write the WEEX-schema ai-log for an order.
 
         Never raises — the trade is already live by the time this runs. But a
@@ -163,13 +183,23 @@ class DecisionLog:
             if entry is None:
                 raise LookupError("decision not found in memory or on disk")
             path = wars_log.emit(entry, order)
+            upload = self.uploader.register(path, required=self.live_upload)
             self.ailog_emitted += 1
-            self.last_ailog_error = None
-            logger.info(
-                "AILOG_OK %s order=%s -> %s",
-                order.get("symbol"), order.get("order_id"), path.name,
-            )
-            return path
+            if self.live_upload and not upload.get("uploaded"):
+                self.ailog_failed += 1
+                self.last_ailog_error = str(upload.get("last_error") or "upload pending")
+                logger.error(
+                    "AILOG_UPLOAD_PENDING (COMPLIANCE) %s order=%s: %s",
+                    order.get("symbol"), order.get("order_id"), self.last_ailog_error,
+                )
+            else:
+                self.last_ailog_error = None
+                logger.info(
+                    "AILOG_OK %s order=%s -> %s uploaded=%s",
+                    order.get("symbol"), order.get("order_id"), path.name,
+                    bool(upload.get("uploaded")),
+                )
+            return {"path": str(path), "upload": upload}
         except Exception as e:
             self.ailog_failed += 1
             self.last_ailog_error = (
@@ -253,6 +283,7 @@ class DecisionLog:
         # `compliant` is about what is still actionable: every order has a log, and
         # every log that COULD be complete is. A permanently-false flag is a monitor
         # nobody reads.
+        upload = self.uploader.status()
         return {
             "orders_linked": len(links),
             "ai_logs_on_disk": len(names),
@@ -263,7 +294,11 @@ class DecisionLog:
             "missing": missing[-20:],
             "incomplete": broken[-20:],
             "unrepairable": unrepairable[-20:],
-            "compliant": not missing and not broken,
+            "official_upload": upload,
+            "official_upload_pending": upload.get("pending", 0),
+            "compliant": not missing and not broken and (
+                not self.live_upload or bool(upload.get("ready"))
+            ),
             "note": (
                 f"{len(unrepairable)} historical log(s) predate verbatim-prompt "
                 "capture and cannot be completed from the record"

@@ -1,8 +1,10 @@
 name: Deploy
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
     branches: [main]
+    types: [completed]
   workflow_dispatch:
     # Manual redeploy from GitHub Actions UI
 
@@ -14,12 +16,17 @@ jobs:
   deploy:
     name: Deploy to VPS
     runs-on: ubuntu-latest
-    # Wait for CI on same commit when possible
-    needs: []
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     environment: production
+    env:
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Setup SSH
         env:
@@ -54,18 +61,19 @@ jobs:
           echo "Deploy target: $SSH_USER@$SSH_HOST:$DEPLOY_PATH"
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
             "$SSH_USER@$SSH_HOST" \
-            "DEPLOY_PATH='$DEPLOY_PATH' bash -s" << 'REMOTE'
+            "DEPLOY_PATH='$DEPLOY_PATH' DEPLOY_SHA='$DEPLOY_SHA' bash -s" << 'REMOTE'
           set -euo pipefail
           cd "$DEPLOY_PATH"
 
-          echo "==> Pulling latest main"
+          echo "==> Fetching CI-approved commit $DEPLOY_SHA"
           git fetch origin main
-          git reset --hard origin/main
+          git cat-file -e "$DEPLOY_SHA^{commit}"
+          git reset --hard "$DEPLOY_SHA"
 
           echo "==> Building & restarting stack"
           docker compose pull 2>/dev/null || true
           docker compose build --pull
-          docker compose up -d --remove-orphans
+          docker compose up -d --remove-orphans --wait --wait-timeout 300
 
           echo "==> Pruning old images"
           docker image prune -f
@@ -88,7 +96,8 @@ jobs:
           if [ -n "${DASHBOARD_PUBLIC_URL:-}" ]; then
             echo "Checking $DASHBOARD_PUBLIC_URL/api/health"
             for i in 1 2 3 4 5; do
-              if curl -fsS "$DASHBOARD_PUBLIC_URL/api/health" | grep -q '"ok"'; then
+              health="$(curl -fsS "$DASHBOARD_PUBLIC_URL/api/health" || true)"
+              if HEALTH="$health" python -c 'import json,os; d=json.loads(os.environ["HEALTH"]); assert d.get("ok") is True, d.get("failures")'; then
                 echo "Dashboard healthy"
                 exit 0
               fi

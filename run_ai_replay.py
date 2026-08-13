@@ -74,10 +74,14 @@ def main():
     ap.add_argument("--every", type=int, default=12, help="hours between decision points")
     ap.add_argument("--model", default=None)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--no-intel", action="store_true",
-                    help="withhold positioning/sentiment")
-    ap.add_argument("--no-macro", action="store_true",
-                    help="withhold macro (dollar, yields, equities, Nikkei)")
+    ap.add_argument("--intel", dest="intel", action="store_true", default=None,
+                    help="force positioning/sentiment ON regardless of config")
+    ap.add_argument("--no-intel", dest="intel", action="store_false",
+                    help="force positioning/sentiment OFF regardless of config")
+    ap.add_argument("--macro", dest="macro", action="store_true", default=None,
+                    help="force macro ON regardless of config")
+    ap.add_argument("--no-macro", dest="macro", action="store_false",
+                    help="force macro OFF regardless of config")
     ap.add_argument("--no-osc", dest="osc", action="store_false", default=None,
                     help="withhold RSI/StochRSI/Bollinger/VWAP + edge signals "
                          "(default: follow ai.include_oscillators in config)")
@@ -87,9 +91,6 @@ def main():
                     help="end the window N days earlier — for out-of-sample validation")
     ap.add_argument("--tag", default="", help="label for the saved results file")
     args = ap.parse_args()
-    use_intel = not args.no_intel
-    use_macro = not args.no_macro
-
     cfg = yaml.safe_load(open(args.config)) or {}
     cfg.setdefault("ai", {})["enabled"] = True
     if args.model:
@@ -103,9 +104,23 @@ def main():
     # measures nothing you can act on.
     cfg_osc = bool((cfg.get("ai") or {}).get("include_oscillators", False))
     use_osc = cfg_osc if args.osc is None else args.osc
+    cfg_intel = bool((cfg.get("ai") or {}).get("include_positioning", False))
+    cfg_macro = bool((cfg.get("ai") or {}).get("include_macro", False))
+    use_intel = cfg_intel if args.intel is None else args.intel
+    use_macro = cfg_macro if args.macro is None else args.macro
     if use_osc != cfg_osc:
         console.print(f"[yellow]oscillators forced {'ON' if use_osc else 'OFF'} by flag "
                       f"— config says {cfg_osc}. This is NOT the live configuration.[/]")
+
+    for name, value, configured in (
+        ("positioning", use_intel, cfg_intel),
+        ("macro", use_macro, cfg_macro),
+    ):
+        if value != configured:
+            console.print(
+                f"[yellow]{name} forced {'ON' if value else 'OFF'} by flag; "
+                f"config says {configured}. This is NOT the live configuration.[/]"
+            )
 
     symbols = cfg["trading"]["symbols"]
     equity = float(cfg["backtest"]["initial_capital"])
@@ -237,8 +252,15 @@ def main():
         )
         ctx = build_context(
             symbols_data=market, account=account, risk=risk, recent_trades=[],
-            competition={"ranking_metric": "cumulative PnL", "trades_executed": 0,
-                         "minimum_trades_required": 10},
+            competition={
+                "scoring": "multi-metric: realised profit + risk management + strategy stability",
+                "ranking_metric": (
+                    "NOT cumulative PnL alone. A smaller steady gain with shallow "
+                    "drawdown outranks a larger erratic one."
+                ),
+                "trades_executed": 0,
+                "minimum_trades_required": cfg.get("competition", {}).get("min_trades", 10),
+            },
             fear_greed=fng.get(day) if use_intel else None,
             macro=macro_snapshot(macro_hist, at_ms_point) if use_macro else None,
         )

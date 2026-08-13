@@ -41,7 +41,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import json,time; from pathlib import Path; s=Path('data/bot_state.json'); h=Path('data/ai_health.json'); assert s.exists() and time.time()-s.stat().st_mtime<600, 'state stale'; assert h.exists(), 'ai_health.json missing'; d=json.loads(h.read_text()); assert d.get('healthy') and time.time()-h.stat().st_mtime<11000, 'ai unhealthy'",
+          "import json,time; from pathlib import Path; s=Path('data/bot_state.json'); h=Path('data/ai_health.json'); e=Path('data/execution_health.json'); assert s.exists() and time.time()-s.stat().st_mtime<600, 'state stale'; assert h.exists(), 'ai_health.json missing'; d=json.loads(h.read_text()); assert d.get('healthy') and time.time()-h.stat().st_mtime<11000, 'ai unhealthy'; assert e.exists(), 'execution_health.json missing'; x=json.loads(e.read_text()); assert x.get('healthy') and time.time()-e.stat().st_mtime<600, 'execution unhealthy'",
         ]
       interval: 2m
       timeout: 10s
@@ -74,7 +74,8 @@ services:
         "from dashboard.app import main; main(['--host','0.0.0.0','--port','8787','--no-auto-port'])",
       ]
     depends_on:
-      - bot
+      bot:
+        condition: service_healthy
     healthcheck:
       test:
         [

@@ -31,6 +31,8 @@ from ..utils.state import save_state, load_state, DEFAULT_STATE_PATH
 from ..ai import AITrader, DecisionLog, DeepSeekClient, build_context
 from ..ai.client import TERMINAL_ERROR_KINDS
 from ..ai.context import symbol_snapshot
+from ..data.intel import latest_fear_greed, live_positioning
+from ..data.macro import live_macro
 import numpy as np  # noqa: E402
 
 console = Console()
@@ -53,12 +55,12 @@ class TradingEngine:
         state = load_state(self.state_path)
         if state:
             self.risk.load_state(state.get("risk") or {})
-            paper_state = state.get("paper") or {}
-            if not paper_state and (state.get("account") or {}).get("mode") == "paper":
+            exchange_state = state.get("exchange") or state.get("paper") or {}
+            if not exchange_state and (state.get("account") or {}).get("mode") == "paper":
                 # State written before the paper ledger was persisted: the dashboard
                 # snapshot is the only record of the balance, so seed from it.
-                paper_state = {"balance": (state.get("account") or {}).get("balance")}
-            self.exchange.load_state(paper_state)
+                exchange_state = {"balance": (state.get("account") or {}).get("balance")}
+            self.exchange.load_state(exchange_state)
             lt = state.get("last_trade_time") or {}
             for k, v in lt.items():
                 try:
@@ -94,6 +96,8 @@ class TradingEngine:
         # --no-osc arm. Off unless someone re-tests and flips it in config: feeding
         # them triggered a memorised BB-fade reflex that shorted a bull market.
         self.ai_include_osc = bool(ai_cfg.get("include_oscillators", False))
+        self.ai_include_positioning = bool(ai_cfg.get("include_positioning", False))
+        self.ai_include_macro = bool(ai_cfg.get("include_macro", False))
 
         # --- Maker execution ---
         # Entries rest at the touch instead of crossing the spread: measured
@@ -130,10 +134,14 @@ class TradingEngine:
         self._alerted_state: str | None = None
         # ai-log coverage, published next to it. Alarms on change, not every cycle.
         self.compliance_path = self.state_path.parent / "compliance.json"
+        self.execution_health_path = self.state_path.parent / "execution_health.json"
         self._last_compliance_gap = -1
 
         if ai_cfg.get("enabled", False):
-            self.decision_log = DecisionLog(ai_cfg.get("log_file", "logs/ai_decisions.jsonl"))
+            self.decision_log = DecisionLog(
+                ai_cfg.get("log_file", "logs/ai_decisions.jsonl"),
+                live_upload=self.exchange.mode != "paper",
+            )
             client = DeepSeekClient(self.config)
             # Fail at startup on a dead model id rather than once an hour, silently,
             # forever. A listing outage is not fatal — the failure alarm covers that.
@@ -159,6 +167,10 @@ class TradingEngine:
             # absence, which is exactly the hole that let a dead decision layer
             # report healthy.
             self._record_ai_health(None, decided=False)
+
+        # Stable in paper and live so deployment health never consumes a stale
+        # sidecar left behind by a previous mode.
+        self._record_execution_health()
 
         sig.signal(sig.SIGINT, self._shutdown)
         sig.signal(sig.SIGTERM, self._shutdown)
@@ -217,6 +229,9 @@ class TradingEngine:
         self._cleanup()
 
     def _run_cycle(self, symbols, timeframe, htf, lookback, htf_lookback):
+        if self.decision_log:
+            self.decision_log.uploader.retry_pending()
+            self._record_compliance()
         # Resting entries are managed every cycle (60s), same as stops — a fill,
         # a chase or an abandon must never wait on the model's hourly cadence.
         self._manage_pending_entries()
@@ -226,9 +241,15 @@ class TradingEngine:
 
     def _run_rules_cycle(self, symbols, timeframe, htf, lookback, htf_lookback):
         account = self.exchange.get_account_state()
+        self._reconcile_external_closures(account)
         self.strategy.sync_scores_from_risk(self.risk)
 
         can_trade, reason = self.risk.can_trade(account)
+        if can_trade and self.exchange.mode != "paper":
+            protection = self.exchange.protection_status()
+            if not protection.get("healthy"):
+                can_trade = False
+                reason = "execution protection unresolved"
         if not can_trade:
             console.print(f"[yellow]Trading blocked: {reason}[/]")
             # A full book is routine, not a warning — logging it at WARNING every
@@ -290,6 +311,7 @@ class TradingEngine:
 
     def _run_ai_cycle(self, symbols, timeframe, htf, lookback, htf_lookback):
         account = self.exchange.get_account_state()
+        self._reconcile_external_closures(account)
 
         # Stops never wait on the model. Position management runs every cycle (60s);
         # the model is consulted on its own, much slower, cadence.
@@ -300,6 +322,21 @@ class TradingEngine:
             return
 
         can_trade, reason = self.risk.can_trade(account)
+        if can_trade and self.exchange.mode != "paper":
+            protection = self.exchange.protection_status()
+            if not protection.get("healthy"):
+                can_trade = False
+                reason = (
+                    "execution protection unresolved: "
+                    f"unprotected={protection.get('unprotected') or []}, "
+                    f"external_closures={protection.get('unresolved_external_closures') or []}, "
+                    f"error={protection.get('verification_error') or 'none'}"
+                )
+        if can_trade and self.exchange.mode != "paper" and self.decision_log:
+            upload_ready, upload_reason = self.decision_log.uploader.readiness()
+            if not upload_ready:
+                can_trade = False
+                reason = f"AI-log delivery unavailable: {upload_reason}"
 
         market = []
         atrs: dict[str, float] = {}
@@ -330,6 +367,19 @@ class TradingEngine:
                 prices[symbol] = float(closes[-1])
                 closes_by_symbol[symbol] = closes
 
+                positioning = None
+                if self.ai_include_positioning:
+                    try:
+                        change_24h = (
+                            (float(closes[-1]) / float(closes[-24]) - 1) * 100
+                            if len(closes) > 24 else None
+                        )
+                        positioning = live_positioning(symbol, change_24h)
+                    except Exception as e:
+                        self.logger.warning(
+                            "AI positioning unavailable for %s: %s", symbol, e
+                        )
+
                 edges = (
                     self.edges.analyze_all_edges(
                         candles, funding, higher_tf_candles=htf_candles or None
@@ -340,6 +390,7 @@ class TradingEngine:
                 market.append(
                     symbol_snapshot(
                         symbol, candles, funding, htf_candles or None, edges,
+                        positioning,
                         include_oscillators=self.ai_include_osc,
                     )
                 )
@@ -354,12 +405,27 @@ class TradingEngine:
             closes_by_symbol, self.risk.correlation_lookback
         )
 
+        macro = None
+        sentiment = None
+        if self.ai_include_macro:
+            try:
+                macro = live_macro()
+            except Exception as e:
+                self.logger.warning("AI macro context unavailable: %s", e)
+        if self.ai_include_positioning:
+            try:
+                sentiment = latest_fear_greed()
+            except Exception as e:
+                self.logger.warning("AI sentiment unavailable: %s", e)
+
         context = build_context(
             symbols_data=market,
             account=account,
             risk=self.risk,
             recent_trades=self.risk.trade_history,
             competition=self._competition_context(),
+            fear_greed=sentiment,
+            macro=macro,
             position_conviction=self.position_conviction,
         )
         # Tell the model plainly when it may not open anything, so it reasons about
@@ -415,7 +481,9 @@ class TradingEngine:
             price = prices.get(sym) or pos.entry_price
             console.print(f"[yellow]AI closing {sym}: {d.get('rationale', '')[:100]}[/]")
             self.logger.info("AI_CLOSE %s reason=%s", sym, str(d.get("rationale"))[:200])
-            self._close_position(pos, price, "ai_close")
+            self._close_position(
+                pos, price, "ai_close", close_decision_id=decision_id
+            )
 
         # A fresh decision supersedes a resting order that no longer matches it —
         # the model has seen an hour of data the order has not. Same-side entries
@@ -858,8 +926,10 @@ class TradingEngine:
         # despite the record holding everything needed to complete it. Logs that
         # provably cannot be repaired are counted separately and stay quiet, so
         # they cannot desensitise us to a new failure.
-        gap = int(status.get("orders_without_ai_log") or 0) + int(
-            status.get("ai_logs_repairable_incomplete") or 0
+        gap = (
+            int(status.get("orders_without_ai_log") or 0)
+            + int(status.get("ai_logs_repairable_incomplete") or 0)
+            + int(status.get("official_upload_pending") or 0)
         )
         if gap and gap != self._last_compliance_gap:
             self.logger.critical(
@@ -879,6 +949,31 @@ class TradingEngine:
                 title="COMPLIANCE ALARM",
             ))
         self._last_compliance_gap = gap
+
+    def _record_execution_health(self):
+        """Publish the money-path gate consumed by Docker and the dashboard."""
+        try:
+            protection = self.exchange.protection_status()
+            delivery = (
+                self.decision_log.uploader.status()
+                if self.decision_log
+                else {"ready": self.exchange.mode == "paper", "enabled": False}
+            )
+            healthy = bool(protection.get("healthy")) and bool(delivery.get("ready"))
+            payload = {
+                "healthy": healthy,
+                "mode": self.exchange.mode,
+                "venue_protection": protection,
+                "ai_log_delivery": delivery,
+                "new_entries_allowed": healthy,
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            }
+            self.execution_health_path.parent.mkdir(parents=True, exist_ok=True)
+            self.execution_health_path.write_text(
+                json.dumps(payload, indent=1, default=str), encoding="utf-8"
+            )
+        except Exception as e:
+            self.logger.warning("could not write execution health: %s", e)
 
     def _competition_context(self) -> dict:
         """Scoring, trade count and clock — the model reasons about all three."""
@@ -1045,7 +1140,13 @@ class TradingEngine:
             signal.strength, size, signal.stop_loss, signal.take_profit, signal.reason,
         )
 
-        self.exchange.set_leverage(signal.symbol, signal.leverage)
+        if not self.exchange.set_leverage(signal.symbol, signal.leverage):
+            self.logger.error(
+                "ENTRY_BLOCKED %s: could not set leverage to %dx",
+                signal.symbol, signal.leverage,
+            )
+            console.print("[red]   Entry blocked: leverage setup failed[/]")
+            return
 
         if self.maker_entries:
             self._place_maker_entry(signal, size, atr=atr, decision_id=decision_id)
@@ -1079,11 +1180,14 @@ class TradingEngine:
             br = self.exchange._local_brackets.get(signal.symbol, {})
             br["partial_take_profit"] = signal.partial_take_profit
             br["partial_fraction"] = signal.partial_fraction
-            br["initial_size"] = size
+            br["initial_size"] = float(result.get("filled") or result.get("amount") or size)
             br["strategy"] = signal.strategy
             self.exchange._local_brackets[signal.symbol] = br
 
         order_id = str(result.get("id", "N/A"))
+        executed_size = float(result.get("filled") or result.get("amount") or size)
+        executed_stop = float(result.get("stop_loss") or signal.stop_loss)
+        executed_target = float(result.get("take_profit") or signal.take_profit)
         console.print(f"[green]   Order filled: {order_id}[/]")
         self.logger.info(
             "FILL %s %s size=%.6f id=%s SL=%.4f TP=%.4f",
@@ -1100,15 +1204,36 @@ class TradingEngine:
                 symbol=signal.symbol,
                 order_id=order_id,
                 side=signal.side.value,
-                size=size,
+                size=executed_size,
                 entry_price=signal.entry_price,
-                stop_loss=signal.stop_loss,
-                take_profit=signal.take_profit,
+                stop_loss=executed_stop,
+                take_profit=executed_target,
+                order_type="MARKET",
+            )
+            self._link_protection_orders(
+                decision_id, signal.symbol, signal.side, executed_size,
+                executed_stop, executed_target, result,
             )
             self.position_decisions[signal.symbol] = decision_id
         # Recorded regardless of decision linkage: the swap guard needs it even for
         # positions opened by a non-AI strategy.
         self.position_conviction[signal.symbol] = float(signal.strength)
+        if result.get("sl_placed") is False and self.exchange.mode != "paper":
+            self.logger.critical(
+                "UNPROTECTED ENTRY %s: venue stop missing; closing immediately",
+                signal.symbol,
+            )
+            emergency = self.exchange.close_position(signal.symbol)
+            if emergency.get("error"):
+                self.logger.critical(
+                    "EMERGENCY CLOSE FAILED %s: %s",
+                    signal.symbol, emergency.get("error"),
+                )
+            else:
+                self.position_decisions.pop(signal.symbol, None)
+                self.position_conviction.pop(signal.symbol, None)
+                self._persist_state()
+                return
         if result.get("sl_placed") is False and self.exchange.mode != "paper":
             console.print("[yellow]   SL not on exchange — software stop active[/]")
         if result.get("tp_placed") is False and self.exchange.mode != "paper":
@@ -1163,15 +1288,38 @@ class TradingEngine:
             self.logger.info("ENTRY_PLACE_FAILED %s: %s", signal.symbol, res["error"])
             return
 
+        actual_limit = float(res.get("limit_price") or touch)
+        actual_size = float(res.get("amount") or size)
+        actual_stop = float(res.get("stop_loss") or signal.stop_loss)
+        actual_target = float(res.get("take_profit") or signal.take_profit)
+        ai_log_linked = False
+        upload_ok = True
+        if self.exchange.mode != "paper" and decision_id and self.decision_log:
+            linkage = self.decision_log.link_order(
+                decision_id,
+                symbol=signal.symbol,
+                order_id=str(res["id"]),
+                side=signal.side.value,
+                size=actual_size,
+                entry_price=actual_limit,
+                stop_loss=actual_stop,
+                take_profit=actual_target,
+                order_type="LIMIT",
+            )
+            ai_log_linked = True
+            upload_ok = bool(
+                linkage and (linkage.get("upload") or {}).get("uploaded")
+            )
+
         now_iso = datetime.utcnow().isoformat()
         self.pending_entries[signal.symbol] = {
             "order_id": str(res["id"]),
             "side": signal.side.value,
-            "size": size,
-            "limit_price": touch,
+            "size": actual_size,
+            "limit_price": actual_limit,
             "signal_price": signal.entry_price,
-            "stop_loss": signal.stop_loss,
-            "take_profit": signal.take_profit,
+            "stop_loss": actual_stop,
+            "take_profit": actual_target,
             "partial_take_profit": signal.partial_take_profit,
             "partial_fraction": signal.partial_fraction,
             "strategy": signal.strategy,
@@ -1187,10 +1335,19 @@ class TradingEngine:
                 self.config.get("competition", {}).get("min_rr", 1.35)
             ),
             "decision_id": decision_id,
+            "sl_attached": bool(res.get("sl_attached")),
+            "ai_log_linked": ai_log_linked,
             "placed_at": now_iso,
             "last_reprice_at": now_iso,
             "reprices": 0,
         }
+        if self.exchange.mode != "paper" and not upload_ok:
+            self.logger.critical(
+                "ENTRY ORDER %s placed but UploadAiLog failed; cancelling without retrying trade",
+                res["id"],
+            )
+            self._abandon_pending(signal.symbol, self.pending_entries[signal.symbol], "ai_log_upload_failed")
+            return
         console.print(
             f"[cyan]   Entry resting at {touch:.6f} (maker) — "
             f"chases <= {self.max_chase_atr}x ATR, TTL {self.entry_ttl_sec / 60:.0f}min[/]"
@@ -1320,6 +1477,12 @@ class TradingEngine:
         if filled > 0:
             self._on_entry_fill(symbol, pe, filled, float(pe["limit_price"]))
             return
+        if not cancel.get("cancelled"):
+            self.logger.error(
+                "ENTRY_REPRICE_CANCEL_FAILED %s id=%s: %s",
+                symbol, pe["order_id"], cancel.get("error") or "order still open",
+            )
+            return
 
         res = self.exchange.place_entry_limit(
             symbol, side, float(pe["size"]), touch,
@@ -1335,14 +1498,106 @@ class TradingEngine:
             self._persist_state()
             return
 
+        actual_limit = float(res.get("limit_price") or touch)
+        actual_size = float(res.get("amount") or pe["size"])
+        actual_stop = float(res.get("stop_loss") or sl)
+        actual_target = float(res.get("take_profit") or tp)
+        reprice_upload_ok = True
+        if self.exchange.mode != "paper" and pe.get("decision_id") and self.decision_log:
+            linkage = self.decision_log.link_order(
+                str(pe["decision_id"]),
+                symbol=symbol,
+                order_id=str(res["id"]),
+                side=pe["side"],
+                size=actual_size,
+                entry_price=actual_limit,
+                stop_loss=actual_stop,
+                take_profit=actual_target,
+                order_type="LIMIT",
+            )
+            pe["ai_log_linked"] = True
+            reprice_upload_ok = bool(
+                linkage and (linkage.get("upload") or {}).get("uploaded")
+            )
         pe["order_id"] = str(res["id"])
-        pe["limit_price"] = touch
+        pe["sl_attached"] = bool(res.get("sl_attached"))
+        pe["limit_price"] = actual_limit
+        pe["size"] = actual_size
+        pe["stop_loss"] = actual_stop
+        pe["take_profit"] = actual_target
         pe["last_reprice_at"] = now.isoformat()
         pe["reprices"] = int(pe.get("reprices") or 0) + 1
         self.logger.info(
             "ENTRY_REPRICE %s -> %.6f (#%d)", symbol, touch, pe["reprices"]
         )
         self._persist_state()
+        if self.exchange.mode != "paper" and not reprice_upload_ok:
+            self.logger.critical(
+                "REPRICE ORDER %s placed but UploadAiLog failed; cancelling it",
+                res["id"],
+            )
+            self._abandon_pending(symbol, pe, "ai_log_upload_failed")
+
+    def _link_protection_orders(
+        self,
+        decision_id: str,
+        symbol: str,
+        position_side: Side,
+        size: float,
+        stop_loss: float,
+        take_profit: float,
+        result: dict,
+    ) -> None:
+        """Upload a matching log for each separate protective order request."""
+        if not self.decision_log or self.exchange.mode == "paper":
+            return
+        exit_side = "sell" if position_side == Side.LONG else "buy"
+        side_name = position_side.value.upper()
+        sl_id = result.get("sl_order_id")
+        if sl_id:
+            self.decision_log.link_order(
+                decision_id,
+                symbol=symbol,
+                order_id=str(sl_id),
+                side=exit_side,
+                size=size,
+                entry_price=0,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                intent="stop_loss",
+                position_side=side_name,
+                trigger_price=stop_loss,
+            )
+        tp_id = result.get("tp_order_id")
+        if tp_id:
+            if result.get("tp_trigger"):
+                self.decision_log.link_order(
+                    decision_id,
+                    symbol=symbol,
+                    order_id=str(tp_id),
+                    side=exit_side,
+                    size=size,
+                    entry_price=0,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    intent="take_profit_trigger",
+                    position_side=side_name,
+                    trigger_price=take_profit,
+                )
+            else:
+                self.decision_log.link_order(
+                    decision_id,
+                    symbol=symbol,
+                    order_id=str(tp_id),
+                    side=exit_side,
+                    size=size,
+                    entry_price=take_profit,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    order_type="LIMIT",
+                    intent="reduce",
+                    position_side=side_name,
+                )
 
     def _on_entry_fill(self, symbol: str, pe: dict, filled_amount: float, fill_price: float):
         side = Side(pe["side"])
@@ -1353,6 +1608,7 @@ class TradingEngine:
             strategy=pe.get("strategy") or "",
             partial_take_profit=pe.get("partial_take_profit"),
             partial_fraction=float(pe.get("partial_fraction") or 0.5),
+            stop_attached=bool(pe.get("sl_attached")),
         )
         console.print(
             f"[green]Maker entry filled: {pe['side']} {symbol} "
@@ -1367,19 +1623,41 @@ class TradingEngine:
 
         decision_id = pe.get("decision_id")
         if decision_id and self.decision_log:
-            self.decision_log.link_order(
-                decision_id,
-                symbol=symbol,
-                order_id=str(pe["order_id"]),
-                side=pe["side"],
-                size=filled_amount,
-                entry_price=fill_price,
-                stop_loss=float(pe["stop_loss"]),
-                take_profit=float(pe["take_profit"]),
+            if self.exchange.mode == "paper" or not pe.get("ai_log_linked"):
+                self.decision_log.link_order(
+                    decision_id,
+                    symbol=symbol,
+                    order_id=str(pe["order_id"]),
+                    side=pe["side"],
+                    size=filled_amount,
+                    entry_price=fill_price,
+                    stop_loss=float(pe["stop_loss"]),
+                    take_profit=float(pe["take_profit"]),
+                    order_type="LIMIT",
+                )
+            self._link_protection_orders(
+                decision_id, symbol, side, filled_amount,
+                float(pe["stop_loss"]), float(pe["take_profit"]), fin,
             )
             self.position_decisions[symbol] = decision_id
         self.position_conviction[symbol] = float(pe.get("strength") or 0.0)
 
+        if fin.get("sl_placed") is False and self.exchange.mode != "paper":
+            self.logger.critical(
+                "UNPROTECTED MAKER FILL %s: venue stop missing; closing immediately",
+                symbol,
+            )
+            emergency = self.exchange.close_position(symbol)
+            if emergency.get("error"):
+                self.logger.critical(
+                    "EMERGENCY CLOSE FAILED %s: %s", symbol, emergency.get("error")
+                )
+            else:
+                self.position_decisions.pop(symbol, None)
+                self.position_conviction.pop(symbol, None)
+                self.pending_entries.pop(symbol, None)
+                self._persist_state()
+                return
         if fin.get("sl_placed") is False and self.exchange.mode != "paper":
             console.print("[yellow]   SL not on exchange — software stop active[/]")
         if fin.get("tp_placed") is False and self.exchange.mode != "paper":
@@ -1395,6 +1673,13 @@ class TradingEngine:
             # The cancel raced a fill. The money is in — bracket it, don't orphan it.
             self._on_entry_fill(symbol, pe, filled, float(pe["limit_price"]))
             return
+        if not cancel.get("cancelled"):
+            self.logger.error(
+                "ENTRY_ABANDON_CANCEL_FAILED %s id=%s reason=%s: %s",
+                symbol, pe["order_id"], reason,
+                cancel.get("error") or "order still open",
+            )
+            return
         console.print(
             f"[yellow]Entry missed ({reason}): {symbol} never filled at "
             f"{float(pe['limit_price']):.6f} — no fee paid, no trade[/]"
@@ -1405,6 +1690,75 @@ class TradingEngine:
         )
         self.pending_entries.pop(symbol, None)
         self._persist_state()
+
+    def _reconcile_external_closures(self, account):
+        """Book venue-side SL/TP fills that completed between polling cycles."""
+        for event in self.exchange.detect_external_closures(account.positions):
+            position = event["position"]
+            exit_price = float(event["exit_price"])
+            actual_maker = bool(event.get("maker"))
+            rate = (
+                self.exchange.maker_fee_rate
+                if actual_maker else self.exchange.commission_rate
+            )
+            exit_fee = (
+                float(event["fee"])
+                if event.get("fee") is not None
+                else position.size * exit_price * rate
+            )
+            final_leg = position.calculate_pnl(exit_price) - exit_fee
+            pnl = final_leg + position.realized_pnl - position.entry_fee
+            fees = position.fees_paid + exit_fee
+            sized_for_margin = position.initial_size or position.size
+            margin = sized_for_margin * position.entry_price / max(position.leverage, 1)
+            pnl_pct = pnl / margin * 100 if margin else 0.0
+            duration = int((datetime.utcnow() - position.opened_at).total_seconds())
+            reason = str(event.get("reason") or "external_close")
+
+            trade_result = TradeResult(
+                symbol=position.symbol,
+                side=position.side,
+                entry_price=position.entry_price,
+                exit_price=exit_price,
+                size=sized_for_margin,
+                leverage=position.leverage,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+                duration_seconds=duration,
+                exit_reason=reason,
+                strategy=position.strategy,
+                banked_pnl=position.realized_pnl,
+                fees=fees,
+            )
+            self.risk.record_trade(trade_result)
+            self.strategy.sync_scores_from_risk(self.risk)
+
+            opening_decision_id = self.position_decisions.pop(position.symbol, None)
+            self.position_conviction.pop(position.symbol, None)
+            if opening_decision_id and self.decision_log:
+                self.decision_log.record_outcome(
+                    opening_decision_id,
+                    symbol=position.symbol,
+                    order_id=str(event.get("order_id") or ""),
+                    pnl=pnl,
+                    exit_price=exit_price,
+                    exit_reason=reason,
+                )
+            if pnl < 0:
+                self.strategy.record_loss(datetime.utcnow())
+            else:
+                self.strategy.record_win()
+            self.exchange.acknowledge_external_close(position.symbol)
+            self.logger.info(
+                "EXTERNAL_CLOSE_RECOVERED %s %s pnl=%.2f fees=%.4f reason=%s exit=%s",
+                position.symbol, position.side.value, pnl, fees, reason,
+                "maker" if actual_maker else "taker",
+            )
+            console.print(
+                f"[cyan]Recovered venue close: {position.symbol} "
+                f"PnL=${pnl:.2f} ({reason})[/]"
+            )
+            self._persist_state()
 
     def _manage_positions(self, account):
         candles_cache = {}
@@ -1528,10 +1882,20 @@ class TradingEngine:
         reason: str,
         *,
         maker_price: float | None = None,
+        close_decision_id: str | None = None,
     ):
         result = self.exchange.close_position(position.symbol, maker_price=maker_price)
         if isinstance(result, dict) and result.get("error"):
             console.print(f"[red]   Close failed: {result['error']}[/]")
+            return
+        if (
+            isinstance(result, dict)
+            and str(result.get("reason") or "").startswith("no_position")
+        ):
+            self.logger.warning(
+                "Close reconciliation needed for %s: venue reports no position",
+                position.symbol,
+            )
             return
 
         exit_price = (
@@ -1548,12 +1912,14 @@ class TradingEngine:
             # Live: a proven maker exit rested at our own price, so it pays the
             # maker rate. Charging taker here would understate the live book
             # against the paper one and re-open the §2e comparability problem.
-            rate = (
-                self.exchange.maker_fee_rate
-                if maker_price
-                else self.exchange.commission_rate
+            actual_maker = bool(result.get("maker")) if isinstance(result, dict) else False
+            rate = self.exchange.maker_fee_rate if actual_maker else self.exchange.commission_rate
+            reported_fee = result.get("fee") if isinstance(result, dict) else None
+            exit_fee = (
+                float(reported_fee)
+                if reported_fee is not None
+                else position.size * exit_price * rate
             )
-            exit_fee = position.size * exit_price * rate
             final_leg = position.calculate_pnl(exit_price) - exit_fee
 
         # Round trip = partial legs already banked + this leg, net of every fee
@@ -1589,11 +1955,25 @@ class TradingEngine:
 
         # Write the realised result back against the decision that opened it, so the
         # log shows not just what the model thought but what it actually earned.
-        decision_id = self.position_decisions.pop(position.symbol, None)
+        opening_decision_id = self.position_decisions.pop(position.symbol, None)
         self.position_conviction.pop(position.symbol, None)
-        if decision_id and self.decision_log:
+        if close_decision_id and self.decision_log and isinstance(result, dict):
+            self.decision_log.link_order(
+                close_decision_id,
+                symbol=position.symbol,
+                order_id=str(result.get("id") or ""),
+                side="sell" if position.side == Side.LONG else "buy",
+                size=position.size,
+                entry_price=exit_price,
+                stop_loss=position.stop_loss,
+                take_profit=position.take_profit,
+                order_type="MARKET",
+                intent="reduce",
+                position_side=position.side.value.upper(),
+            )
+        if opening_decision_id and self.decision_log:
             self.decision_log.record_outcome(
-                decision_id,
+                opening_decision_id,
                 symbol=position.symbol,
                 order_id=str(result.get("id", "")) if isinstance(result, dict) else "",
                 pnl=pnl,
@@ -1616,7 +1996,7 @@ class TradingEngine:
             "CLOSE %s %s pnl=%.2f banked=%.2f fees=%.4f reason=%s strategy=%s exit=%s",
             position.symbol, position.side.value, pnl,
             position.realized_pnl, fees, reason, position.strategy,
-            "maker" if maker_price else "taker",
+            "maker" if isinstance(result, dict) and result.get("maker") else "taker",
         )
         self._persist_state()
 
@@ -1627,6 +2007,7 @@ class TradingEngine:
                 for k, v in self.strategy.last_trade_time.items()
             }
             account = self.exchange.snapshot_for_dashboard()
+            self._record_execution_health()
             # Keep a rolling equity tick for the dashboard curve (live mark-to-market)
             prev = load_state(self.state_path)
             ticks = list(prev.get("equity_ticks") or [])
@@ -1643,7 +2024,7 @@ class TradingEngine:
                 self.state_path,
                 {
                     "risk": self.risk.to_state(),
-                    "paper": self.exchange.to_state(),
+                    "exchange": self.exchange.to_state(),
                     "account": account,
                     "equity_ticks": ticks,
                     "last_trade_time": lt,

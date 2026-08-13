@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Response
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -550,15 +550,19 @@ def health():
     # Decision-layer liveness and ai-log coverage, both published by the bot.
     # Surfaced here because "is the brain alive and are we compliant" should be
     # answerable without an SSH session.
-    def _sidecar(name: str) -> dict:
+    def _sidecar(name: str) -> tuple[dict, float | None]:
         try:
             p = st.parent / name
-            return json.loads(p.read_text()) if p.exists() else {}
+            if not p.exists():
+                return {}, None
+            age = max(0.0, datetime.now(timezone.utc).timestamp() - p.stat().st_mtime)
+            return json.loads(p.read_text()), age
         except Exception:
-            return {}
+            return {}, None
 
-    ai = _sidecar("ai_health.json")
-    comp = _sidecar("compliance.json")
+    ai, ai_age = _sidecar("ai_health.json")
+    comp, comp_age = _sidecar("compliance.json")
+    execution, execution_age = _sidecar("execution_health.json")
     gap = comp.get("orders_without_ai_log")
     # Provider credit, surfaced next to liveness because it is the dependency that
     # took the bot down for 65h while every other field here stayed green.
@@ -567,8 +571,34 @@ def health():
         alerts = json.loads((st.parent / "alerts.json").read_text() or "[]")
     except Exception:
         alerts = []
-    return {
-        "ok": True,
+    state_age = (
+        max(0.0, datetime.now(timezone.utc).timestamp() - st.stat().st_mtime)
+        if st.exists() else None
+    )
+    ai_required = bool((cfg.get("ai") or {}).get("enabled", False))
+    failures = []
+    if not _config_path().exists():
+        failures.append("config missing")
+    if state_age is None or state_age >= 600:
+        failures.append("state missing or stale")
+    if not log.exists():
+        failures.append("trading log missing")
+    if ai_required and (not ai.get("healthy") or ai_age is None or ai_age >= 11000):
+        failures.append("AI decision layer unhealthy or stale")
+    if ai_required and (
+        not comp.get("compliant") or comp_age is None or comp_age >= 11000
+    ):
+        failures.append("AI-log compliance unhealthy or stale")
+    if (
+        not execution.get("healthy")
+        or execution_age is None
+        or execution_age >= 600
+    ):
+        failures.append("execution protection/delivery unhealthy or stale")
+
+    payload = {
+        "ok": not failures,
+        "failures": failures,
         "config_exists": _config_path().exists(),
         "state_exists": st.exists(),
         "log_exists": log.exists(),
@@ -581,6 +611,7 @@ def health():
         "ai_consecutive_failures": ai.get("consecutive_failures"),
         "ai_error_kind": ai.get("last_error_kind"),
         "ai_terminal_failure": ai.get("terminal"),
+        "ai_health_age_sec": ai_age,
         "ai_credit_balance": bal.get("balance"),
         "ai_credit_currency": bal.get("currency"),
         "ai_credit_available": bal.get("available"),
@@ -592,7 +623,15 @@ def health():
         "ai_logs_repairable_incomplete": comp.get("ai_logs_repairable_incomplete"),
         "ai_logs_unrepairable_historical": comp.get("ai_logs_unrepairable_historical"),
         "compliance_note": comp.get("note") or None,
+        "compliance_age_sec": comp_age,
+        "official_upload_pending": comp.get("official_upload_pending"),
+        "execution_healthy": execution.get("healthy"),
+        "execution_health_age_sec": execution_age,
+        "venue_protection": execution.get("venue_protection"),
+        "ai_log_delivery": execution.get("ai_log_delivery"),
+        "state_age_sec": state_age,
     }
+    return JSONResponse(payload, status_code=200 if payload["ok"] else 503)
 
 
 @app.get("/api/edges")

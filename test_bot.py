@@ -709,4 +709,214 @@ assert _maker["pnl"] > _taker["pnl"], (_maker["pnl"], _taker["pnl"])
 print(f"maker TP exit OK (fee {_taker['fee']:.4f} -> {_maker['fee']:.4f}, "
       f"pnl +{_maker['pnl'] - _taker['pnl']:.4f} on this exit)")
 
+print("\n=== LIVE SAFETY STATE SURVIVES RESTART ===")
+_live_state = ExchangeClient.__new__(ExchangeClient)
+_live_state.mode = "live"
+_live_state._local_brackets = {
+    "BTC/USDT:USDT": {
+        "stop_loss": 96.0,
+        "take_profit": 120.0,
+        "opened_at": "2026-08-13T10:00:00",
+        "sl_order_id": "sl-1",
+        "tp_order_id": "tp-1",
+        "trailing_stop": 101.0,
+    }
+}
+_saved_live = _live_state.to_state()
+_restored_live = ExchangeClient.__new__(ExchangeClient)
+_restored_live.mode = "live"
+_restored_live._local_brackets = {}
+_restored_live.load_state(_saved_live)
+assert _restored_live._local_brackets == _live_state._local_brackets
+print("live bracket ids, trail and open time restore exactly")
+
+print("\n=== CURRENT WEEX CONDITIONAL ORDER CONTRACT ===")
+class _OrderRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def create_order(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return {"id": f"o{len(self.calls)}"}
+
+
+_br = ExchangeClient.__new__(ExchangeClient)
+_br.exchange = _OrderRecorder()
+_br.maker_exits = True
+_br.normalize_price = lambda symbol, price: price
+_placed = _br._create_live_brackets(
+    "BTC/USDT:USDT", Side.LONG, 0.01, 96.0, 120.0
+)
+_sl_args, _sl_kwargs = _br.exchange.calls[0]
+assert _sl_args[1] == "market", _sl_args
+assert _sl_kwargs["params"]["stopLossPrice"] == 96.0
+assert "stopPrice" not in _sl_kwargs["params"]
+assert _placed["sl_placed"] and _placed["sl_order_id"] == "o1"
+assert _placed["tp_placed"] and _placed["tp_order_id"] == "o2"
+print("standalone SL uses stopLossPrice and a MARKET trigger request")
+
+_pending_exchange = _OrderRecorder()
+_pending_client = ExchangeClient.__new__(ExchangeClient)
+_pending_client.mode = "live"
+_pending_client.exchange = _pending_exchange
+_pending_client.normalize_amount = lambda symbol, amount: amount
+_pending_client.normalize_price = lambda symbol, price: price
+_pending_order = _pending_client.place_entry_limit(
+    "BTC/USDT:USDT", Side.LONG, 0.01, 99.9,
+    stop_loss=96.0, take_profit=120.0,
+)
+_entry_params = _pending_exchange.calls[0][1]["params"]
+assert _entry_params["timeInForce"] == "POST_ONLY"
+assert _entry_params["stopLoss"] == {
+    "triggerPrice": 96.0, "triggerPriceType": "mark"
+}
+assert _pending_order["sl_attached"] is True
+print("resting entry carries its stop atomically in the accepted order request")
+
+print("\n=== LIVE MARKET CLOSE CANNOT MASQUERADE AS MAKER ===")
+class _LiveCloseExchange:
+    def __init__(self):
+        self.created = []
+        self.cancelled = []
+
+    def cancel_order(self, order_id, symbol, params=None):
+        self.cancelled.append((order_id, bool((params or {}).get("trigger"))))
+        return {"id": order_id}
+
+    def fetch_positions(self, symbols):
+        return [{"symbol": symbols[0], "side": "long", "contracts": 0.5}]
+
+    def create_order(self, *args, **kwargs):
+        self.created.append((args, kwargs))
+        return {"id": "close-1", "average": 119.5, "fee": {"cost": 0.035}}
+
+
+_lc = ExchangeClient.__new__(ExchangeClient)
+_lc.mode = "live"
+_lc.exchange = _LiveCloseExchange()
+_lc._local_brackets = {
+    "BTC/USDT:USDT": {
+        "side": "long", "stop_loss": 96.0,
+        "sl_order_id": "sl-1", "sl_trigger": True,
+        "tp_order_id": "tp-1", "tp_trigger": False,
+    }
+}
+_closed = _lc.close_position("BTC/USDT:USDT", maker_price=120.0)
+assert _lc.exchange.created[0][0][1] == "market"
+assert _closed["maker"] is False and _closed["execution"] == "taker"
+assert _closed["fee"] == 0.035 and _closed["exit_price"] == 119.5
+assert set(_lc.exchange.cancelled) == {("sl-1", True), ("tp-1", False)}
+print("actual request/fill class drives fee accounting; sibling brackets cancelled")
+
+print("\n=== VENUE-SIDE CLOSES CANNOT VANISH FROM HISTORY ===")
+class _TradeHistoryExchange:
+    def fetch_my_trades(self, symbol, since=None, limit=None):
+        return [{
+            "order": "tp-9", "side": "sell", "amount": 0.5, "price": 120.0,
+            "takerOrMaker": "maker", "fee": {"cost": 0.012},
+        }]
+
+
+_recovery = ExchangeClient.__new__(ExchangeClient)
+_recovery.mode = "live"
+_recovery.exchange = _TradeHistoryExchange()
+_recovery._local_brackets = {
+    "BTC/USDT:USDT": {
+        "side": "long", "entry_price": 100.0, "size": 0.5, "initial_size": 0.5,
+        "leverage": 5, "stop_loss": 96.0, "take_profit": 120.0,
+        "opened_at": "2026-08-13T10:00:00", "missing_since": "2026-08-13T10:01:00",
+        "tp_order_id": "tp-9", "entry_fee": 0.01, "fees_paid": 0.01,
+    }
+}
+_events = _recovery.detect_external_closures([])
+assert len(_events) == 1
+assert _events[0]["reason"] == "take_profit"
+assert _events[0]["maker"] is True and _events[0]["fee"] == 0.012
+assert _events[0]["position"].opened_at == datetime(2026, 8, 13, 10, 0)
+print("missing position is recovered from private fills with actual price, fee and order id")
+
+print("\n=== OFFICIAL UPLOADAILOG IS SIGNED AND DURABLE ===")
+from unittest.mock import patch
+from src.ai import wars_log
+
+_upload_root = Path(tempfile.mkdtemp())
+_payload = {
+    "stage": "Strategy Generation",
+    "model": "deepseek-v4-pro",
+    "input": {
+        "messages": [{"role": "user", "content": "trade only this snapshot"}],
+        "market_context": {"symbol": "BTC/USDT:USDT", "price": 100},
+    },
+    "output": {
+        "symbol": "BTCUSDT", "side": "BUY", "positionSide": "LONG",
+        "type": "LIMIT", "quantity": 0.01, "price": 99.9,
+    },
+    "explanation": "The supplied snapshot and prompt support this concrete entry.",
+    "orderId": 123,
+}
+_ai_file = _upload_root / "ai.json"
+_ai_file.write_text(json.dumps(_payload), encoding="utf-8")
+_uploader = wars_log.WeexAILogUploader(
+    enabled=True, status_dir=_upload_root / "status"
+)
+_uploader.api_key = "k"
+_uploader.api_secret = "s"
+_uploader.passphrase = "p"
+
+class _UploadResponse:
+    status = 200
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    def read(self): return b'{"code":"00000","data":"upload success"}'
+
+_captured_request = []
+def _fake_urlopen(req, timeout):
+    _captured_request.append(req)
+    return _UploadResponse()
+
+with patch.object(wars_log.request, "urlopen", _fake_urlopen):
+    _upload_status = _uploader.register(_ai_file, required=True)
+assert _upload_status["uploaded"] is True
+assert _captured_request[0].full_url.endswith("/capi/v3/order/uploadAiLog")
+assert _captured_request[0].headers.get("Access-sign")
+assert _uploader.status()["pending"] == 0
+print("successful upload is recorded; retries can distinguish log delivery from trade execution")
+
+print("\n=== DASHBOARD HEALTH FAILS CLOSED ===")
+import os as _os
+import dashboard.app as _dashboard
+
+_health_root = Path(tempfile.mkdtemp())
+(_health_root / "data").mkdir()
+(_health_root / "logs").mkdir()
+(_health_root / "config.yaml").write_text(
+    "ai:\n  enabled: true\nlogging:\n  state_file: data/bot_state.json\n  file: logs/trading.log\n",
+    encoding="utf-8",
+)
+(_health_root / "data" / "bot_state.json").write_text(
+    json.dumps({"risk": {"trade_history": []}}), encoding="utf-8"
+)
+(_health_root / "logs" / "trading.log").write_text("healthy\n", encoding="utf-8")
+(_health_root / "data" / "ai_health.json").write_text(
+    json.dumps({"healthy": True}), encoding="utf-8"
+)
+(_health_root / "data" / "compliance.json").write_text(
+    json.dumps({"compliant": True, "orders_without_ai_log": 0}), encoding="utf-8"
+)
+_execution_file = _health_root / "data" / "execution_health.json"
+_execution_file.write_text(json.dumps({"healthy": True}), encoding="utf-8")
+_old_root = _dashboard.ROOT
+try:
+    _dashboard.ROOT = _health_root
+    _green = _dashboard.health()
+    assert _green.status_code == 200, _green.body
+    stale = datetime.now().timestamp() - 700
+    _os.utime(_execution_file, (stale, stale))
+    _red = _dashboard.health()
+    assert _red.status_code == 503, _red.body
+    assert "execution protection/delivery unhealthy or stale" in json.loads(_red.body)["failures"]
+finally:
+    _dashboard.ROOT = _old_root
+print("health is 200 only while state, AI, compliance and execution sidecars are fresh")
+
 print("\n=== ALL TESTS PASSED ===")

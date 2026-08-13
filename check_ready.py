@@ -1,5 +1,6 @@
-"""Paper/Live readiness checklist for WEEX AI Wars bot v8.3"""
+"""Non-mutating readiness gate for the WEEX AI Wars bot."""
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -15,6 +16,12 @@ console = Console()
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--target", choices=("paper", "live"), default="live",
+        help="assess this target without changing config or placing an order",
+    )
+    args = parser.parse_args()
     ok = 0
     fail = 0
     rows = []
@@ -42,6 +49,21 @@ def main():
         check("HTF bias on", cfg.get("competition", {}).get("htf_directional_bias", False))
         check("risk/trade <= 2%", cfg.get("risk", {}).get("max_risk_per_trade", 1) <= 0.02)
         check("max DD <= 20%", cfg.get("risk", {}).get("max_drawdown", 1) <= 0.20)
+        if args.target == "live":
+            check(
+                "live remains disarmed for rehearsal",
+                mode == "paper",
+                "keep trading.mode=paper until the supervised minimum-size test",
+            )
+            check("AI decision layer enabled", bool((cfg.get("ai") or {}).get("enabled")))
+            check(
+                "maker entries enabled",
+                bool((cfg.get("execution") or {}).get("maker_entries")),
+            )
+            check(
+                "venue leverage ceiling <= 20x",
+                cfg.get("trading", {}).get("max_leverage", 99) <= 20,
+            )
 
     # Env
     from dotenv import load_dotenv
@@ -52,6 +74,16 @@ def main():
     check(".env API key present", bool(key) and key != "your_api_key_here", "set WEEX_API_KEY")
     check(".env secret present", bool(secret) and secret != "your_api_secret_here")
     check("passphrase present", bool(phrase) and "your_passphrase" not in phrase)
+    if args.target == "live":
+        check("DeepSeek key present", bool(os.getenv("DEEPSEEK_API_KEY", "")))
+        try:
+            from src.ai.wars_log import WeexAILogUploader
+
+            uploader = WeexAILogUploader(enabled=True)
+            ready, why = uploader.readiness()
+            check("official WEEX AI-log delivery ready", ready, why)
+        except Exception as e:
+            check("official WEEX AI-log delivery ready", False, str(e))
 
     # Imports
     try:
@@ -113,10 +145,11 @@ def main():
         "  3. python -m src.main\n"
         "  4. Confirm every fill logs Stop + TP\n\n"
         "Live path (only after paper is clean):\n"
-        "  1. Fill .env keys\n"
-        "  2. trading.mode: live\n"
+        "  1. Keep trading.mode: paper while this gate is red\n"
+        "  2. Verify the account is AI-Wars allowlisted\n"
         "  3. Start leverage 3–5\n"
-        "  4. Watch first 3 orders manually",
+        "  4. Confirm UploadAiLog says upload success before another entry\n"
+        "  5. Only then arm live mode and watch the first three round trips",
         title="Next Steps",
     ))
     return 0 if fail == 0 else 1
