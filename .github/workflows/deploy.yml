@@ -87,27 +87,21 @@ jobs:
         env:
           SSH_HOST: ${{ secrets.DEPLOY_HOST }}
           SSH_USER: ${{ secrets.DEPLOY_USER }}
-          DASHBOARD_PUBLIC_URL: ${{ secrets.DASHBOARD_PUBLIC_URL }}
         run: |
+          set -euo pipefail
           SSH_HOST="${SSH_HOST:-45.88.191.129}"
           SSH_USER="${SSH_USER:-farouk}"
-          # The dashboard is intentionally loopback-only unless an authenticated
-          # reverse-proxy URL is configured explicitly.  An empty value must fall
-          # through to the SSH localhost probe below.
-          DASHBOARD_PUBLIC_URL="${DASHBOARD_PUBLIC_URL:-}"
-          # Prefer public URL if set; else curl via SSH localhost
-          if [ -n "${DASHBOARD_PUBLIC_URL:-}" ]; then
-            echo "Checking $DASHBOARD_PUBLIC_URL/api/health"
-            for i in 1 2 3 4 5; do
-              health="$(curl -fsS "$DASHBOARD_PUBLIC_URL/api/health" || true)"
-              if HEALTH="$health" python -c 'import json,os; d=json.loads(os.environ["HEALTH"]); assert d.get("ok") is True, d.get("failures")'; then
-                echo "Dashboard healthy"
-                exit 0
-              fi
-              sleep 5
-            done
-            echo "Dashboard healthcheck failed"
-            exit 1
-          fi
-          ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" \
-            "curl -fsS http://127.0.0.1:8787/api/health"
+          echo "Checking dashboard through VPS loopback"
+          for i in 1 2 3 4 5; do
+            if health="$(ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=yes -o ConnectTimeout=10 \
+              "$SSH_USER@$SSH_HOST" \
+              "curl -fsS http://127.0.0.1:8787/api/health")" && \
+              HEALTH="$health" python -c 'import json,os; d=json.loads(os.environ["HEALTH"]); assert d.get("ok") is True, d.get("failures")'; then
+              echo "Dashboard healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Dashboard healthcheck failed"
+          exit 1
