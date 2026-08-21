@@ -112,7 +112,7 @@ Quick local prod-like stack:
 ```bash
 cp .env.example .env
 docker compose up -d --build
-# bot + dashboard on :8787
+# bot + paper dashboard published on IPv4 :8787
 ```
 
 ## What’s new in v8.5

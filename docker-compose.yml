@@ -5,7 +5,7 @@
 #
 # Services:
 #   bot       — trading engine (paper/live)
-#   dashboard — monitoring UI on VPS loopback :8787 (use an SSH tunnel)
+#   dashboard — paper-monitoring UI published on VPS IPv4 :8787
 
 services:
   bot:
@@ -62,8 +62,9 @@ services:
       - .env
     ports:
       # The dashboard exposes positions, logs and state and has no built-in login.
-      # Keep it off the public interface; operators connect through SSH forwarding.
-      - "127.0.0.1:${DASHBOARD_PORT:-8787}:8787"
+      # This paper deployment intentionally publishes it on VPS IPv4. Restrict
+      # the bind or add authentication before reusing this setup with live funds.
+      - "0.0.0.0:${DASHBOARD_PORT:-8787}:8787"
     volumes:
       # Read same state/logs the bot writes
       - bot-data:/app/data:ro

@@ -15,9 +15,10 @@ class DeployHygieneTests(unittest.TestCase):
         for required in {".env*", "deploy_key*", "id_rsa*", "id_ed25519*", "*.pem", "*.key", "data", "logs"}:
             self.assertIn(required, patterns)
 
-    def test_dashboard_is_loopback_only_and_ci_always_uses_ssh_loopback(self):
+    def test_paper_dashboard_is_public_but_ci_uses_ssh_loopback(self):
         compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-        self.assertIn('"127.0.0.1:${DASHBOARD_PORT:-8787}:8787"', compose)
+        self.assertIn('"0.0.0.0:${DASHBOARD_PORT:-8787}:8787"', compose)
+        self.assertNotIn('"127.0.0.1:${DASHBOARD_PORT:-8787}:8787"', compose)
 
         workflow_path = ROOT / ".github" / "workflows" / "deploy.yml"
         if not workflow_path.exists():
