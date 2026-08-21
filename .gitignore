@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 deploy_key
 deploy_key.pub
 DEPLOY.md

@@ -1,4 +1,4 @@
-"""WEEX AI Wars II — Risk Management Engine v8.4
+"""WEEX competition-rehearsal risk management engine v8.4
 
 - Strength + pair + strategy adaptive sizing
 - Partial take-profit support
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 class RiskManager:
     def __init__(self, config: dict):
         risk_config = config.get("risk", {})
+        backtest_config = config.get("backtest", {})
         self.max_risk_per_trade = risk_config.get("max_risk_per_trade", 0.015)
         self.max_drawdown = risk_config.get("max_drawdown", 0.15)
         self.max_open_positions = risk_config.get("max_open_positions", 2)
@@ -82,6 +83,12 @@ class RiskManager:
         self.default_win_rate = sizing_config.get("default_win_rate", 0.50)
         self.min_position_usd = sizing_config.get("min_position_usd", 10)
         self.max_position_pct = sizing_config.get("max_position_pct", 0.20)
+        try:
+            self.initial_capital = float(backtest_config.get("initial_capital", 10000))
+        except (TypeError, ValueError):
+            self.initial_capital = 10000.0
+        if not np.isfinite(self.initial_capital) or self.initial_capital <= 0:
+            self.initial_capital = 10000.0
 
         self.pair_weights: dict[str, float] = {}
         self.pair_sharpes: dict[str, list[float]] = {}
@@ -94,6 +101,10 @@ class RiskManager:
         self.trades_since_win = 0
         self.daily_pnl = 0.0
         self.daily_reset_date = datetime.utcnow().date()
+        # Mark-to-market baseline for the UTC trading day. Unlike daily_pnl, this
+        # sees unrealized PnL and funding because can_trade() compares it with the
+        # venue/account equity observed on every cycle.
+        self.daily_start_equity: Optional[float] = None
         self.trade_history: list[TradeResult] = []
         self.is_killed = False
         self.cooldown_until: Optional[datetime] = None
@@ -108,6 +119,17 @@ class RiskManager:
         if today != self.daily_reset_date:
             self.daily_pnl = 0.0
             self.daily_reset_date = today
+            self.daily_start_equity = (
+                float(account.equity)
+                if np.isfinite(account.equity) and account.equity > 0
+                else None
+            )
+        elif self.daily_start_equity is None:
+            # New installs and legacy state files have no trustworthy day-open
+            # equity. Establish it from the first real account snapshot instead of
+            # guessing from realised PnL or peak equity and risking a false halt.
+            if np.isfinite(account.equity) and account.equity > 0:
+                self.daily_start_equity = float(account.equity)
 
         if account.equity > self.peak_equity:
             self.peak_equity = account.equity
@@ -121,10 +143,16 @@ class RiskManager:
         if self.is_killed:
             return False, "Trading halted by kill-switch"
 
-        if self.peak_equity > 0:
-            daily_loss_pct = abs(self.daily_pnl) / self.peak_equity
-            if self.daily_pnl < 0 and daily_loss_pct >= self.daily_loss_limit:
-                return False, f"Daily loss limit reached: {daily_loss_pct:.1%}"
+        if self.daily_start_equity is not None and self.daily_start_equity > 0:
+            daily_equity_change = float(account.equity) - self.daily_start_equity
+            daily_loss_pct = max(0.0, -daily_equity_change / self.daily_start_equity)
+            if daily_loss_pct >= self.daily_loss_limit:
+                return (
+                    False,
+                    f"Daily loss limit reached: {daily_loss_pct:.1%} "
+                    f"(equity {account.equity:.2f} vs day start "
+                    f"{self.daily_start_equity:.2f})",
+                )
 
         # Time-based loss cooldown (fixed deadlock: old logic needed wins to resume)
         if self.cooldown_until is not None:
@@ -318,7 +346,7 @@ class RiskManager:
     ) -> tuple[float, str]:
         """Multiplier in [0,1] for `size` honouring BOTH correlation budgets.
 
-        Two different questions, both scored by the competition:
+        Two different internal risk questions:
           - stop-out risk : what if every stop fires at once (risk management)
           - net notional  : how hard does the equity curve swing (stability)
         The binding one wins, so the trade is scaled to satisfy whichever is tighter.
@@ -442,13 +470,17 @@ class RiskManager:
 
         strength = max(0.05, min(1.0, signal.strength if signal.strength else 0.5))
         strat_w = self.get_strategy_weight(signal.strategy)
-        risk_amount = (
-            account.equity
-            * self.max_risk_per_trade
-            * strength
-            * pair_weight
-            * strat_w
-        )
+
+        # Strength defines the base stop-dollar budget. Adaptive weights are
+        # allowed to de-risk it, never lever it up: otherwise a strong pair and a
+        # winning strategy can multiply max_risk_per_trade beyond its advertised
+        # hard limit. Clamp each independently so one winning weight cannot undo
+        # the other's reduction.
+        pair_scale = max(0.0, min(1.0, float(pair_weight)))
+        strategy_scale = max(0.0, min(1.0, float(strat_w)))
+        adaptive_scale = pair_scale * strategy_scale
+        base_risk_amount = account.equity * self.max_risk_per_trade * strength
+        risk_amount = base_risk_amount * adaptive_scale
 
         stop_distance_usd = abs(signal.entry_price - signal.stop_loss)
         if stop_distance_usd <= 0:
@@ -462,7 +494,7 @@ class RiskManager:
             amount *= kelly
 
         max_amount = (
-            account.equity * self.max_position_pct * strength * strat_w
+            account.equity * self.max_position_pct * strength * adaptive_scale
         ) / signal.entry_price
         amount = min(amount, max_amount)
 
@@ -470,6 +502,11 @@ class RiskManager:
             account.available_margin * 0.9 * max(signal.leverage, 1)
         ) / signal.entry_price
         amount = min(amount, max_margin_amount)
+
+        # Final post-multiplier invariant. Keep it here so future sizing modifiers
+        # cannot accidentally push stop-dollar risk back above the strength budget.
+        max_stop_amount = base_risk_amount / stop_distance_usd
+        amount = max(0.0, min(amount, max_stop_amount))
 
         if amount * signal.entry_price < self.min_position_usd:
             return 0
@@ -621,9 +658,9 @@ class RiskManager:
     def record_partial(self, pnl: float):
         """Bank a partial scale-out immediately.
 
-        Only daily_pnl moves here: it gates the daily loss limit and must reflect
-        cash that is already realized. Pair/strategy performance is credited once,
-        at close, from the full round-trip PnL.
+        Only the realized-PnL report moves here. The loss gate uses account equity,
+        while pair/strategy performance is credited once, at close, from the full
+        round-trip PnL.
         """
         self.daily_pnl += pnl
 
@@ -656,7 +693,9 @@ class RiskManager:
             self.consecutive_losses = 0
             self.trades_since_win = 0
             self.trades_since_loss += 1
-            self.cooldown_until = None
+            # Existing positions may close profitably while new entries are in a
+            # time-based loss cooldown. A win must not shorten that safety window;
+            # can_trade() is the single place that clears it after expiry.
 
         # banked_pnl already hit daily_pnl via record_partial()
         self.daily_pnl += result.pnl - result.banked_pnl
@@ -684,10 +723,16 @@ class RiskManager:
         else:
             sharpe = 0
 
-        cumulative = np.cumsum(pnls)
-        peak = np.maximum.accumulate(cumulative)
-        base = peak + 10000
-        drawdown = (peak - cumulative) / base
+        equity_curve = self.initial_capital + np.concatenate(
+            (np.array([0.0]), np.cumsum(pnls, dtype=float))
+        )
+        peak = np.maximum.accumulate(equity_curve)
+        drawdown = np.divide(
+            peak - equity_curve,
+            peak,
+            out=np.zeros_like(equity_curve, dtype=float),
+            where=peak > 0,
+        )
         max_dd = float(np.max(drawdown)) if len(drawdown) else 0
 
         pair_stats = {}
@@ -737,6 +782,7 @@ class RiskManager:
             "trades_since_win": self.trades_since_win,
             "daily_pnl": self.daily_pnl,
             "daily_reset_date": str(self.daily_reset_date),
+            "daily_start_equity": self.daily_start_equity,
             "is_killed": self.is_killed,
             "cooldown_until": self.cooldown_until.isoformat() if self.cooldown_until else None,
             "pair_sharpes": self.pair_sharpes,
@@ -756,6 +802,8 @@ class RiskManager:
                     "strategy": t.strategy,
                     "banked_pnl": t.banked_pnl,
                     "fees": t.fees,
+                    "funding": t.funding,
+                    "policy_id": t.policy_id,
                     # Without this, TradeResult's default_factory stamps every
                     # restored trade with boot time, and any "trades in the last N
                     # hours" count silently reads the whole history as happening at
@@ -775,6 +823,16 @@ class RiskManager:
         self.trades_since_loss = int(state.get("trades_since_loss") or 0)
         self.trades_since_win = int(state.get("trades_since_win") or 0)
         self.daily_pnl = float(state.get("daily_pnl") or 0)
+        raw_daily_start = state.get("daily_start_equity")
+        try:
+            daily_start = float(raw_daily_start) if raw_daily_start is not None else None
+            self.daily_start_equity = (
+                daily_start
+                if daily_start is not None and np.isfinite(daily_start) and daily_start > 0
+                else None
+            )
+        except (TypeError, ValueError):
+            self.daily_start_equity = None
         self.is_killed = bool(state.get("is_killed") or False)
 
         # daily_pnl is only meaningful together with the day it belongs to. Without
@@ -791,6 +849,7 @@ class RiskManager:
         if self.daily_reset_date != today:
             self.daily_pnl = 0.0
             self.daily_reset_date = today
+            self.daily_start_equity = None
         self.pair_sharpes = state.get("pair_sharpes") or {}
         self.strategy_pnls = state.get("strategy_pnls") or {}
         cu = state.get("cooldown_until")
@@ -819,6 +878,8 @@ class RiskManager:
                     strategy=raw.get("strategy") or "",
                     banked_pnl=float(raw.get("banked_pnl") or 0),
                     fees=float(raw.get("fees") or 0),
+                    funding=float(raw.get("funding") or 0),
+                    policy_id=str(raw.get("policy_id") or ""),
                 )
                 # A trade whose close time is unknown gets None, never the default
                 # factory's "now": a boot-time stamp reads as a real close and

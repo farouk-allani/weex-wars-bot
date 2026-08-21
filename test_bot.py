@@ -212,14 +212,13 @@ rm.adjust_stops(pos5, 50900, atr=10.0)  # +0.9R, tiny ATR so the trail cannot ar
 assert pos5.stop_loss < 50000, f"BE fired at 0.9R (stop={pos5.stop_loss})"
 print(f"BE holds at 0.9R OK (trigger={rm.be_trigger_r}R)")
 
-# 3. A too-tight AI stop must be WIDENED, not rejected — rejecting costs pace, and
-#    pace is a scored metric.
+# 3. A too-tight AI stop is widened while preserving its proposed R:R.
 from src.ai.trader import AITrader
 trader = AITrader(config, client=None, logbook=None)
 price, atr_t = 50000.0, 500.0
 tight = {"symbol": "BTC/USDT:USDT", "action": "long", "conviction": 0.8,
          "stop_loss": price - atr_t * 0.4, "take_profit": price + atr_t * 1.0,
-         "rationale": "test"}
+         "rationale": "trend continuation with structure below the swing low"}
 sig, why = trader.to_signal(tight, "BTC/USDT:USDT", price, atr_t,
                              {"BTC/USDT:USDT"})
 assert sig is not None, f"tight stop was rejected instead of widened: {why}"
@@ -389,20 +388,23 @@ print("round pace OK (undated trades cannot fake the minimum)")
 
 print("\n=== CAPACITY-MOTIVATED CLOSES ARE REFUSED ===")
 # Measured 2026-08-01: with the book full the model closed a losing SOL short "to
-# free a position slot" and re-opened the same short 62 minutes later. A swap must
-# now beat the incumbent's entry conviction by swap_conviction_margin.
+# free a position slot" and re-opened the same short 62 minutes later. Because an
+# entry is not fully validated when closes execute, shipped and missing config must
+# refuse the full-book swap rather than trusting its stated conviction.
 from types import SimpleNamespace
 
 class _SwapStub:
     _capacity_only_closes = TradingEngine._capacity_only_closes
     _entry_conviction = TradingEngine._entry_conviction
 
-def _stub(margin=0.15, cap=3, held=(("SOL/USDT:USDT", 0.40),), pending=None, min_conv=0.35):
+def _stub(margin=0.15, cap=3, held=(("SOL/USDT:USDT", 0.40),), pending=None,
+          min_conv=0.35, allow_swaps=False):
     s = _SwapStub()
     s.risk = SimpleNamespace(swap_conviction_margin=margin, max_open_positions=cap)
     s.pending_entries = dict(pending or {})
     s.position_conviction = {sym: c for sym, c in held}
     s.ai = SimpleNamespace(min_conviction=min_conv)
+    s.allow_capacity_swaps = allow_swaps
     return s
 
 def _acct(*symbols):
@@ -411,16 +413,32 @@ def _acct(*symbols):
 _full = _acct("SOL/USDT:USDT", "ADA/USDT:USDT", "BNB/USDT:USDT")
 _close_sol = {"action": "close", "symbol": "SOL/USDT:USDT"}
 
-# The exact observed churn: a marginal replacement does not buy the slot.
+# The exact observed churn: a replacement does not buy the slot, regardless of its
+# unvalidated conviction.
 _r1 = _stub()._capacity_only_closes(
     [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.45}], _full)
 assert "SOL/USDT:USDT" in _r1, _r1
-assert "0.45" in _r1["SOL/USDT:USDT"] and "0.40" in _r1["SOL/USDT:USDT"], _r1
+assert "not atomically validated" in _r1["SOL/USDT:USDT"], _r1
 
-# A genuinely better idea still gets its slot — this must not become a freeze.
+# A claimed 1.0-conviction idea is still unvalidated at close time.
 _r2 = _stub()._capacity_only_closes(
-    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.60}], _full)
-assert _r2 == {}, _r2
+    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 1.0}], _full)
+assert "SOL/USDT:USDT" in _r2, _r2
+
+# Missing configuration fails closed too; __new__ and legacy objects may not have
+# the runtime attribute at all.
+_missing = _stub()
+del _missing.allow_capacity_swaps
+_r_missing = _missing._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 1.0}], _full)
+assert "SOL/USDT:USDT" in _r_missing, _r_missing
+
+# Malformed and same-symbol replacement requests are still swaps, not a loophole
+# that turns the paired close into a standalone thesis exit.
+assert "SOL/USDT:USDT" in _stub()._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "", "conviction": None}], _full)
+assert "SOL/USDT:USDT" in _stub()._capacity_only_closes(
+    [_close_sol, {"action": "short", "symbol": "SOL/USDT:USDT", "conviction": 1.0}], _full)
 
 # A thesis close with nothing competing for the slot is never touched.
 assert _stub()._capacity_only_closes([_close_sol], _full) == {}
@@ -435,33 +453,36 @@ _r4 = _stub(cap=4, pending={"XRP/USDT:USDT": {"side": "short"}})._capacity_only_
     [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.45}], _full)
 assert "SOL/USDT:USDT" in _r4, _r4
 
-# Two closes, one replacement: only the slot actually demanded is priced.
+# With swaps disabled, every close mixed into the full-book replacement response is
+# refused; the engine cannot safely infer which close was a separate thesis exit.
 _r5 = _stub(held=(("SOL/USDT:USDT", 0.40), ("ADA/USDT:USDT", 0.80)))._capacity_only_closes(
     [_close_sol, {"action": "close", "symbol": "ADA/USDT:USDT"},
      {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.45}], _full)
-assert _r5 == {"SOL/USDT:USDT": _r5.get("SOL/USDT:USDT")} and "ADA/USDT:USDT" not in _r5, _r5
+assert set(_r5) == {"SOL/USDT:USDT", "ADA/USDT:USDT"}, _r5
 
-# Unknown incumbent conviction (opened before tracking) falls back to the floor
-# rather than blocking on missing data.
-_r6 = _stub(held=())._capacity_only_closes(
+# The legacy conviction comparison is reachable only with explicit opt-in.
+_r6 = _stub(held=(), allow_swaps=True)._capacity_only_closes(
     [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.51}], _full)
 assert _r6 == {}, _r6
-_r7 = _stub(held=())._capacity_only_closes(
+_r7 = _stub(held=(), allow_swaps=True)._capacity_only_closes(
     [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.49}], _full)
 assert "SOL/USDT:USDT" in _r7, _r7
 
-# Margin 0 disables the guard entirely.
-assert _stub(margin=0.0)._capacity_only_closes(
-    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 0.0}], _full) == {}
+# Even explicit opt-in with an invalid margin fails closed.
+_bad_margin = _stub(margin=0.0, allow_swaps=True)._capacity_only_closes(
+    [_close_sol, {"action": "long", "symbol": "BTC/USDT:USDT", "conviction": 1.0}], _full)
+assert "SOL/USDT:USDT" in _bad_margin and "invalid" in _bad_margin["SOL/USDT:USDT"]
 
 # An entry on a symbol already held is not asking for a new slot.
 assert _stub()._capacity_only_closes(
     [_close_sol, {"action": "long", "symbol": "ADA/USDT:USDT", "conviction": 0.45}], _full) == {}
 
 _live = RiskManager(config)
-assert _live.swap_conviction_margin > 0, "guard must be armed in the shipped config"
+assert config["risk"].get("allow_capacity_swaps") is False, "shipped swaps must be off"
+assert _live.swap_conviction_margin > 0, "legacy opt-in comparison must fail safe"
 assert _live.max_open_positions >= 5, "count cap must leave the correlation budgets binding"
-print(f"swap guard OK (margin {_live.swap_conviction_margin}, "
+print(f"swap guard OK (allowed {config['risk']['allow_capacity_swaps']}, "
+      f"margin {_live.swap_conviction_margin}, "
       f"max_open_positions {_live.max_open_positions})")
 
 print("\n=== PAPER FUNDING IS CHARGED, ONCE PER SETTLEMENT ===")

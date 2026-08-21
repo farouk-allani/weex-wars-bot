@@ -1,8 +1,9 @@
-# WEEX AI Wars — AI-driven config.
+# WEEX competition rehearsal — AI-driven config.
 # DeepSeek is the primary decision-maker; the risk block below is a hard veto layer
-# it cannot override. Rules (AI Wars II): scoring is MULTI-METRIC — profit AND risk
-# management AND strategy stability, not cumulative PnL alone — min 10 trades,
-# max 20x leverage, >8h without AI logs is non-compliant.
+# it cannot override. WEEX has published AI Wars II pre-registration and API-skill
+# onboarding, but dates, detailed scoring, tasks, and final eligibility rules remain
+# TBA. The competition values below are rehearsal assumptions, not verified facts.
+# Live readiness stays blocked until the exact round rules are published and set.
 
 # AI decision layer
 ai:
@@ -41,8 +42,8 @@ ai:
   # is free, so it is polled on this cadence and alarms BEFORE the wall, not after.
   balance_warn_usd: 2.0
   balance_check_hours: 6
-  # Every call writes an AI log entry, trade or no trade. 60min keeps us far inside
-  # the 8h inactivity rule even if several calls fail in a row.
+  # Every call writes a local AI log entry, trade or no trade. The 60min cadence is
+  # a Season-1 rehearsal assumption; verify current upload/cadence rules for S2.
   decision_interval_minutes: 60
   min_conviction: 0.35          # below this, the model's own doubt vetoes the trade
   # Not a rejection threshold any more — a stop tighter than this is WIDENED to it
@@ -77,10 +78,10 @@ ai:
   include_macro: false
   log_file: logs/ai_decisions.jsonl
 
-# Execution: how orders reach the venue. Round-trip cost with market orders
-# measured 0.22% of notional vs a best measured edge of ~0.13%/trade — the spread
-# and taker fee were the entire losing margin. Maker entries rest at the touch,
-# chase a little, and abandon rather than ever cross the spread.
+# Execution: how orders reach the venue. A historical simulator run measured a
+# 0.22% market-order round trip under its then-current fee assumption, already above
+# the best weak gross edge. Maker entries rest at the touch, chase a little, and
+# abandon rather than cross the spread. Current fee inputs are set below.
 execution:
   maker_entries: true
   maker_fee_rate: 0.0002        # WEEX futures maker tier; taker stays at backtest.commission_rate
@@ -90,7 +91,7 @@ execution:
   # Rest the TAKE-PROFIT leg too, instead of firing a market order at a price we
   # already chose. A TP is favourable by construction (above the market for a long),
   # so a limit there is maker by definition and can never cross the spread — the old
-  # `take_profit_market` was paying taker 0.06% + 0.05% slippage for nothing.
+  # `take_profit_market` was paying a taker fee + assumed slippage unnecessarily.
   # Measured on zero-alpha entries (run_exit_lab.py --entries random, n=4584):
   # net/trade -1.2161 -> -1.0071, i.e. +$0.209/trade, a 17% cut in the cost drag.
   # Stops stay taker — a stop crosses the book by construction and cannot rest.
@@ -106,7 +107,7 @@ execution:
 
 trading:
   mode: paper
-  # The 8 pairs WEEX permits. Anything else is disqualified.
+  # Historical Season-1 finals set. Verify the current round's permitted symbols.
   symbols:
   - BTC/USDT:USDT
   - ETH/USDT:USDT
@@ -117,7 +118,7 @@ trading:
   - ADA/USDT:USDT
   - LTC/USDT:USDT
   default_leverage: 5
-  max_leverage: 20              # competition ceiling
+  max_leverage: 20              # conservative rehearsal ceiling; verify current rules
   timeframe: 1h
   higher_timeframe: 4h
   # 200h > 1 week, so the model's 7d change and 72h levels actually populate.
@@ -143,9 +144,12 @@ risk:
   # bet) from BTC+DOGE. Kept as a coarse backstop; max_portfolio_risk below is the
   # control that actually binds.
   max_same_side_positions: 3
-  # Anti-churn: when the book is full, a close is only honoured if the model also
-  # wants a replacement whose conviction beats the incumbent's by this margin.
-  # Below it the close is capacity-motivated churn and is refused. 0 disables.
+  # Capacity swaps are non-atomic: exits run before a proposed replacement has
+  # passed all entry and venue checks. Keep disabled so an invalid replacement can
+  # never liquidate a valid incumbent. Missing config also fails closed in code.
+  # A genuine thesis close is still allowed when no replacement competes for it.
+  allow_capacity_swaps: false
+  # Legacy opt-in comparison only. A non-positive/missing value fails closed.
   swap_conviction_margin: 0.15
   # Correlation-aware portfolio budget: the most we accept losing if EVERY open stop
   # fills in the same move. Measured 2026-07-27, the bot held BTC long + ETH long at
@@ -217,18 +221,20 @@ strategy:
     # OFF, and it must stay off in AI mode: keepalive only ever ran on the rules
     # path (_run_rules_cycle), which `ai.enabled: true` never reaches — so this flag
     # was inert for the whole paper run and produced zero trades. It is also the
-    # wrong tool for AI Wars II: a code-generated heartbeat order has no model
-    # decision behind it, so it would upload with no ai-log (non-compliant), and
-    # robotic in-outs are penalised by the stability metric. The trade floor is now
-    # handled by feeding round pace into the AI context (see _trade_pace).
+    # wrong tool for a genuine AI evaluation: a code-generated heartbeat order has no
+    # model decision behind it and manufactures fee-paying turnover. Any current
+    # competition cadence/log rule must be verified separately.
     enabled: false
     symbol_base: SOL
     interval_hours: 12
     strength: 0.04
     max_per_week: 5
 competition:
-  min_trades: 10                # below this = disqualified
-  # The minimum is per ROUND, and rounds are weekly — 10 trades in 7 days needs
+  # Flip only after recording the exact current official rulebook/invitation and
+  # reconciling its dates, symbols, scoring, API eligibility and log requirements.
+  rules_verified: false
+  min_trades: 10                # historical rehearsal floor; verify for the real round
+  # Historical rehearsal assumes weekly rounds — 10 trades in 7 days needs
   # ~1.4/day. Measured 2026-07-27 from the decision log: 28 entry decisions over
   # 12 days = ~2.3/day, i.e. ~16 per weekly round, comfortably clear of the floor.
   # (An earlier read of ~9/day came from trade_history timestamps that a loader
@@ -262,11 +268,20 @@ sizing:
   default_win_rate: 0.52
   min_position_usd: 10
   max_position_pct: 0.75
+
+# Forward-evaluation cohort. Bump this before any change to prompts, fees, fills,
+# exits, sizing, or risk policy. Live readiness counts only trades with this exact
+# ID, so incompatible historical simulations cannot validate the current bot.
+evaluation:
+  policy_id: paper-20260821-safety-v1
+
 backtest:
-  # WEEX resets every account to 1,000 USDT at the start. Sizing off 10,000 would
-  # propose positions the real account cannot margin.
+  # Paper capital is 1,000 USDT for comparability with this bot's current ledger.
+  # The real competition account size must come from the current official terms.
   initial_capital: 1000
-  commission_rate: 0.0006
+  # Conservative current VIP0 futures taker fee (0.08%). Replace only after the
+  # actual account tier and eligible pair schedule are verified on WEEX.
+  commission_rate: 0.0008
   slippage_pct: 0.0005
   use_kill_switch: false
 logging:

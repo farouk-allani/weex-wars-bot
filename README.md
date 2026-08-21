@@ -1,7 +1,19 @@
-# WEEX AI Wars II — Trading Bot v8.5
+# WEEX Competition Rehearsal — Trading Bot v8.5
 
-AI-driven competition futures bot with hard portfolio-risk vetoes, restart-safe
-venue protection, durable WEEX decision logs, and supervised live arming.
+AI-driven futures rehearsal bot with hard portfolio-risk vetoes, restart-safe
+venue protection, durable decision logs, and supervised live arming. WEEX has
+published AI Wars II pre-registration and Trader Skill onboarding, but dates,
+scoring details, event tasks, and final eligibility rules remain TBA. This repo
+does not treat pre-registration as final competition authorization.
+
+## Current AI evidence: no live GO
+
+The live-config point-in-time replay recorded **168 trades, -31.61%, 27.4% win
+rate, PF 0.64, and t=-2.69**. It does not demonstrate trading alpha. Keep the bot
+in paper mode until a locked future sample passes the readiness gates and the
+exact current event rules are verified. See [RESEARCH.md](RESEARCH.md#2h-the-live-configuration-measured-properly-2026-08-07-supersedes-2g).
+Readiness counts only trades carrying the current `evaluation.policy_id`; bump that
+ID whenever trading behavior changes instead of pooling incompatible history.
 
 ## Historical rules-engine benchmark
 
@@ -10,7 +22,7 @@ and risk plumbing, but it is **not** a backtest of the deployed DeepSeek decisio
 layer and must not be used as proof that the live AI bot is profitable. Use
 `run_ai_replay.py` for point-in-time AI decision scoring.
 
-### 90d portfolio (BTC + SOL, shared $10k) — current config
+### 90d portfolio (BTC + SOL, shared $10k) — legacy experiment
 
 | Metric | Value |
 |--------|-------|
@@ -37,11 +49,11 @@ layer and must not be used as proof that the live AI bot is profitable. Use
 
 | Profile | File | Use |
 |---------|------|-----|
-| **Competition** (default) | `config.yaml` | AI decisions across the 8 permitted pairs; keepalive off |
+| **Rehearsal** (default) | `config.yaml` | AI decisions across the historical S1 8-symbol set; keepalive off |
 | Pure edge BTC | `config.edge.yaml` | No KA, max edge research |
 
 ```bash
-# Competition paper
+# Rehearsal paper
 python -m src.main
 
 # Pure edge config

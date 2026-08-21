@@ -1,4 +1,4 @@
-"""WEEX AI Wars II — Technical Indicators"""
+"""WEEX competition-rehearsal technical indicators."""
 
 import numpy as np
 import pandas as pd

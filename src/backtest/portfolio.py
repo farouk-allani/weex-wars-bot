@@ -34,7 +34,7 @@ class PortfolioBacktester:
     def __init__(self, config: dict):
         self.config = config
         self.initial_capital = config.get("backtest", {}).get("initial_capital", 10000)
-        self.commission_rate = config.get("backtest", {}).get("commission_rate", 0.0006)
+        self.commission_rate = config.get("backtest", {}).get("commission_rate", 0.0008)
         self.slippage_pct = config.get("backtest", {}).get("slippage_pct", 0.0005)
 
     def run(self, market: dict[str, dict]) -> BacktestResult:

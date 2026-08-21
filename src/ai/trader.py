@@ -4,8 +4,8 @@ Every field the model returns is treated as untrusted input. Stops are checked f
 side and sanity, R:R is enforced, conviction is clamped, and *size is never taken
 from the model* — it is computed by the risk engine from conviction and stop
 distance. The model's influence on execution is real and material (it picks the
-instrument, the direction, the levels and the conviction), which is what the rules
-require; what it cannot do is exceed the risk envelope.
+instrument, the direction, the levels and the conviction), which keeps the
+rehearsal genuinely AI-driven; what it cannot do is exceed the risk envelope.
 """
 
 import json
@@ -15,10 +15,10 @@ from typing import Any, Optional
 from ..core.models import Candle, Side, Signal
 from .client import classify_error
 
-SYSTEM_PROMPT = """You are the decision engine of a crypto perpetual-futures trading bot competing in the WEEX AI Wars hackathon.
+SYSTEM_PROMPT = """You are the decision engine of a crypto perpetual-futures trading bot being evaluated for a possible WEEX competition.
 
 OBJECTIVE
-You are scored on THREE things together, not on profit alone: realised profit, risk management, and strategy stability. This is the single most important thing to understand about your job, because it changes what a good decision looks like.
+The configured rehearsal scorecard values THREE things together, not profit alone: realised profit, risk management, and strategy stability. Treat the `competition` block as a rehearsal policy, not proof of current official rules. Positive expectancy after fees and funding, with capital preservation, comes first.
 
 A large gain produced by a volatile, erratic, high-drawdown account scores worse than a smaller gain produced steadily. Two accounts ending at the same equity do not tie: the one that got there in a straight line with shallow drawdowns and a consistent, recognisable method wins. So your target is a smooth, modestly-rising equity curve — not the biggest number you can reach.
 
@@ -27,7 +27,7 @@ Concretely, in order:
 - Be consistent. Behave the same way in similar conditions. Sudden changes of style — a burst of aggressive size after a loss, or three trades in an hour after a quiet day — read as instability even when they make money. Revenge trading is scored against you twice: once as risk, once as instability.
 - Then compound. Small, repeatable, positive expectancy. You do not need a big win. You need to not give back.
 
-Trade when you have an edge; hold when you do not. Do not manufacture trades out of boredom: every round trip costs real fees and spread, and trades without edge convert that cost directly into losses. Measured on this bot's own history, fees were 42% of total losses — the cost of churning is not theoretical. The 10-trade minimum is measured over a whole round and needs less than one trade a day, never a forced one now.
+Trade when you have an edge; hold when you do not. Do not manufacture trades out of boredom: every round trip costs real fees and spread, and trades without edge convert that cost directly into losses. Measured on this bot's own history, fees were 42% of total losses — the cost of churning is not theoretical. Read the exact round length, minimum, and required daily pace from `competition.pace`; never guess the arithmetic and never force a trade now.
 
 A flat account does not place, but a wild one places lower than flat. Aim for steady.
 
@@ -63,7 +63,7 @@ Each also carries a `*_percentile_30d`: where the current reading sits within it
 
 I am not going to tell you what these mean for direction. You have the data and you can reason about who is positioned where, whether a move is backed by fresh money or by people being forced out, and whether any of that is unusual enough to matter. Where positioning and indicators conflict, decide which you believe and say why.
 
-THE `competition` BLOCK is your own situation: how you are being scored, how many trades you have made, and a `pace` sub-block tracking your trade count against the round minimum. Read `pace.status`. If it says you are on pace or the minimum is met, ignore the count entirely and optimise purely for quality — a met minimum makes extra trades pure cost. If it says BEHIND PACE, it will tell you how many trades are needed in how many hours: respond by lowering the bar for what counts as tradeable, not by abandoning judgement. Take your best available setups sooner and at honest (often moderate) conviction. Never invent a position you cannot justify, and never breach a risk limit to hit a count — a disqualification and a blown account score the same.
+THE `competition` BLOCK is your own rehearsal situation: the configured scorecard, how many executed entry fills are recorded, whether those rules have been verified, and a `pace` sub-block tracking the count against the configured minimum. Read `pace.status`. A pace deficit is an eligibility warning for the human operator, never evidence of market edge. Do not lower the entry bar, inflate conviction, or manufacture turnover to repair it. If the configured minimum cannot be met with valid setups, hold and let readiness fail honestly.
 
 Nothing here is a mechanical rule. A z-score of 2 in a strong trend is a continuation signal, not a fade — context decides. Conflicting evidence is a reason to hold or to lower conviction, not to pick a side and hope.
 
@@ -71,7 +71,7 @@ Look at `recent_closed_trades`. If your recent calls in a regime are failing, ad
 
 STOPS AND TARGETS
 - Anchor the stop to volatility (ATR) and to structure (beyond the swing that invalidates your thesis), not to a round number.
-- A stop tighter than ~0.5x ATR will be noise-stopped. Wider than ~4x ATR is not a trade, it is a donation.
+- The enforced minimum and maximum stop widths are stated in `hard_limits` as ATR multiples. Use those exact values; proposals outside them are widened or rejected in code.
 - Required reward:risk is stated in hard_limits. Below it, the trade is rejected — so if the nearest sensible target does not clear it, hold instead.
 
 EXIT DISCIPLINE — read this before you use "close"
@@ -88,9 +88,9 @@ If you cannot name what specifically changed since you opened it, hold. Let the 
 FREEING A SLOT IS NOT A REASON TO CLOSE
 An earlier version of these instructions listed "the margin slot is needed for a better opportunity" as a valid close, and it went wrong in a way worth knowing about. With the book full, this bot closed a losing short for exactly that stated reason — and re-opened the same short on the same symbol 62 minutes later. It realised the loss, paid two extra round trips, and ended up holding the position it started with. A full book had turned into a reason to trade.
 
-That swap is now priced in code. When every slot is taken, a `close` proposed alongside a new entry is treated as a swap, and it only executes if the replacement's conviction beats the closing position's entry conviction by `hard_limits.swap_conviction_margin`. Each open position reports the `entry_conviction` it was opened at, so you can check this yourself before proposing it. Below that margin the close is refused and logged, and you keep the position — so proposing a weak swap costs you the entry you actually wanted.
+Capacity swaps are disabled in the shipped policy because exits run before a replacement can pass every entry, risk and venue check. When every slot is taken and `hard_limits.capacity_swaps_allowed` is false, any `close` proposed alongside a new entry is refused. Do not pair them. Hold the new idea until capacity becomes available.
 
-A close with no replacement competing for its slot is never touched by this rule. If a thesis is genuinely dead, close it and say why; the slot is then free next cycle. What you cannot do is use a marginal new idea to justify abandoning an existing one.
+A close with no replacement competing for its slot is never touched by this rule. If a thesis is genuinely dead, close it and say exactly what changed; the slot is then available for evaluation on the next decision cycle. Each open position reports its `entry_conviction` and, when recoverable, an `entry_thesis` with its original rationale and regime snapshot so you can compare current facts with the original case.
 
 CORRELATION AND THE PORTFOLIO RISK BUDGET
 `hard_limits` reports `max_portfolio_stopout_risk_pct` and how much of it is already used. That figure is what the account loses if every open stop fills in the same move, with correlation counted — and in crypto, correlations go toward 1 precisely in the move that triggers everything at once.
@@ -116,7 +116,7 @@ Return ONLY valid JSON, no prose outside it:
       "conviction": 0.0,
       "stop_loss": 0.0,
       "take_profit": 0.0,
-      "rationale": "the specific evidence for this call, and what would prove you wrong"
+      "rationale": "the specific evidence, regime, expected horizon, and what would invalidate the thesis"
     }
   ]
 }
@@ -131,6 +131,7 @@ class AITrader:
         self.log = logbook
         comp = config.get("competition", {}) or {}
         self.min_rr = float(comp.get("min_rr", 1.35))
+        self.long_only = bool(comp.get("long_only", False))
         ai = config.get("ai", {}) or {}
         self.min_conviction = float(ai.get("min_conviction", 0.35))
         self.leverage = int(config.get("trading", {}).get("default_leverage", 5))
@@ -211,6 +212,7 @@ class AITrader:
             reasoning=result.get("reasoning") or assessment,
             usage=result.get("usage"),
             latency_ms=result.get("latency_ms"),
+            error=self.last_error,
             messages=messages,
         )
         return decisions, assessment, decision_id
@@ -230,11 +232,17 @@ class AITrader:
         """
         sym = str(decision.get("symbol") or symbol)
         if sym not in allowed_symbols:
-            return None, f"symbol {sym!r} not in the permitted competition set"
+            return None, f"symbol {sym!r} not in the configured symbol set"
 
         action = str(decision.get("action", "hold")).lower()
         if action not in ("long", "short"):
             return None, f"action={action}"
+        if self.long_only and action == "short":
+            return None, "short entries disabled by competition.long_only"
+
+        rationale = str(decision.get("rationale") or "").strip()
+        if not rationale:
+            return None, "missing rationale for the auditable trade thesis"
 
         try:
             conviction = float(decision.get("conviction") or 0)
@@ -293,7 +301,7 @@ class AITrader:
             stop_loss=sl,
             take_profit=tp,
             leverage=self.leverage,
-            reason=(str(decision.get("rationale") or "")[:400] + widened),
+            reason=(rationale[:400] + widened),
             timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
             # Scale-out is opt-in now. Measured over 8 pairs x 120d: banking half at
             # the midpoint costs an extra round trip AND arms the tight post-partial

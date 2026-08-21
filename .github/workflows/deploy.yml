@@ -91,7 +91,10 @@ jobs:
         run: |
           SSH_HOST="${SSH_HOST:-45.88.191.129}"
           SSH_USER="${SSH_USER:-farouk}"
-          DASHBOARD_PUBLIC_URL="${DASHBOARD_PUBLIC_URL:-http://45.88.191.129:8787}"
+          # The dashboard is intentionally loopback-only unless an authenticated
+          # reverse-proxy URL is configured explicitly.  An empty value must fall
+          # through to the SSH localhost probe below.
+          DASHBOARD_PUBLIC_URL="${DASHBOARD_PUBLIC_URL:-}"
           # Prefer public URL if set; else curl via SSH localhost
           if [ -n "${DASHBOARD_PUBLIC_URL:-}" ]; then
             echo "Checking $DASHBOARD_PUBLIC_URL/api/health"

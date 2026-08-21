@@ -1,4 +1,4 @@
-"""WEEX AI Wars II — Backtesting Engine v8
+"""WEEX competition-rehearsal backtesting engine v8
 
 - Resamples 1h → 4h for real HTF confluence in strategy
 - Strategy-level PnL breakdown
@@ -75,7 +75,7 @@ class Backtester:
         self.config = config
         self.strategy = CompositeStrategy(config)
         self.initial_capital = config.get("backtest", {}).get("initial_capital", 10000)
-        self.commission_rate = config.get("backtest", {}).get("commission_rate", 0.0006)
+        self.commission_rate = config.get("backtest", {}).get("commission_rate", 0.0008)
         self.slippage_pct = config.get("backtest", {}).get("slippage_pct", 0.001)
 
     def run(

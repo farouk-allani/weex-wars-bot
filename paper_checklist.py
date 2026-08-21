@@ -47,16 +47,16 @@ def main():
     # is worse than no checklist: it trains you to ignore it. Each is replaced by
     # the invariant the current config actually holds.
 
-    # WEEX permits exactly these 8. Trading anything else is disqualification, which
-    # is the real hazard — not which subset of the 8 is enabled.
+    # Historical Season 1 used exactly these 8. The current set is unverified; this
+    # only keeps the rehearsal configuration inside its declared universe.
     WEEX_PAIRS = {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "LTC"}
     bases = {s.split("/")[0] for s in symbols}
-    check("Pairs are WEEX-permitted", bases <= WEEX_PAIRS,
+    check("Pairs stay inside the S1 rehearsal set", bases <= WEEX_PAIRS,
           f"not permitted: {sorted(bases - WEEX_PAIRS)}" if bases - WEEX_PAIRS else f"{len(bases)} pairs")
     check("Breakouts off", not cfg.get("strategy", {}).get("breakout", {}).get("enabled", False))
 
     # Keepalive must stay OFF while the AI decides: it only ever ran on the rules
-    # path, and a code-generated order carries no ai-log — non-compliant by §1.
+    # path, and a code-generated order would not carry AI-log linkage.
     ai_on = cfg.get("ai", {}).get("enabled", False)
     ka_on = cfg.get("strategy", {}).get("keepalive", {}).get("enabled", False)
     check("Keepalive off under AI", not (ai_on and ka_on),
@@ -72,6 +72,12 @@ def main():
     ticks = float(ex.get("paper_fill_through_ticks", 1))
     check("Fills need trade-through", ticks >= 1,
           f"{ticks} tick(s)" if ticks >= 1 else "0 = a touch fills, inflating the fill rate")
+    policy_id = str((cfg.get("evaluation", {}) or {}).get("policy_id") or "").strip()
+    check(
+        "Forward-test policy cohort set",
+        bool(policy_id),
+        policy_id or "set evaluation.policy_id and bump it after behavior changes",
+    )
 
     # Modules
     try:
@@ -104,18 +110,26 @@ def main():
         table.add_row(*r)
     console.print(table)
 
+    readiness = (
+        "[green]Paper-runtime readiness checks passed.[/]"
+        if fail == 0
+        else "[red]Paper runtime still needs attention.[/]"
+    )
     console.print(Panel.fit(
+        f"{readiness}\n\n"
         "[bold]Session plan[/]\n"
         "1. python test_bot.py\n"
         "2. python run_portfolio_backtest.py --days 90\n"
         "3. python -m src.main\n"
-        "4. On first signal verify: Stop + TP + Partial TP logged\n"
+        "4. On first fill verify: Stop + TP + AI decision link logged\n"
         "5. After 24h: review logs/trading.log + data/bot_state.json\n"
-        "6. Live only if paper equity stable and no order errors\n\n"
+        "6. Review saved paper evidence separately before considering live mode\n\n"
+        "[bold]Scope:[/] This checklist covers paper-runtime readiness only.\n"
+        "It is not a live GO, alpha validation, or competition GO.\n\n"
         f"[cyan]Profile:[/] {'pure_edge' if cfg.get('competition', {}).get('pure_edge') else 'competition'}\n"
         f"[cyan]Pairs:[/] {', '.join(symbols)}\n"
         f"Checks: {ok} ok, {fail} need attention",
-        title="GO",
+        title="PAPER RUNTIME READY" if fail == 0 else "PAPER RUNTIME NOT READY",
     ))
     return 0 if fail == 0 else 1
 

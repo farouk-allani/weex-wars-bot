@@ -1,4 +1,4 @@
-"""WEEX AI Wars II — Trading Bot Entry Point"""
+"""WEEX competition-rehearsal trading bot entry point."""
 
 from .core.engine import TradingEngine
 

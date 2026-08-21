@@ -1,4 +1,4 @@
-"""WEEX AI Wars — Monitoring Dashboard API
+"""WEEX competition-rehearsal monitoring dashboard API.
 
 Run:
   python -m dashboard.app
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import re
 import sys
 import zipfile
@@ -20,19 +21,12 @@ import yaml
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
 
 # Project root
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-app = FastAPI(title="WEEX AI Wars Dashboard", version="1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="WEEX Competition Rehearsal Dashboard", version="1.0")
 
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
@@ -220,14 +214,35 @@ def parse_log_lines(text: str, limit: int = 150) -> list[dict]:
     return out
 
 
+def _finite_pnls(values: Any) -> list[float]:
+    """Return only finite numeric PnLs from a JSON-style sequence."""
+    if not isinstance(values, (list, tuple)):
+        return []
+    out: list[float] = []
+    for value in values:
+        try:
+            pnl = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(pnl):
+            out.append(pnl)
+    return out
+
+
 def build_metrics(state: dict, cfg: dict) -> dict[str, Any]:
     risk = state.get("risk") or {}
-    history = risk.get("trade_history") or []
+    history_value = risk.get("trade_history")
+    # An empty list is still an authoritative current-format history.  Fall back
+    # to the capped rolling arrays only for legacy states without a history list.
+    has_trade_history = isinstance(history_value, list)
+    history = history_value if has_trade_history else []
     pair_sharpes = risk.get("pair_sharpes") or {}
     strategy_pnls = risk.get("strategy_pnls") or {}
     account = state.get("account") or {}
 
-    pnls = [float(t.get("pnl") or 0) for t in history]
+    pnls = _finite_pnls([
+        t.get("pnl") for t in history if isinstance(t, dict)
+    ])
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
     total_pnl = sum(pnls)
@@ -277,10 +292,38 @@ def build_metrics(state: dict, cfg: dict) -> dict[str, Any]:
     # Closed + unrealized for "session" PnL feel
     session_pnl = (equity - initial) if account else total_pnl
 
+    # Strategy and pair reporting must cover the same complete saved history as
+    # the headline totals.  strategy_pnls/pair_sharpes are intentionally capped
+    # rolling windows used by risk logic, so they are only a legacy fallback.
+    strategy_groups: dict[str, list[float]] = {}
+    pair_groups: dict[str, list[float]] = {}
+    if has_trade_history:
+        for trade in history:
+            if not isinstance(trade, dict):
+                continue
+            values = _finite_pnls([trade.get("pnl")])
+            if not values:
+                continue
+            pnl = values[0]
+            strategy = str(trade.get("strategy") or "unknown")
+            symbol = str(trade.get("symbol") or "unknown")
+            strategy_groups.setdefault(strategy, []).append(pnl)
+            pair_groups.setdefault(symbol, []).append(pnl)
+    else:
+        if isinstance(strategy_pnls, dict):
+            strategy_groups = {
+                str(name): _finite_pnls(values)
+                for name, values in strategy_pnls.items()
+            }
+        if isinstance(pair_sharpes, dict):
+            pair_groups = {
+                str(symbol): _finite_pnls(values)
+                for symbol, values in pair_sharpes.items()
+            }
+
     # Strategy stats
     strat_stats = []
-    for name, arr in strategy_pnls.items():
-        arr = [float(x) for x in arr]
+    for name, arr in strategy_groups.items():
         strat_stats.append({
             "name": name,
             "trades": len(arr),
@@ -292,8 +335,7 @@ def build_metrics(state: dict, cfg: dict) -> dict[str, Any]:
 
     # Pair stats
     pair_stats = []
-    for sym, arr in pair_sharpes.items():
-        arr = [float(x) for x in arr]
+    for sym, arr in pair_groups.items():
         name = sym.split("/")[0] if "/" in sym else sym
         pair_stats.append({
             "symbol": sym,
@@ -301,12 +343,15 @@ def build_metrics(state: dict, cfg: dict) -> dict[str, Any]:
             "trades": len(arr),
             "pnl": round(sum(arr), 2),
             "wins": sum(1 for x in arr if x > 0),
+            "win_rate": (sum(1 for x in arr if x > 0) / len(arr)) if arr else 0,
         })
     pair_stats.sort(key=lambda x: x["pnl"], reverse=True)
 
     # Recent trades (newest first)
     trades = []
     for t in reversed(history[-50:]):
+        if not isinstance(t, dict):
+            continue
         trades.append({
             "symbol": t.get("symbol"),
             "side": t.get("side"),
@@ -323,6 +368,8 @@ def build_metrics(state: dict, cfg: dict) -> dict[str, Any]:
     # Exit reason breakdown
     reasons: dict[str, int] = {}
     for t in history:
+        if not isinstance(t, dict):
+            continue
         r = t.get("exit_reason") or "unknown"
         reasons[r] = reasons.get(r, 0) + 1
 

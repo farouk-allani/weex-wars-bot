@@ -5,7 +5,7 @@
 #
 # Services:
 #   bot       — trading engine (paper/live)
-#   dashboard — monitoring UI on :8787
+#   dashboard — monitoring UI on VPS loopback :8787 (use an SSH tunnel)
 
 services:
   bot:
@@ -61,7 +61,9 @@ services:
     env_file:
       - .env
     ports:
-      - "${DASHBOARD_PORT:-8787}:8787"
+      # The dashboard exposes positions, logs and state and has no built-in login.
+      # Keep it off the public interface; operators connect through SSH forwarding.
+      - "127.0.0.1:${DASHBOARD_PORT:-8787}:8787"
     volumes:
       # Read same state/logs the bot writes
       - bot-data:/app/data:ro

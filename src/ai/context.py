@@ -233,6 +233,8 @@ def build_context(
     fear_greed: Optional[int] = None,
     macro: Optional[dict] = None,
     position_conviction: Optional[dict] = None,
+    position_theses: Optional[dict] = None,
+    trading_constraints: Optional[dict] = None,
 ) -> dict:
     """Full decision context: market + book + risk envelope + own recent results."""
     drawdown = 0.0
@@ -240,6 +242,8 @@ def build_context(
         drawdown = max(0.0, (risk.peak_equity - account.equity) / risk.peak_equity)
 
     convictions = position_conviction or {}
+    theses = position_theses or {}
+    constraints = trading_constraints or {}
     positions = []
     for p in account.positions:
         age_h = (datetime.utcnow() - p.opened_at).total_seconds() / 3600
@@ -255,10 +259,14 @@ def build_context(
             "age_hours": _r(age_h, 1),
             "partial_taken": p.partial_taken,
         }
-        # What this position cost in conviction — the number a replacement has to
-        # beat before the engine will accept a swap for its slot.
+        # Preserve the opening confidence beside the original thesis so the model
+        # compares today's evidence with what it originally believed.
         if p.symbol in convictions:
             entry["entry_conviction"] = _r(float(convictions[p.symbol]), 2)
+        if p.symbol in theses:
+            # The full original prompt remains in the append-only decision log. The
+            # current call only needs the entry facts it must compare with today's.
+            entry["entry_thesis"] = theses[p.symbol]
         positions.append(entry)
 
     # The model's own recent track record. This is the input that makes adaptation
@@ -297,12 +305,19 @@ def build_context(
             "max_risk_per_trade_pct": _r(risk.max_risk_per_trade * 100, 2),
             "max_open_positions": risk.max_open_positions,
             "max_same_side_positions": risk.max_same_side_positions,
-            # Only meaningful when the book is full; see EXIT DISCIPLINE.
+            # Shipped false: a close cannot safely reserve an unvalidated entry.
+            "capacity_swaps_allowed": (
+                constraints.get("allow_capacity_swaps") is True
+            ),
+            # Only meaningful under the explicit legacy opt-in above.
             "swap_conviction_margin": _r(
                 getattr(risk, "swap_conviction_margin", 0.0), 2
             ),
             "max_drawdown_pct": _r(risk.max_drawdown * 100, 1),
             "daily_loss_limit_pct": _r(risk.daily_loss_limit * 100, 2),
+            "min_reward_risk": _r(constraints.get("min_rr"), 2),
+            "min_stop_atr": _r(constraints.get("min_stop_atr"), 2),
+            "max_stop_atr": _r(constraints.get("max_stop_atr"), 2),
             "note": (
                 "Position size is computed by the risk engine from your conviction "
                 "and stop distance. You do not set size. Stops are enforced in code "

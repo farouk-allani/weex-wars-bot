@@ -1,4 +1,4 @@
-"""WEEX AI Wars II — Composite Strategy v8.5
+"""WEEX competition-rehearsal composite strategy v8.5
 
 v8.5:
 - Wick-rejection quality filter on MR entries

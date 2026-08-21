@@ -1,4 +1,4 @@
-"""WEEX AI Wars II trading bot."""
+"""WEEX competition-rehearsal trading bot."""
 
 import sys
 

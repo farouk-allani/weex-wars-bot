@@ -1,4 +1,4 @@
-"""WEEX AI Wars II — Exchange Client (ccxt-based) v8
+"""WEEX competition-rehearsal exchange client (ccxt-based) v8
 
 Fixes:
 - SL/TP stored and applied in paper mode
@@ -52,7 +52,7 @@ class ExchangeClient:
         # Paper state — same cost model as the backtest, otherwise paper results
         # are optimistic and can't be compared against the WFO that tuned them.
         bt = config.get("backtest", {})
-        self.commission_rate = float(bt.get("commission_rate", 0.0006))
+        self.commission_rate = float(bt.get("commission_rate", 0.0008))
         self.slippage_pct = float(bt.get("slippage_pct", 0.0005))
         # Maker fee for resting limit fills. A maker fill pays no slippage either —
         # the price is ours by construction; what we risk instead is not filling.
@@ -418,12 +418,27 @@ class ExchangeClient:
                     symbol, "market", ccxt_side, amount, params=entry_params
                 )
 
-            bracket_result = self._create_live_brackets(
-                symbol, side, amount, None, take_profit
+            # An accepted entry request does not prove its requested child stop is
+            # live. Apply the same proof/fallback invariant used for maker fills.
+            confirmed_stop, proof_error = self._find_open_live_stop(
+                symbol, side, float(stop_loss or 0)
             )
-            sl_ok = bool(stop_loss and stop_loss > 0)
+            bracket_result = self._create_live_brackets(
+                symbol, side, amount,
+                None if confirmed_stop is not None else stop_loss,
+                take_profit,
+            )
+            sl_ok = confirmed_stop is not None or bool(bracket_result["sl_placed"])
             tp_ok = bool(bracket_result["tp_placed"])
-            sl_err = None if sl_ok else "no stop loss was attached to the entry"
+            confirmed_sl_id = (
+                str(confirmed_stop.get("id") or "") or None
+                if confirmed_stop is not None else None
+            )
+            sl_order_id = confirmed_sl_id or bracket_result.get("sl_order_id")
+            sl_err = None
+            if not sl_ok:
+                errors = [proof_error, bracket_result.get("sl_error")]
+                sl_err = "; ".join(str(error) for error in errors if error)
             tp_err = bracket_result.get("tp_error")
 
             # Cache brackets so software management still works
@@ -488,9 +503,9 @@ class ExchangeClient:
                 "size": amount,
                 "leverage": int(leverage or self.config.get("trading", {}).get("default_leverage", 5)),
                 "opened_at": datetime.utcnow().isoformat(),
-                "sl_attached": sl_ok,
-                "sl_order_id": None,
-                "sl_trigger": True,
+                "sl_attached": confirmed_stop is not None,
+                "sl_order_id": sl_order_id,
+                "sl_trigger": bool(sl_ok),
                 "tp_order_id": bracket_result.get("tp_order_id"),
                 "tp_trigger": bool(bracket_result.get("tp_trigger")),
                 "entry_order_id": str(order.get("id") or ""),
@@ -501,9 +516,9 @@ class ExchangeClient:
             order["tp_placed"] = tp_ok
             order["stop_loss"] = stop_loss
             order["take_profit"] = take_profit
-            order["sl_order_id"] = bracket_result.get("sl_order_id")
+            order["sl_order_id"] = sl_order_id
             order["tp_order_id"] = bracket_result.get("tp_order_id")
-            order["sl_trigger"] = True
+            order["sl_trigger"] = bool(sl_ok)
             order["tp_trigger"] = bool(bracket_result.get("tp_trigger"))
             if sl_err:
                 order["sl_error"] = sl_err
@@ -597,14 +612,42 @@ class ExchangeClient:
             "tp_trigger": tp_trigger,
         }
 
+    def _find_open_live_stop(
+        self,
+        symbol: str,
+        side: Side,
+        stop_loss: float,
+    ) -> tuple[Optional[dict], Optional[str]]:
+        """Prove an exact venue-side stop exists for a newly filled position."""
+        if not stop_loss or stop_loss <= 0:
+            return None, "no valid stop loss supplied"
+        try:
+            target = float(self.normalize_price(symbol, stop_loss))
+            orders = self.exchange.fetch_open_orders(
+                symbol, params={"type": "swap", "trigger": True}
+            )
+        except Exception as exc:
+            return None, f"open-stop verification failed: {exc}"
+
+        expected_side = "sell" if side == Side.LONG else "buy"
+        for order in orders or []:
+            if not isinstance(order, dict):
+                continue
+            if (
+                str(order.get("symbol") or "") == symbol
+                and str(order.get("side") or "").lower() == expected_side
+                and self._same_price(self._trigger_price(order), target)
+            ):
+                return order, None
+        return None, "no matching open stop found"
+
     # ---- Maker (post-only) entries ----
     #
-    # Why this path exists: a market entry pays taker fee + slippage (~0.11% of
-    # notional per side); a resting post-only limit pays the maker fee and no
-    # spread. Measured round-trip cost at market was 0.22% against a best measured
-    # edge of ~0.13%/trade — execution is the difference between negative and
-    # roughly breakeven. So entries rest at the touch and the engine reprices or
-    # abandons; it never crosses the spread to chase a trade.
+    # Why this path exists: market entries pay the configured taker fee, spread and
+    # slippage; a resting post-only limit pays the maker fee without crossing. A
+    # historical simulator already measured market round-trip cost above its best
+    # weak gross edge. Entries therefore rest at the touch and are repriced or
+    # abandoned; they never cross the spread to chase a trade.
 
     def touch_price(self, symbol: str, side: Side) -> float:
         """Best passive price: the bid for a buy, the ask for a sell.
@@ -857,12 +900,28 @@ class ExchangeClient:
         if self.mode == "paper":
             return {"sl_placed": True, "tp_placed": True}
 
-        bracket_result = self._create_live_brackets(
-            symbol, side, amount, None if stop_attached else stop_loss, take_profit
+        # `stop_attached` only says the entry request asked for an atomic child
+        # stop; it is not evidence that the venue accepted and kept that child.
+        # Prove the exact symbol/closing-side/trigger now. If proof is unavailable,
+        # place an independent reduce-only stop before reporting this fill protected.
+        confirmed_stop, proof_error = self._find_open_live_stop(
+            symbol, side, float(stop_loss or 0)
         )
-        sl_ok = bool(stop_attached) or bool(bracket_result["sl_placed"])
+        bracket_result = self._create_live_brackets(
+            symbol, side, amount, None if confirmed_stop is not None else stop_loss,
+            take_profit,
+        )
+        sl_ok = confirmed_stop is not None or bool(bracket_result["sl_placed"])
         tp_ok = bool(bracket_result["tp_placed"])
-        sl_err = None if stop_attached else bracket_result.get("sl_error")
+        confirmed_sl_id = (
+            str(confirmed_stop.get("id") or "") or None
+            if confirmed_stop is not None else None
+        )
+        sl_order_id = confirmed_sl_id or bracket_result.get("sl_order_id")
+        sl_err = None
+        if not sl_ok:
+            errors = [proof_error, bracket_result.get("sl_error")]
+            sl_err = "; ".join(str(error) for error in errors if error)
         tp_err = bracket_result.get("tp_error")
         entry_fee = amount * fill_price * self.maker_fee_rate
         self._local_brackets[symbol] = {
@@ -885,18 +944,18 @@ class ExchangeClient:
             "size": amount,
             "leverage": int(self.config.get("trading", {}).get("default_leverage", 5)),
             "opened_at": datetime.utcnow().isoformat(),
-            "sl_attached": bool(stop_attached),
-            "sl_order_id": bracket_result.get("sl_order_id"),
-            "sl_trigger": True,
+            "sl_attached": confirmed_stop is not None,
+            "sl_order_id": sl_order_id,
+            "sl_trigger": bool(sl_ok),
             "tp_order_id": bracket_result.get("tp_order_id"),
             "tp_trigger": bool(bracket_result.get("tp_trigger")),
         }
         out = {
             "sl_placed": sl_ok,
             "tp_placed": tp_ok,
-            "sl_order_id": bracket_result.get("sl_order_id"),
+            "sl_order_id": sl_order_id,
             "tp_order_id": bracket_result.get("tp_order_id"),
-            "sl_trigger": True,
+            "sl_trigger": bool(sl_ok),
             "tp_trigger": bool(bracket_result.get("tp_trigger")),
         }
         if sl_err:
@@ -1370,15 +1429,29 @@ class ExchangeClient:
         bracket["closure_error"] = "external close booked; bracket cleanup unresolved"
         self._local_brackets[symbol] = bracket
 
-    def close_position(self, symbol: str, *, maker_price: Optional[float] = None) -> dict:
-        """Close at market, or — when `maker_price` is given — book the fill as a
-        resting limit that the caller has already proven would have executed."""
+    def close_position(
+        self,
+        symbol: str,
+        *,
+        maker_price: Optional[float] = None,
+        trigger_price: Optional[float] = None,
+    ) -> dict:
+        """Close at market, or book a proven paper/venue bracket fill.
+
+        ``maker_price`` represents a resting TP limit. ``trigger_price`` is a paper
+        stop reference recovered from a completed 1m candle; normal exit slippage is
+        still applied to it. Live execution ignores the latter and uses venue fills.
+        """
         if self.mode == "paper":
             if symbol not in self.paper_positions:
                 return {"closed": True, "reason": "no_position"}
             pos = self.paper_positions.pop(symbol)
             ticker = self.fetch_ticker(symbol)
-            mark = float(ticker.get("last") or pos.entry_price)
+            mark = float(
+                trigger_price
+                if trigger_price is not None and float(trigger_price) > 0
+                else (ticker.get("last") or pos.entry_price)
+            )
             # Settle funding owed up to this instant before the position leaves the
             # book, or a close that lands just after a boundary escapes the charge.
             self._settle_paper_funding(pos, mark, datetime.utcnow())

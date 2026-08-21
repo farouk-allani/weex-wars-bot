@@ -1,6 +1,8 @@
-"""Non-mutating readiness gate for the WEEX AI Wars bot."""
+"""Non-mutating readiness gate for the WEEX competition rehearsal bot."""
 
 import argparse
+import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -13,6 +15,114 @@ from rich.panel import Panel
 import yaml
 
 console = Console()
+
+LIVE_MIN_CLOSED_TRADES = 40
+LIVE_MIN_PROFIT_FACTOR = 1.25
+LIVE_RECENT_WINDOW = 20
+
+
+def configured_policy_id(cfg):
+    """Explicit forward-test cohort; operators bump it when behavior changes."""
+    evaluation = cfg.get("evaluation") if isinstance(cfg, dict) else None
+    return str((evaluation or {}).get("policy_id") or "").strip()
+
+
+def paper_evidence_from_state(state, policy_id=None):
+    """Extract finite closed-trade evidence, optionally for one policy cohort."""
+    risk = state.get("risk") if isinstance(state, dict) else None
+    history = risk.get("trade_history") if isinstance(risk, dict) else None
+    rows = history if isinstance(history, list) else []
+    pnls = []
+    invalid_rows = 0
+    other_policy_rows = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            invalid_rows += 1
+            continue
+        if policy_id is not None and str(row.get("policy_id") or "") != policy_id:
+            other_policy_rows += 1
+            continue
+        try:
+            pnl = float(row.get("pnl"))
+        except (TypeError, ValueError, OverflowError):
+            invalid_rows += 1
+            continue
+        if not math.isfinite(pnl):
+            invalid_rows += 1
+            continue
+        pnls.append(pnl)
+
+    gross_profit = sum(pnl for pnl in pnls if pnl > 0)
+    gross_loss = -sum(pnl for pnl in pnls if pnl < 0)
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    elif gross_profit > 0:
+        profit_factor = math.inf
+    else:
+        profit_factor = None
+
+    recent = pnls[-LIVE_RECENT_WINDOW:]
+    return {
+        "history_present": isinstance(history, list),
+        "closed_trades": len(pnls),
+        "invalid_rows": invalid_rows,
+        "other_policy_rows": other_policy_rows,
+        "policy_id": policy_id,
+        "profit_factor": profit_factor,
+        "recent_count": len(recent),
+        "recent_net_pnl": sum(recent),
+    }
+
+
+def live_paper_evidence_gates(evidence):
+    """Minimum saved-paper thresholds; these do not establish trading alpha."""
+    profit_factor = evidence.get("profit_factor")
+    return {
+        "closed_trades": evidence.get("closed_trades", 0) >= LIVE_MIN_CLOSED_TRADES,
+        "profit_factor": (
+            isinstance(profit_factor, (int, float))
+            and not math.isnan(profit_factor)
+            and profit_factor >= LIVE_MIN_PROFIT_FACTOR
+        ),
+        "recent_net_pnl": (
+            evidence.get("recent_count", 0) >= LIVE_RECENT_WINDOW
+            and evidence.get("recent_net_pnl", 0) > 0
+        ),
+    }
+
+
+def competition_rules_verified(cfg):
+    """Require an explicit acknowledgement of the official current rulebook."""
+    competition = cfg.get("competition") if isinstance(cfg, dict) else None
+    return isinstance(competition, dict) and competition.get("rules_verified") is True
+
+
+def load_saved_paper_evidence(cfg, base_dir=Path(".")):
+    """Load configured state without mutating it; return evidence, path, error."""
+    configured = (cfg.get("logging") or {}).get("state_file") if isinstance(cfg, dict) else None
+    path = Path(configured or "data/bot_state.json")
+    if not path.is_absolute():
+        path = base_dir / path
+    try:
+        with open(path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        if not isinstance(state, dict):
+            raise ValueError("state root is not an object")
+        policy_id = configured_policy_id(cfg)
+        # A missing ID deliberately matches no real cohort. It must fail readiness
+        # instead of silently pooling every historical implementation.
+        selected = policy_id or "__missing_policy_id__"
+        return paper_evidence_from_state(state, policy_id=selected), path, None
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return paper_evidence_from_state({}, policy_id=configured_policy_id(cfg)), path, str(exc)
+
+
+def _format_profit_factor(value):
+    if value is None:
+        return "N/A"
+    if math.isinf(value):
+        return "inf (no losing trades)"
+    return f"{value:.3f}"
 
 
 def main():
@@ -49,6 +159,11 @@ def main():
         check("HTF bias on", cfg.get("competition", {}).get("htf_directional_bias", False))
         check("risk/trade <= 2%", cfg.get("risk", {}).get("max_risk_per_trade", 1) <= 0.02)
         check("max DD <= 20%", cfg.get("risk", {}).get("max_drawdown", 1) <= 0.20)
+        check(
+            "forward-test policy cohort set",
+            bool(configured_policy_id(cfg)),
+            configured_policy_id(cfg) or "set evaluation.policy_id and bump it after behavior changes",
+        )
         if args.target == "live":
             check(
                 "live remains disarmed for rehearsal",
@@ -61,9 +176,45 @@ def main():
                 bool((cfg.get("execution") or {}).get("maker_entries")),
             )
             check(
-                "venue leverage ceiling <= 20x",
+                "configured rehearsal leverage <= 20x",
                 cfg.get("trading", {}).get("max_leverage", 99) <= 20,
             )
+            check(
+                "official current competition rules verified",
+                competition_rules_verified(cfg),
+                "set competition.rules_verified=true only after reviewing the official current rulebook",
+            )
+
+    if args.target == "live":
+        evidence, state_path, state_error = load_saved_paper_evidence(cfg)
+        gates = live_paper_evidence_gates(evidence)
+        source = str(state_path)
+        if state_error:
+            source += f"; unreadable: {state_error}"
+        invalid = evidence["invalid_rows"]
+        invalid_note = f"; skipped invalid rows={invalid}" if invalid else ""
+        cohort_note = (
+            f"; policy={evidence.get('policy_id') or '<missing>'}; "
+            f"excluded other-policy rows={evidence.get('other_policy_rows', 0)}"
+        )
+        check(
+            "saved paper: >=40 closed trades",
+            gates["closed_trades"],
+            f"finite closed trades={evidence['closed_trades']}; {source}"
+            f"{cohort_note}{invalid_note}",
+        )
+        check(
+            "saved paper: full-sample PF >=1.25",
+            gates["profit_factor"],
+            f"PF={_format_profit_factor(evidence['profit_factor'])}; "
+            f"n={evidence['closed_trades']}; {source}{cohort_note}",
+        )
+        check(
+            "saved paper: recent-20 net PnL >0",
+            gates["recent_net_pnl"],
+            f"recent sample={evidence['recent_count']}/20; "
+            f"net=${evidence['recent_net_pnl']:.2f}; {source}",
+        )
 
     # Env
     from dotenv import load_dotenv
@@ -71,10 +222,10 @@ def main():
     key = os.getenv("WEEX_API_KEY", "")
     secret = os.getenv("WEEX_API_SECRET", "")
     phrase = os.getenv("WEEX_API_PASSPHRASE") or os.getenv("WEEX_PASSPHRASE") or ""
-    check(".env API key present", bool(key) and key != "your_api_key_here", "set WEEX_API_KEY")
-    check(".env secret present", bool(secret) and secret != "your_api_secret_here")
-    check("passphrase present", bool(phrase) and "your_passphrase" not in phrase)
     if args.target == "live":
+        check(".env API key present", bool(key) and key != "your_api_key_here", "set WEEX_API_KEY")
+        check(".env secret present", bool(secret) and secret != "your_api_secret_here")
+        check("passphrase present", bool(phrase) and "your_passphrase" not in phrase)
         check("DeepSeek key present", bool(os.getenv("DEEPSEEK_API_KEY", "")))
         try:
             from src.ai.wars_log import WeexAILogUploader
@@ -151,6 +302,12 @@ def main():
                 "configured symbols allow API trading",
             ):
                 check(name, False, "credentials missing; probe not attempted")
+    else:
+        check(
+            "WEEX credentials optional in paper mode",
+            True,
+            "public market data works without private trading credentials",
+        )
 
     # Imports
     try:
@@ -211,9 +368,11 @@ def main():
         "  2. python test_bot.py\n"
         "  3. python -m src.main\n"
         "  4. Confirm every fill logs Stop + TP\n\n"
+        "Saved-paper gates are minimum runtime/live-readiness thresholds only.\n"
+        "They do not prove alpha or competition readiness.\n\n"
         "Live path (only after paper is clean):\n"
         "  1. Keep trading.mode: paper while this gate is red\n"
-        "  2. Verify the account is AI-Wars allowlisted\n"
+        "  2. Verify the current event's UID, API key and VPS IP are allowlisted\n"
         "  3. Start leverage 3–5\n"
         "  4. Confirm UploadAiLog says upload success before another entry\n"
         "  5. Only then arm live mode and watch the first three round trips",

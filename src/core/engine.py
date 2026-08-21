@@ -1,4 +1,4 @@
-"""WEEX AI Wars II — Main Trading Engine v8.4
+"""WEEX competition-rehearsal trading engine v8.4
 
 - HTF data, adaptive strategy scores
 - State persistence across restarts
@@ -13,7 +13,7 @@ import time
 import urllib.request
 import yaml
 import signal as sig
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rich.console import Console
@@ -41,9 +41,19 @@ console = Console()
 class TradingEngine:
     def __init__(self, config_path: str = "config.yaml"):
         self.config = self._load_config(config_path)
+        self.policy_id = str(
+            (self.config.get("evaluation", {}) or {}).get("policy_id") or ""
+        ).strip()
         self.exchange = ExchangeClient(self.config)
         self.strategy = CompositeStrategy(self.config)
         self.risk = RiskManager(self.config)
+        # A capacity swap closes risk before its replacement has passed the entry
+        # gate, signal geometry, sizing and venue checks. Until that lifecycle is
+        # atomic, the safe default is no swaps. ``is True`` is deliberate: a
+        # missing key (and strings such as "true") must fail closed.
+        self.allow_capacity_swaps = (
+            (self.config.get("risk", {}) or {}).get("allow_capacity_swaps") is True
+        )
         self.logger = setup_logger(self.config)
         self.running = False
         self.cycle_count = 0
@@ -83,13 +93,25 @@ class TradingEngine:
         self.edges = EdgeStrategies(self.config)
         # Which AI decision opened which position, so outcomes link back to reasoning.
         self.position_decisions: dict[str, str] = (state or {}).get("position_decisions") or {}
-        # Entry conviction per open symbol. Needed to price a swap: replacing a
-        # position is only rational if the replacement is genuinely better, and
-        # without the incumbent's conviction there is nothing to compare against.
+        # Entry conviction per open symbol. This is useful evidence when reviewing
+        # the original thesis and is retained for the explicitly opt-in legacy swap
+        # guard; shipped configuration keeps capacity swaps disabled.
         self.position_conviction: dict[str, float] = {
             str(k): float(v)
             for k, v in ((state or {}).get("position_conviction") or {}).items()
         }
+        # Forward-test policy belongs to the ENTRY, not the close. Positions that
+        # predate this mapping stay unversioned when they eventually close.
+        self.position_policy_ids: dict[str, str] = {
+            str(k): str(v)
+            for k, v in ((state or {}).get("position_policy_ids") or {}).items()
+        }
+        # Last completed 1m candle whose range was checked against each paper
+        # bracket. This closes the gap where a stop/TP was touched and recovered
+        # between 60-second ticker polls.
+        self.paper_bar_checked: dict[str, str] = (
+            (state or {}).get("paper_bar_checked") or {}
+        )
         self._last_ai_call: datetime | None = None
         self.ai_interval_min = float(ai_cfg.get("decision_interval_minutes", 60))
         # Oscillators + edge_signals travel together, exactly like the replay's
@@ -101,7 +123,7 @@ class TradingEngine:
 
         # --- Maker execution ---
         # Entries rest at the touch instead of crossing the spread: measured
-        # round-trip cost at market (0.22%) exceeded the best measured edge
+        # historical market round-trip cost exceeded the best measured edge
         # (~0.13%/trade), so the fee/slippage saved here IS the strategy's margin.
         exec_cfg = self.config.get("execution", {}) or {}
         self.maker_entries = bool(exec_cfg.get("maker_entries", False))
@@ -185,7 +207,7 @@ class TradingEngine:
 
         pure = self.config.get("competition", {}).get("pure_edge", False)
         console.print(Panel.fit(
-            "[bold green]WEEX AI Wars II — Trading Bot v8.5[/]\n"
+            "[bold green]WEEX Competition Rehearsal - Trading Bot v8.5[/]\n"
             f"Mode: [yellow]{self.config['trading']['mode']}[/] | "
             f"Profile: [cyan]{'pure_edge' if pure else 'competition'}[/]\n"
             f"Symbols: {', '.join(symbols)}\n"
@@ -244,12 +266,7 @@ class TradingEngine:
         self._reconcile_external_closures(account)
         self.strategy.sync_scores_from_risk(self.risk)
 
-        can_trade, reason = self.risk.can_trade(account)
-        if can_trade and self.exchange.mode != "paper":
-            protection = self.exchange.protection_status()
-            if not protection.get("healthy"):
-                can_trade = False
-                reason = "execution protection unresolved"
+        can_trade, reason = self._entry_gate(account)
         if not can_trade:
             console.print(f"[yellow]Trading blocked: {reason}[/]")
             # A full book is routine, not a warning — logging it at WARNING every
@@ -265,17 +282,34 @@ class TradingEngine:
         self._manage_positions(account)
         account = self.exchange.get_account_state()
 
+        # Position management can itself change the gate: a stop may arm a loss
+        # cooldown, a close fee may cross the daily limit, or live protection may
+        # become unresolved. Never carry the pre-management answer into entries.
+        can_trade, reason = self._entry_gate(account)
+        if not can_trade:
+            self.logger.info("Trading blocked after position management: %s", reason)
+            return
+
         existing = [(p.symbol, p.side.value) for p in account.positions]
         symbol_weights = {s: self.risk.get_pair_weight(s) for s in symbols}
         sorted_symbols = sorted(symbols, key=lambda s: symbol_weights[s], reverse=True)
 
         for symbol in sorted_symbols:
             try:
+                # Every preceding attempt may have filled, paid a fee, or changed
+                # venue protection. Refresh the complete gate between attempts.
+                account = self.exchange.get_account_state()
+                can_trade, reason = self._entry_gate(account)
+                if not can_trade:
+                    self.logger.info("Trading blocked between entry attempts: %s", reason)
+                    break
                 if any(p.symbol == symbol for p in account.positions):
                     continue
-                if len(account.positions) >= self.risk.max_open_positions:
+                if (
+                    len(account.positions) + len(self.pending_entries)
+                    >= self.risk.max_open_positions
+                ):
                     break
-
                 candles = self.exchange.fetch_candles(symbol, timeframe, lookback)
                 if len(candles) < 100:
                     continue
@@ -296,6 +330,22 @@ class TradingEngine:
                     self.logger.info("SKIP %s: %s", symbol, why)
                     continue
 
+                pending_side = signal.side.value
+                pending_same = sum(
+                    1 for pending in self.pending_entries.values()
+                    if pending.get("side") == pending_side
+                )
+                open_same = sum(1 for p in account.positions if p.side == signal.side)
+                if (
+                    0 < self.risk.max_same_side_positions
+                    <= pending_same + open_same
+                ):
+                    self.logger.info(
+                        "SKIP %s: %d %s position(s)/order(s) already committed",
+                        symbol, pending_same + open_same, pending_side,
+                    )
+                    continue
+
                 pair_weight = self.risk.get_pair_weight(symbol)
                 size = self.risk.calculate_position_size(signal, account, pair_weight)
                 if size <= 0:
@@ -309,19 +359,16 @@ class TradingEngine:
                 console.print(f"[red]Error analyzing {symbol}: {e}[/]")
                 self.logger.exception("Analyze %s: %s", symbol, e)
 
-    def _run_ai_cycle(self, symbols, timeframe, htf, lookback, htf_lookback):
-        account = self.exchange.get_account_state()
-        self._reconcile_external_closures(account)
-
-        # Stops never wait on the model. Position management runs every cycle (60s);
-        # the model is consulted on its own, much slower, cadence.
-        self._manage_positions(account)
-        account = self.exchange.get_account_state()
-
-        if not self._ai_due():
-            return
-
+    def _entry_gate(self, account) -> tuple[bool, str]:
+        """One authoritative gate for every path that can create exposure."""
         can_trade, reason = self.risk.can_trade(account)
+        if (
+            can_trade
+            and self.exchange.mode != "paper"
+            and not bool((self.config.get("competition", {}) or {}).get("rules_verified"))
+        ):
+            can_trade = False
+            reason = "current official competition rules have not been verified"
         if can_trade and self.exchange.mode != "paper":
             protection = self.exchange.protection_status()
             if not protection.get("healthy"):
@@ -337,6 +384,24 @@ class TradingEngine:
             if not upload_ready:
                 can_trade = False
                 reason = f"AI-log delivery unavailable: {upload_reason}"
+        return can_trade, reason
+
+    def _run_ai_cycle(self, symbols, timeframe, htf, lookback, htf_lookback):
+        account = self.exchange.get_account_state()
+        self._reconcile_external_closures(account)
+
+        # Stops never wait on the model. Position management runs every cycle (60s);
+        # the model is consulted on its own, much slower, cadence.
+        self._manage_positions(account)
+        account = self.exchange.get_account_state()
+
+        # can_trade() owns peak-equity, daily mark-to-market and cooldown state.
+        # Refresh it every 60-second management cycle, not only when the hourly
+        # model call is due.
+        can_trade, reason = self._entry_gate(account)
+
+        if not self._ai_due():
+            return
 
         market = []
         atrs: dict[str, float] = {}
@@ -439,10 +504,17 @@ class TradingEngine:
             account=account,
             risk=self.risk,
             recent_trades=self.risk.trade_history,
-            competition=self._competition_context(),
+            competition=self._competition_context(account),
             fear_greed=sentiment,
             macro=macro,
             position_conviction=self.position_conviction,
+            position_theses=self._position_theses(account),
+            trading_constraints={
+                "min_rr": self.ai.min_rr,
+                "min_stop_atr": self.ai.min_stop_atr,
+                "max_stop_atr": self.ai.max_stop_atr,
+                "allow_capacity_swaps": self.allow_capacity_swaps,
+            },
         )
         # Tell the model plainly when it may not open anything, so it reasons about
         # exits and holds instead of proposing entries that will be thrown away.
@@ -478,10 +550,9 @@ class TradingEngine:
             self.logger.info("AI decision_id=%s assessment=%s", decision_id, assessment[:200])
 
         allowed = set(symbols)
-        # Exits first: closing frees a slot that an entry below may want. That
-        # ordering is what makes a swap possible at all, and it is also how
-        # capacity pressure leaks into the exit decision — so the swap has to be
-        # priced before any close is executed.
+        # Exits are processed before entries, so a response that mixes a full-book
+        # close with a new-slot request could otherwise become a non-atomic swap.
+        # Refuse that lifecycle by default before any close is executed.
         blocked_swaps = self._capacity_only_closes(decisions, account)
         for d in decisions:
             if str(d.get("action", "")).lower() != "close":
@@ -494,7 +565,16 @@ class TradingEngine:
                 console.print(f"[yellow]AI close {sym} refused: {blocked_swaps[sym]}[/]")
                 self.logger.info("AI_CLOSE_REFUSED %s: %s", sym, blocked_swaps[sym])
                 continue
-            price = prices.get(sym) or pos.entry_price
+            rationale = str(d.get("rationale") or "").strip()
+            if not rationale:
+                self.logger.info("AI_CLOSE_REFUSED %s: missing rationale", sym)
+                continue
+            if sym not in prices:
+                self.logger.warning(
+                    "AI_CLOSE_REFUSED %s: no current market snapshot", sym
+                )
+                continue
+            price = prices[sym]
             console.print(f"[yellow]AI closing {sym}: {d.get('rationale', '')[:100]}[/]")
             self.logger.info("AI_CLOSE %s reason=%s", sym, str(d.get("rationale"))[:200])
             self._close_position(
@@ -514,6 +594,11 @@ class TradingEngine:
                 continue
             self._abandon_pending(sym, pe, f"superseded_by_{act or 'none'}")
 
+        # A standalone thesis close may have freed a slot. Re-run the complete gate
+        # after exits; venue protection, cooldown and AI-log delivery remain
+        # impossible to bypass.
+        account = self.exchange.get_account_state()
+        can_trade, reason = self._entry_gate(account)
         if not can_trade:
             console.print(f"[yellow]Entries blocked: {reason}[/]")
             self.logger.info("AI entries blocked: %s", reason)
@@ -523,11 +608,22 @@ class TradingEngine:
                 self._abandon_pending(sym, pe, f"blocked:{reason}")
             return
 
-        account = self.exchange.get_account_state()
         for d in decisions:
             act = str(d.get("action", "")).lower()
             if act not in ("long", "short"):
                 continue
+            # A prior decision in this same response may already have created
+            # exposure. Fees, position caps, protection and MTM loss all need the
+            # same fresh gate used at the start of the batch.
+            account = self.exchange.get_account_state()
+            can_trade, reason = self._entry_gate(account)
+            if not can_trade:
+                self.logger.info("AI entries blocked between attempts: %s", reason)
+                for pending_symbol, pending in list(self.pending_entries.items()):
+                    self._abandon_pending(
+                        pending_symbol, pending, f"blocked_between_attempts:{reason}"
+                    )
+                break
             sym = str(d.get("symbol") or "")
             if sym not in prices:
                 continue
@@ -607,34 +703,18 @@ class TradingEngine:
         explicitly sanctioned this ("the margin slot is needed for a clearly better
         opportunity"), but nothing ever checked the "clearly better" part.
 
-        So check it. A swap is legitimate when the replacement genuinely beats the
-        incumbent; below that margin the close is capacity pressure wearing a
-        thesis. Closes with no replacement competing for their slot are untouched —
-        those are ordinary thesis exits, and this guard has no opinion on them.
+        Conviction alone cannot make the operation safe: the proposed replacement
+        has not yet passed symbol, bracket, RR, sizing, risk, entry-gate or venue
+        validation when exits run. Therefore full-book swaps are refused unless an
+        operator explicitly opts into the legacy conviction guard. Closes with no
+        replacement competing for their slot are untouched — those are ordinary
+        thesis exits, and this guard has no opinion on them.
         """
-        margin = self.risk.swap_conviction_margin
-        if margin <= 0:
-            return {}
-
         committed = len(account.positions or []) + len(self.pending_entries)
         if committed < self.risk.max_open_positions:
             return {}  # a free slot exists; no close is buying one
 
         open_syms = {p.symbol for p in (account.positions or [])}
-        candidates = []
-        for d in decisions:
-            if str(d.get("action", "")).lower() not in ("long", "short"):
-                continue
-            sym = str(d.get("symbol") or "")
-            if not sym or sym in open_syms or sym in self.pending_entries:
-                continue  # not asking for a new slot
-            try:
-                candidates.append((float(d.get("conviction") or 0.0), sym))
-            except (TypeError, ValueError):
-                continue
-        if not candidates:
-            return {}  # nothing wants the slot, so nothing is being freed for it
-
         closes = []
         for d in decisions:
             if str(d.get("action", "")).lower() != "close":
@@ -644,6 +724,57 @@ class TradingEngine:
                 closes.append((self._entry_conviction(sym), sym))
         if not closes:
             return {}
+
+        closing_syms = {sym for _, sym in closes}
+        candidate_requests = []
+        for d in decisions:
+            if str(d.get("action", "")).lower() not in ("long", "short"):
+                continue
+            sym = str(d.get("symbol") or "")
+            if sym in self.pending_entries:
+                continue
+            if sym in open_syms and sym not in closing_syms:
+                continue  # continuing another incumbent does not need this slot
+            # Missing/malformed fields still represent a replacement request. They
+            # must block the close, not make the close look like a standalone exit.
+            candidate_requests.append((d, sym))
+        if not candidate_requests:
+            return {}  # nothing wants the slot, so this is a standalone thesis exit
+
+        if getattr(self, "allow_capacity_swaps", False) is not True:
+            return {
+                held_sym: (
+                    "capacity swap refused: replacements are not atomically "
+                    "validated; submit a thesis close without a replacement"
+                )
+                for _, held_sym in closes
+            }
+
+        # Legacy opt-in only. Even an explicit enable fails closed if its comparison
+        # margin is missing or invalid; zero must never silently disarm the guard.
+        try:
+            margin = float(self.risk.swap_conviction_margin)
+        except (AttributeError, TypeError, ValueError):
+            margin = 0.0
+        if margin <= 0:
+            return {
+                held_sym: "capacity swap refused: invalid swap conviction margin"
+                for _, held_sym in closes
+            }
+
+        candidates = []
+        for decision, sym in candidate_requests:
+            try:
+                conviction = float(decision.get("conviction"))
+            except (TypeError, ValueError):
+                continue
+            if sym and np.isfinite(conviction):
+                candidates.append((conviction, sym))
+        if not candidates:
+            return {
+                held_sym: "capacity swap refused: invalid replacement proposal"
+                for _, held_sym in closes
+            }
 
         # Pair the cheapest incumbents against the strongest replacements: that is
         # the most favourable reading of the model's intent, so anything this
@@ -710,7 +841,7 @@ class TradingEngine:
                 round(used_n / eq, 3) if eq else 0.0
             )
             hl["portfolio_risk_note"] = (
-                "Two correlation budgets, both scored. The stop-out one is what you "
+                "Two internal correlation budgets. The stop-out one is what you "
                 "lose if EVERY open stop fills in the same move. The notional one is "
                 "how hard your equity curve can swing, which is what the stability "
                 "metric sees. Same-side positions in correlated pairs consume both "
@@ -786,7 +917,7 @@ class TradingEngine:
                 "ai_credit_low",
                 f"DeepSeek credit is LOW: {bal} {result.get('currency') or ''} left "
                 f"(warn threshold {self.ai_balance_warn_usd}). "
-                "Top up before the next round — a mid-round outage costs the trade minimum.",
+                "Top up before a supervised round; an outage interrupts decisions and risk review.",
             )
         else:
             self._clear_alert("ai_credit_low")
@@ -922,9 +1053,9 @@ class TradingEngine:
     def _record_compliance(self):
         """Publish ai-log coverage: every linked order must have an ai-log file.
 
-        An AI-driven live order without its ai-log is non-compliant, and the penalty
-        is not a worse score but potentially no score — so coverage is monitored on
-        every cycle rather than checked by hand before a round. Derived from the
+        Historical Season 1 rules required each AI-driven order to have a matching
+        log. Current-round requirements remain unverified, so coverage is monitored
+        as a conservative rehearsal control rather than presented as current law.
         artifacts on disk, so it reports what a reviewer would see.
         """
         if not self.decision_log:
@@ -949,9 +1080,9 @@ class TradingEngine:
         )
         if gap and gap != self._last_compliance_gap:
             self.logger.critical(
-                "COMPLIANCE: %d of %d linked orders lack a usable ai-log "
-                "(%d missing, %d incomplete-but-repairable). AI-driven orders "
-                "without a valid log are non-compliant. Last error: %s",
+                "REHEARSAL LOG GAP: %d of %d linked orders lack a usable ai-log "
+                "(%d missing, %d incomplete-but-repairable). This would have failed "
+                "the historical Season 1 workflow. Last error: %s",
                 gap, status.get("orders_linked"),
                 status.get("orders_without_ai_log"),
                 status.get("ai_logs_repairable_incomplete"),
@@ -991,28 +1122,119 @@ class TradingEngine:
         except Exception as e:
             self.logger.warning("could not write execution health: %s", e)
 
-    def _competition_context(self) -> dict:
-        """Scoring, trade count and clock — the model reasons about all three."""
+    def _position_theses(self, account) -> dict[str, dict]:
+        """Recover concise entry facts for the positions the model now manages."""
+        if not self.decision_log:
+            return {}
+        result: dict[str, dict] = {}
+        for position in account.positions:
+            decision_id = self.position_decisions.get(position.symbol)
+            if not decision_id:
+                continue
+            record = self.decision_log.get_decision(decision_id)
+            if not record:
+                continue
+            original = next(
+                (
+                    d for d in (record.get("decisions") or [])
+                    if str(d.get("symbol") or "") == position.symbol
+                    and str(d.get("action") or "").lower() == position.side.value
+                ),
+                None,
+            )
+            if not original:
+                continue
+            entry_market = next(
+                (
+                    m for m in ((record.get("context") or {}).get("markets") or [])
+                    if str(m.get("symbol") or "") == position.symbol
+                ),
+                {},
+            )
+            result[position.symbol] = {
+                "decision_id": decision_id,
+                "entered_decision_at": record.get("timestamp"),
+                "rationale": str(original.get("rationale") or "")[:500],
+                "original_stop_loss": original.get("stop_loss"),
+                "original_take_profit": original.get("take_profit"),
+                "market_assessment": self._assessment_from_record(record)[:500],
+                "entry_market": {
+                    key: entry_market.get(key)
+                    for key in (
+                        "price", "change_pct", "trend", "volatility", "funding", "levels"
+                    )
+                    if key in entry_market
+                },
+            }
+        return result
+
+    @staticmethod
+    def _assessment_from_record(record: dict) -> str:
+        try:
+            parsed = json.loads(record.get("raw_response") or "{}")
+            return str(parsed.get("market_assessment") or "")
+        except Exception:
+            return str(record.get("reasoning") or "")
+
+    @staticmethod
+    def _event_timestamp(event) -> datetime | None:
+        value = event if isinstance(event, datetime) else getattr(event, "timestamp", None)
+        if not isinstance(value, datetime):
+            return None
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+    def _entry_events(self, account, closed_trades: list) -> list[datetime]:
+        """Executed entry-fill times, including positions that have not closed yet."""
+        events: list[datetime] = []
+        for trade in closed_trades:
+            closed_at = self._event_timestamp(trade)
+            if closed_at is None:
+                continue
+            duration = max(float(getattr(trade, "duration_seconds", 0) or 0), 0.0)
+            events.append(closed_at - timedelta(seconds=duration))
+        for position in getattr(account, "positions", []) or []:
+            if self.risk.is_keepalive(getattr(position, "strategy", "")):
+                continue
+            opened_at = self._event_timestamp(getattr(position, "opened_at", None))
+            if opened_at is not None:
+                events.append(opened_at)
+        return events
+
+    def _competition_context(self, account=None) -> dict:
+        """Configured rehearsal scorecard, executed-entry count and clock."""
         comp = self.config.get("competition", {}) or {}
         real = [t for t in self.risk.trade_history if not self.risk.is_keepalive(t.strategy)]
+        entry_events = (
+            self._entry_events(account, real)
+            if account is not None
+            else [
+                t for t in (TradingEngine._event_timestamp(row) for row in real)
+                if t is not None
+            ]
+        )
         stats = self.risk.get_stats()
+        rules_verified = bool(comp.get("rules_verified", False))
         ctx = {
-            # AI Wars II is scored on profit AND risk AND stability. Telling the
-            # model "cumulative PnL" (the AI Wars I rule) pointed it at variance
-            # while the scoring punishes exactly that.
-            "scoring": "multi-metric: realised profit + risk management + strategy stability",
-            "ranking_metric": (
-                "NOT cumulative PnL alone. A smaller steady gain with shallow "
-                "drawdown outranks a larger erratic one."
+            "rules_verified": rules_verified,
+            "scoring": comp.get(
+                "scoring",
+                "rehearsal profile: realised profit + risk management + strategy stability",
             ),
-            "trades_executed": len(real),
+            "ranking_metric": (
+                "Configured rehearsal assumption only; obtain the current official "
+                "rulebook before treating this as a competition formula."
+            ),
+            "executed_entry_fills": len(entry_events),
+            "closed_trades": len(real),
             "minimum_trades_required": comp.get("min_trades", 10),
             # Let it see the metrics it is judged on, not just its P&L.
             "current_win_rate": round(stats.get("win_rate", 0.0), 3),
             "current_sharpe": round(stats.get("sharpe_ratio", 0.0), 2),
             "note": (
-                "Fewer than the minimum trades means disqualification, but forcing "
-                "low-quality trades to hit a count is a losing play. Take good ones."
+                "Pace is an eligibility diagnostic, never a reason to lower setup "
+                "quality. Unverified rules must block live readiness."
             ),
         }
         ends_at = comp.get("ends_at")
@@ -1022,24 +1244,16 @@ class TradingEngine:
                 ctx["hours_remaining"] = round(remaining.total_seconds() / 3600, 1)
             except Exception:
                 pass
-        ctx["pace"] = self._trade_pace(comp, real)
+        ctx["pace"] = self._trade_pace(comp, entry_events)
         return ctx
 
     def _trade_pace(self, comp: dict, real: list) -> dict:
         """How the trade count is tracking against the round's minimum.
 
-        The minimum is per round, and rounds are short (weekly). At the observed
-        ~0.9 trades/day a 7-day round lands near 6 trades — under a 10-trade floor.
-        So the count has to be watched, but the previous answer (mechanical keepalive
-        in-outs) is wrong twice over for AI Wars II: a code-generated order carries no
-        model decision, so it would ship with no ai-log and be non-compliant, and
-        robotic heartbeat trades are exactly the erratic behaviour the stability
-        metric punishes.
-
-        Instead the constraint is handed to the model as a fact about its situation.
-        It already picks instrument, direction and levels; asking it to spend its
-        remaining budget on the best marginal setups it can find beats having code
-        pick a blind one, and every resulting order keeps its reasoning trail.
+        This counts executed entry fills rather than closes. A long-held open trade is
+        still a trade, and counting its eventual close late is exactly what previously
+        made the model believe it was behind and encouraged low-quality turnover.
+        Pace is reported as an eligibility diagnostic only; it never relaxes the bar.
         """
         min_trades = int(comp.get("min_trades", 10) or 0)
         round_days = float(comp.get("round_days", 7) or 7)
@@ -1049,7 +1263,10 @@ class TradingEngine:
         round_start = None
         if started:
             try:
-                round_start = datetime.fromisoformat(str(started).replace("Z", ""))
+                parsed_start = datetime.fromisoformat(
+                    str(started).replace("Z", "+00:00")
+                )
+                round_start = TradingEngine._event_timestamp(parsed_start)
             except Exception:
                 round_start = None
 
@@ -1058,7 +1275,10 @@ class TradingEngine:
             # fiction. Report the trailing window as a rehearsal rate instead — the
             # question that can honestly be answered is "would this pace qualify?".
             window_start = now - timedelta(days=round_days)
-            recent = [t for t in real if t.timestamp and t.timestamp >= window_start]
+            recent = [
+                t for t in (TradingEngine._event_timestamp(row) for row in real)
+                if t is not None and t >= window_start
+            ]
             per_day = len(recent) / round_days
             projected = per_day * round_days
             return {
@@ -1075,16 +1295,18 @@ class TradingEngine:
                     + (
                         "that would QUALIFY. Optimise purely for quality."
                         if projected >= min_trades
-                        else "that would MISS the minimum. Treat this as evidence that "
-                        "your bar for 'tradeable' is too high for a weekly round, and "
-                        "take good-but-imperfect setups you would currently pass on."
+                        else "that would MISS the configured minimum. Do not manufacture "
+                        "turnover; report the eligibility failure to the operator."
                     )
                 ),
             }
 
         elapsed_h = max((now - round_start).total_seconds() / 3600, 0.1)
         remaining_h = max(round_days * 24 - elapsed_h, 0.0)
-        in_round = [t for t in real if t.timestamp and t.timestamp >= round_start]
+        in_round = [
+            t for t in (TradingEngine._event_timestamp(row) for row in real)
+            if t is not None and t >= round_start
+        ]
         still_needed = max(min_trades - len(in_round), 0)
         required_per_day = (
             round(still_needed / (remaining_h / 24), 2) if remaining_h > 1 else None
@@ -1119,9 +1341,8 @@ class TradingEngine:
                 f"BEHIND PACE: {still_needed} more trades needed in "
                 f"{remaining_h:.0f}h to clear the {min_trades}-trade minimum "
                 f"({required_per_day}/day required vs {observed_per_day}/day so far). "
-                "Widen what you consider tradeable — take your best available setups "
-                "at moderate conviction rather than waiting for perfect ones — but do "
-                "not breach risk limits and do not open a position you cannot justify."
+                "This is an eligibility warning, not a trading signal. Do not lower "
+                "setup quality or manufacture turnover; notify the operator."
             )
         else:
             pace["status"] = (
@@ -1231,9 +1452,14 @@ class TradingEngine:
                 executed_stop, executed_target, result,
             )
             self.position_decisions[signal.symbol] = decision_id
-        # Recorded regardless of decision linkage: the swap guard needs it even for
-        # positions opened by a non-AI strategy.
+        # Recorded regardless of decision linkage so the entry's confidence remains
+        # auditable (and is available to the explicitly opt-in legacy swap guard).
         self.position_conviction[signal.symbol] = float(signal.strength)
+        self.position_policy_ids[signal.symbol] = getattr(self, "policy_id", "")
+        if self.exchange.mode == "paper":
+            # No completed candle has been checked for this new position yet. The
+            # first replay must include the minute in which the fill happened.
+            self.paper_bar_checked.pop(signal.symbol, None)
         if result.get("sl_placed") is False and self.exchange.mode != "paper":
             self.logger.critical(
                 "UNPROTECTED ENTRY %s: venue stop missing; closing immediately",
@@ -1248,6 +1474,7 @@ class TradingEngine:
             else:
                 self.position_decisions.pop(signal.symbol, None)
                 self.position_conviction.pop(signal.symbol, None)
+                self.position_policy_ids.pop(signal.symbol, None)
                 self._persist_state()
                 return
         if result.get("sl_placed") is False and self.exchange.mode != "paper":
@@ -1265,8 +1492,106 @@ class TradingEngine:
     #   - we reprice toward the market but never past max_chase_atr from the
     #     signal price, and never below the minimum R:R — a trade that must be
     #     chased that far has already told us the setup is gone;
-    #   - a missed entry costs nothing. Crossing the spread costs 0.11% every
-    #     time. At our measured edge, patience is the whole profit margin.
+    #   - a missed entry costs nothing. Crossing pays the configured taker fee,
+    #     spread and slippage. At this weak measured edge, patience matters.
+
+    @staticmethod
+    def _maker_order_violation(
+        side: Side,
+        size: float,
+        limit_price: float,
+        stop_loss: float,
+        take_profit: float,
+        risk_budget: float,
+        *,
+        max_size: float | None = None,
+    ) -> str | None:
+        """Explain why submitted maker geometry is unsafe, or return ``None``."""
+        try:
+            size = float(size)
+            limit_price = float(limit_price)
+            stop_loss = float(stop_loss)
+            take_profit = float(take_profit)
+            risk_budget = float(risk_budget)
+        except (TypeError, ValueError):
+            return "non-numeric order geometry"
+        if not all(
+            np.isfinite(value)
+            for value in (size, limit_price, stop_loss, take_profit, risk_budget)
+        ):
+            return "non-finite order geometry"
+        if size <= 0 or limit_price <= 0 or risk_budget <= 0:
+            return "non-positive size, price, or risk budget"
+        if side == Side.LONG and not (stop_loss < limit_price < take_profit):
+            return "normalized long bracket is inverted"
+        if side == Side.SHORT and not (take_profit < limit_price < stop_loss):
+            return "normalized short bracket is inverted"
+        tolerance = max(1e-9, abs(risk_budget) * 1e-9)
+        stop_risk = size * abs(limit_price - stop_loss)
+        if stop_risk > risk_budget + tolerance:
+            return f"stop risk {stop_risk:.8f} exceeds budget {risk_budget:.8f}"
+        size_tolerance = (
+            max(1e-12, abs(float(max_size)) * 1e-9)
+            if max_size is not None else 0.0
+        )
+        if max_size is not None and size > float(max_size) + size_tolerance:
+            return f"size {size:.8f} exceeds approved size {float(max_size):.8f}"
+        return None
+
+    def _normalized_maker_terms(
+        self,
+        symbol: str,
+        side: Side,
+        size: float,
+        limit_price: float,
+        stop_loss: float,
+        take_profit: float,
+        risk_budget: float,
+    ) -> tuple[dict | None, str | None]:
+        """Normalize first, then size against the geometry actually submitted."""
+        try:
+            normalize_price = getattr(self.exchange, "normalize_price", None)
+            normalize_amount = getattr(self.exchange, "normalize_amount", None)
+            actual_limit = float(
+                normalize_price(symbol, limit_price)
+                if callable(normalize_price) else limit_price
+            )
+            actual_stop = float(
+                normalize_price(symbol, stop_loss)
+                if callable(normalize_price) else stop_loss
+            )
+            actual_target = float(
+                normalize_price(symbol, take_profit)
+                if callable(normalize_price) else take_profit
+            )
+            stop_distance = abs(actual_limit - actual_stop)
+            if stop_distance <= 0:
+                return None, "normalized stop distance is zero"
+            capped_size = min(float(size), float(risk_budget) / stop_distance)
+            actual_size = float(
+                normalize_amount(symbol, capped_size)
+                if callable(normalize_amount) else capped_size
+            )
+        except (TypeError, ValueError) as exc:
+            return None, f"normalization failed: {exc}"
+
+        violation = self._maker_order_violation(
+            side,
+            actual_size,
+            actual_limit,
+            actual_stop,
+            actual_target,
+            risk_budget,
+            max_size=capped_size,
+        )
+        if violation:
+            return None, violation
+        return {
+            "size": actual_size,
+            "limit_price": actual_limit,
+            "stop_loss": actual_stop,
+            "take_profit": actual_target,
+        }, None
 
     def _place_maker_entry(
         self,
@@ -1287,10 +1612,44 @@ class TradingEngine:
             self.logger.info("ENTRY_SKIP %s: touch %.6f outside bracket", signal.symbol, touch)
             return
 
+        # Sizing was approved at signal.entry_price. If the maker touch has already
+        # moved toward the target, the same contracts would lose more at the fixed
+        # stop. Reduce before placing so execution can never enlarge the approved
+        # stop-dollar budget.
+        original_stop_dist = abs(signal.entry_price - signal.stop_loss)
+        account = self.exchange.get_account_state()
+        hard_cap = max(float(account.equity), 0.0) * self.risk.max_risk_per_trade
+        approved_risk = min(size * original_stop_dist, hard_cap)
+        if approved_risk <= 0:
+            self.logger.info("ENTRY_SKIP %s: invalid stop-risk budget", signal.symbol)
+            return
+        terms, unsafe_reason = self._normalized_maker_terms(
+            signal.symbol,
+            signal.side,
+            size,
+            touch,
+            signal.stop_loss,
+            signal.take_profit,
+            approved_risk,
+        )
+        if terms is None:
+            self.logger.info(
+                "ENTRY_SKIP %s: unsafe normalized maker order: %s",
+                signal.symbol, unsafe_reason,
+            )
+            return
+        size = float(terms["size"])
+        touch = float(terms["limit_price"])
+        normalized_stop = float(terms["stop_loss"])
+        normalized_target = float(terms["take_profit"])
+        if size * touch < self.risk.min_position_usd:
+            self.logger.info("ENTRY_SKIP %s: risk-safe maker size below minimum", signal.symbol)
+            return
+
         res = self.exchange.place_entry_limit(
             signal.symbol, signal.side, size, touch,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
+            stop_loss=normalized_stop,
+            take_profit=normalized_target,
             strategy=signal.strategy,
             leverage=signal.leverage,
             partial_take_profit=signal.partial_take_profit,
@@ -1304,10 +1663,28 @@ class TradingEngine:
             self.logger.info("ENTRY_PLACE_FAILED %s: %s", signal.symbol, res["error"])
             return
 
-        actual_limit = float(res.get("limit_price") or touch)
-        actual_size = float(res.get("amount") or size)
-        actual_stop = float(res.get("stop_loss") or signal.stop_loss)
-        actual_target = float(res.get("take_profit") or signal.take_profit)
+        response_parse_error = None
+        try:
+            actual_limit = float(
+                res["limit_price"] if res.get("limit_price") is not None else touch
+            )
+            actual_size = float(
+                res["amount"] if res.get("amount") is not None else size
+            )
+            actual_stop = float(
+                res["stop_loss"]
+                if res.get("stop_loss") is not None else normalized_stop
+            )
+            actual_target = float(
+                res["take_profit"]
+                if res.get("take_profit") is not None else normalized_target
+            )
+        except (TypeError, ValueError) as exc:
+            # We still know exactly what was requested, which is enough to track and
+            # cancel the order safely even when the venue response is malformed.
+            actual_limit, actual_size = touch, size
+            actual_stop, actual_target = normalized_stop, normalized_target
+            response_parse_error = f"malformed order response: {exc}"
         ai_log_linked = False
         upload_ok = True
         if self.exchange.mode != "paper" and decision_id and self.decision_log:
@@ -1340,12 +1717,15 @@ class TradingEngine:
             "partial_fraction": signal.partial_fraction,
             "strategy": signal.strategy,
             "leverage": signal.leverage,
-            # Carried to the fill so a maker-entered position knows what it cost
-            # in conviction — the swap guard prices replacements against it.
+            # Carried to the fill so the position's original confidence remains
+            # auditable after a resting maker order fills.
             "strength": float(signal.strength),
+            "policy_id": getattr(self, "policy_id", ""),
+            # Every later reprice must stay at or below the risk of the first order.
+            "risk_budget_usd": approved_risk,
             # Chase distances are measured in ATR; when the caller has none
-            # (rules path), infer it from the stop, which to_signal keeps at
-            # 0.5-4 ATR — the midpoint makes dist/2 a serviceable stand-in.
+            # (rules path), the fallback treats the stop as roughly 2 ATR. The AI
+            # path always supplies its measured ATR and does not use this estimate.
             "atr": atr if atr > 0 else abs(signal.entry_price - signal.stop_loss) / 2,
             "min_rr": self.ai.min_rr if self.ai else float(
                 self.config.get("competition", {}).get("min_rr", 1.35)
@@ -1357,6 +1737,26 @@ class TradingEngine:
             "last_reprice_at": now_iso,
             "reprices": 0,
         }
+        response_violation = response_parse_error or self._maker_order_violation(
+            signal.side, actual_size, actual_limit, actual_stop, actual_target,
+            approved_risk, max_size=size,
+        )
+        if response_violation:
+            self.pending_entries[signal.symbol]["unsafe_reason"] = response_violation
+            self.logger.error(
+                "ENTRY_UNSAFE_RESPONSE %s id=%s: %s; cancelling",
+                signal.symbol, res["id"], response_violation,
+            )
+            self._abandon_pending(
+                signal.symbol,
+                self.pending_entries[signal.symbol],
+                f"unsafe_order_response:{response_violation}",
+            )
+            return
+        self.pending_entries[signal.symbol]["risk_budget_usd"] = min(
+            approved_risk,
+            actual_size * abs(actual_limit - actual_stop),
+        )
         if self.exchange.mode != "paper" and not upload_ok:
             self.logger.critical(
                 "ENTRY ORDER %s placed but UploadAiLog failed; cancelling without retrying trade",
@@ -1408,16 +1808,22 @@ class TradingEngine:
     def _manage_pending_entries(self):
         if not self.pending_entries:
             return
-        # Risk blocks must reach resting orders immediately, not on the model's
-        # hourly cadence — a fill during a cooldown is exposure the risk engine
-        # had already vetoed.
-        blocked = self.risk.is_killed or (
-            self.risk.cooldown_until and datetime.utcnow() < self.risk.cooldown_until
-        )
         for symbol, pe in list(self.pending_entries.items()):
             try:
-                if blocked:
-                    self._abandon_pending(symbol, pe, "risk_blocked")
+                if pe.get("unsafe_reason"):
+                    self._abandon_pending(
+                        symbol,
+                        pe,
+                        f"unsafe_order_response:{pe['unsafe_reason']}",
+                    )
+                    continue
+                # A preceding order in this same batch may just have filled. Refresh
+                # every control before the next resting order can fill or chase.
+                can_enter, block_reason = self._entry_gate(
+                    self.exchange.get_account_state()
+                )
+                if not can_enter:
+                    self._abandon_pending(symbol, pe, f"risk_blocked:{block_reason}")
                 else:
                     self._manage_one_pending(symbol, pe)
             except Exception as e:
@@ -1488,6 +1894,48 @@ class TradingEngine:
             self._abandon_pending(symbol, pe, f"rr_degraded_{rr:.2f}")
             return
 
+
+        # A chase changes distance to the fixed stop. Keep the original order's
+        # stop-dollar budget by shrinking contracts; never let execution turn an
+        # approved setup into a larger bet.
+        account = self.exchange.get_account_state()
+        hard_cap = max(float(account.equity), 0.0) * self.risk.max_risk_per_trade
+        old_risk = float(pe.get("risk_budget_usd") or (
+            float(pe["size"]) * abs(float(pe["limit_price"]) - sl)
+        ))
+        risk_budget = min(old_risk, hard_cap)
+        terms, unsafe_reason = self._normalized_maker_terms(
+            symbol,
+            side,
+            float(pe["size"]),
+            touch,
+            sl,
+            tp,
+            risk_budget,
+        )
+        if terms is None:
+            self._abandon_pending(
+                symbol, pe, f"unsafe_normalized_reprice:{unsafe_reason}"
+            )
+            return
+        replacement_size = float(terms["size"])
+        replacement_limit = float(terms["limit_price"])
+        replacement_stop = float(terms["stop_loss"])
+        replacement_target = float(terms["take_profit"])
+        normalized_stop_dist = abs(replacement_limit - replacement_stop)
+        normalized_rr = (
+            abs(replacement_target - replacement_limit) / normalized_stop_dist
+            if normalized_stop_dist > 0 else 0.0
+        )
+        if normalized_rr < float(pe.get("min_rr") or 0):
+            self._abandon_pending(
+                symbol, pe, f"normalized_rr_degraded_{normalized_rr:.2f}"
+            )
+            return
+        if replacement_size * replacement_limit < self.risk.min_position_usd:
+            self._abandon_pending(symbol, pe, "risk_safe_reprice_below_minimum")
+            return
+
         cancel = self.exchange.cancel_entry(pe["order_id"], symbol)
         filled = float(cancel.get("filled_amount") or 0)
         if filled > 0:
@@ -1501,8 +1949,8 @@ class TradingEngine:
             return
 
         res = self.exchange.place_entry_limit(
-            symbol, side, float(pe["size"]), touch,
-            stop_loss=sl, take_profit=tp,
+            symbol, side, replacement_size, replacement_limit,
+            stop_loss=replacement_stop, take_profit=replacement_target,
             strategy=pe.get("strategy") or "",
             leverage=int(pe.get("leverage") or 5),
             partial_take_profit=pe.get("partial_take_profit"),
@@ -1514,10 +1962,28 @@ class TradingEngine:
             self._persist_state()
             return
 
-        actual_limit = float(res.get("limit_price") or touch)
-        actual_size = float(res.get("amount") or pe["size"])
-        actual_stop = float(res.get("stop_loss") or sl)
-        actual_target = float(res.get("take_profit") or tp)
+        response_parse_error = None
+        try:
+            actual_limit = float(
+                res["limit_price"]
+                if res.get("limit_price") is not None else replacement_limit
+            )
+            actual_size = float(
+                res["amount"]
+                if res.get("amount") is not None else replacement_size
+            )
+            actual_stop = float(
+                res["stop_loss"]
+                if res.get("stop_loss") is not None else replacement_stop
+            )
+            actual_target = float(
+                res["take_profit"]
+                if res.get("take_profit") is not None else replacement_target
+            )
+        except (TypeError, ValueError) as exc:
+            actual_limit, actual_size = replacement_limit, replacement_size
+            actual_stop, actual_target = replacement_stop, replacement_target
+            response_parse_error = f"malformed reprice response: {exc}"
         reprice_upload_ok = True
         if self.exchange.mode != "paper" and pe.get("decision_id") and self.decision_log:
             linkage = self.decision_log.link_order(
@@ -1541,6 +2007,24 @@ class TradingEngine:
         pe["size"] = actual_size
         pe["stop_loss"] = actual_stop
         pe["take_profit"] = actual_target
+        pe["risk_budget_usd"] = risk_budget
+        response_violation = response_parse_error or self._maker_order_violation(
+            side, actual_size, actual_limit, actual_stop, actual_target,
+            risk_budget, max_size=replacement_size,
+        )
+        if response_violation:
+            pe["unsafe_reason"] = response_violation
+            self.logger.error(
+                "ENTRY_REPRICE_UNSAFE_RESPONSE %s id=%s: %s; cancelling",
+                symbol, res["id"], response_violation,
+            )
+            self._abandon_pending(
+                symbol, pe, f"unsafe_order_response:{response_violation}"
+            )
+            return
+        pe["risk_budget_usd"] = min(
+            risk_budget, actual_size * abs(actual_limit - actual_stop)
+        )
         pe["last_reprice_at"] = now.isoformat()
         pe["reprices"] = int(pe.get("reprices") or 0) + 1
         self.logger.info(
@@ -1657,6 +2141,9 @@ class TradingEngine:
             )
             self.position_decisions[symbol] = decision_id
         self.position_conviction[symbol] = float(pe.get("strength") or 0.0)
+        self.position_policy_ids[symbol] = str(pe.get("policy_id") or "")
+        if self.exchange.mode == "paper":
+            self.paper_bar_checked.pop(symbol, None)
 
         if fin.get("sl_placed") is False and self.exchange.mode != "paper":
             self.logger.critical(
@@ -1671,6 +2158,7 @@ class TradingEngine:
             else:
                 self.position_decisions.pop(symbol, None)
                 self.position_conviction.pop(symbol, None)
+                self.position_policy_ids.pop(symbol, None)
                 self.pending_entries.pop(symbol, None)
                 self._persist_state()
                 return
@@ -1688,6 +2176,27 @@ class TradingEngine:
         if filled > 0:
             # The cancel raced a fill. The money is in — bracket it, don't orphan it.
             self._on_entry_fill(symbol, pe, filled, float(pe["limit_price"]))
+            if reason.startswith("unsafe_order_response:"):
+                # The response changed size or bracket geometry after our pre-check.
+                # If cancellation raced a fill, flatten the unapproved exposure.
+                try:
+                    account = self.exchange.get_account_state()
+                    position = next(
+                        (p for p in account.positions if p.symbol == symbol), None
+                    )
+                    if position is not None:
+                        self.logger.critical(
+                            "UNSAFE MAKER FILL %s after cancel race; closing", symbol
+                        )
+                        self._close_position(
+                            position,
+                            float(pe["limit_price"]),
+                            "risk_budget_violation",
+                        )
+                except Exception as exc:
+                    self.logger.critical(
+                        "UNSAFE MAKER FILL CLOSE FAILED %s: %s", symbol, exc
+                    )
             return
         if not cancel.get("cancelled"):
             self.logger.error(
@@ -1723,7 +2232,8 @@ class TradingEngine:
                 else position.size * exit_price * rate
             )
             final_leg = position.calculate_pnl(exit_price) - exit_fee
-            pnl = final_leg + position.realized_pnl - position.entry_fee
+            funding = float(getattr(position, "funding_paid", 0.0) or 0.0)
+            pnl = final_leg + position.realized_pnl - position.entry_fee - funding
             fees = position.fees_paid + exit_fee
             sized_for_margin = position.initial_size or position.size
             margin = sized_for_margin * position.entry_price / max(position.leverage, 1)
@@ -1745,12 +2255,15 @@ class TradingEngine:
                 strategy=position.strategy,
                 banked_pnl=position.realized_pnl,
                 fees=fees,
+                funding=funding,
+                policy_id=self.position_policy_ids.get(position.symbol, ""),
             )
             self.risk.record_trade(trade_result)
             self.strategy.sync_scores_from_risk(self.risk)
 
             opening_decision_id = self.position_decisions.pop(position.symbol, None)
             self.position_conviction.pop(position.symbol, None)
+            self.position_policy_ids.pop(position.symbol, None)
             if opening_decision_id and self.decision_log:
                 self.decision_log.record_outcome(
                     opening_decision_id,
@@ -1776,6 +2289,112 @@ class TradingEngine:
             )
             self._persist_state()
 
+    @staticmethod
+    def _paper_bar_hit(
+        position: Position,
+        bar,
+        maker_through: float = 0.0,
+        target_maker: bool = True,
+    ) -> tuple[str, float, bool] | None:
+        """Resolve a completed 1m candle against brackets conservatively.
+
+        Returns (reason, reference_price, maker). When both stop and target appear
+        inside one candle and the open does not disambiguate the path, the stop wins;
+        this avoids flattering paper results with an unknowable best-case sequence.
+        """
+        stop = float(position.stop_loss or 0)
+        target = float(position.take_profit or 0)
+        through = max(float(maker_through or 0), 0.0)
+        if position.side == Side.LONG:
+            stop_hit = stop > 0 and float(bar.low) <= stop
+            target_hit = target > 0 and float(bar.high) >= target + through
+            if stop_hit and target_hit:
+                if float(bar.open) >= target + through:
+                    return "take_profit", target, target_maker
+                reference = min(stop, float(bar.open))
+                return position.stop_exit_reason(), reference, False
+            if stop_hit:
+                return position.stop_exit_reason(), min(stop, float(bar.open)), False
+            if target_hit:
+                return "take_profit", target, target_maker
+        else:
+            stop_hit = stop > 0 and float(bar.high) >= stop
+            target_hit = target > 0 and float(bar.low) <= target - through
+            if stop_hit and target_hit:
+                if float(bar.open) <= target - through:
+                    return "take_profit", target, target_maker
+                reference = max(stop, float(bar.open))
+                return position.stop_exit_reason(), reference, False
+            if stop_hit:
+                return position.stop_exit_reason(), max(stop, float(bar.open)), False
+            if target_hit:
+                return "take_profit", target, target_maker
+        return None
+
+    def _paper_completed_bar_exit(self, position: Position):
+        """Return a missed-between-polls paper bracket event, if one occurred."""
+        raw = self.exchange.fetch_candles(position.symbol, "1m", 121)
+        bars = self.exchange.closed_candles(raw, "1m")
+        if not bars:
+            return None
+        opened_floor = self._event_timestamp(position.opened_at)
+        if opened_floor is None:
+            opened_floor = datetime.utcnow()
+        opened_floor = opened_floor.replace(second=0, microsecond=0)
+        checked = self.paper_bar_checked.get(position.symbol)
+        checked_at = None
+        if checked:
+            try:
+                checked_at = self._event_timestamp(
+                    datetime.fromisoformat(str(checked).replace("Z", "+00:00"))
+                )
+            except Exception:
+                checked_at = None
+        latest = checked_at
+        for bar in bars:
+            bar_at = self._event_timestamp(getattr(bar, "timestamp", None))
+            if (
+                bar_at is None
+                or bar_at < opened_floor
+                or (checked_at is not None and bar_at <= checked_at)
+            ):
+                continue
+            latest = bar_at
+            maker_target = bool(getattr(self.exchange, "maker_exits", False))
+            through = (
+                float(getattr(self.exchange, "fill_through_ticks", 0.0))
+                * float(self.exchange._tick_size(position.symbol, position.take_profit))
+                if position.take_profit and maker_target
+                else 0.0
+            )
+            if bar_at == opened_floor:
+                # This candle contains prices from before the entry fill. Counting
+                # its target would create unknowable/optimistic paper profit, while
+                # counting its stop is the conservative risk-safe assumption.
+                stop = float(position.stop_loss or 0)
+                if position.side == Side.LONG:
+                    stop_hit = stop > 0 and float(bar.low) <= stop
+                    hit = (
+                        position.stop_exit_reason(),
+                        min(stop, float(bar.open)),
+                        False,
+                    ) if stop_hit else None
+                else:
+                    stop_hit = stop > 0 and float(bar.high) >= stop
+                    hit = (
+                        position.stop_exit_reason(),
+                        max(stop, float(bar.open)),
+                        False,
+                    ) if stop_hit else None
+            else:
+                hit = self._paper_bar_hit(position, bar, through, maker_target)
+            if hit:
+                self.paper_bar_checked[position.symbol] = bar_at.isoformat()
+                return hit
+        if latest is not None:
+            self.paper_bar_checked[position.symbol] = latest.isoformat()
+        return None
+
     def _manage_positions(self, account):
         candles_cache = {}
 
@@ -1785,6 +2404,23 @@ class TradingEngine:
                 if not ticker:
                     continue
                 current_price = float(ticker.get("last") or position.entry_price)
+
+                if self.exchange.mode == "paper":
+                    bar_exit = self._paper_completed_bar_exit(position)
+                    if bar_exit:
+                        reason, reference_price, maker = bar_exit
+                        color = "green" if reason == "take_profit" else "yellow"
+                        console.print(
+                            f"[{color}]Paper 1m bracket: {reason} {position.symbol}[/]"
+                        )
+                        self._close_position(
+                            position,
+                            reference_price,
+                            reason,
+                            maker_price=reference_price if maker else None,
+                            trigger_price=None if maker else reference_price,
+                        )
+                        continue
 
                 # Restore partial metadata from brackets if needed
                 if self.exchange.mode != "paper":
@@ -1898,9 +2534,14 @@ class TradingEngine:
         reason: str,
         *,
         maker_price: float | None = None,
+        trigger_price: float | None = None,
         close_decision_id: str | None = None,
     ):
-        result = self.exchange.close_position(position.symbol, maker_price=maker_price)
+        result = self.exchange.close_position(
+            position.symbol,
+            maker_price=maker_price,
+            trigger_price=trigger_price,
+        )
         if isinstance(result, dict) and result.get("error"):
             console.print(f"[red]   Close failed: {result['error']}[/]")
             return
@@ -1941,7 +2582,12 @@ class TradingEngine:
         # Round trip = partial legs already banked + this leg, net of every fee
         # including entry. Win/loss and Kelly are driven off this number, so a
         # trade that only cleared the spread must not read as a winner.
-        pnl = final_leg + position.realized_pnl - position.entry_fee
+        funding = float(
+            result.get("funding", getattr(position, "funding_paid", 0.0))
+            if isinstance(result, dict)
+            else getattr(position, "funding_paid", 0.0)
+        )
+        pnl = final_leg + position.realized_pnl - position.entry_fee - funding
         fees = position.fees_paid + exit_fee
 
         # Margin is measured on the position as originally opened, otherwise a
@@ -1965,6 +2611,8 @@ class TradingEngine:
             strategy=position.strategy,
             banked_pnl=position.realized_pnl,
             fees=fees,
+            funding=funding,
+            policy_id=self.position_policy_ids.get(position.symbol, ""),
         )
         self.risk.record_trade(trade_result)
         self.strategy.sync_scores_from_risk(self.risk)
@@ -1973,6 +2621,8 @@ class TradingEngine:
         # log shows not just what the model thought but what it actually earned.
         opening_decision_id = self.position_decisions.pop(position.symbol, None)
         self.position_conviction.pop(position.symbol, None)
+        self.position_policy_ids.pop(position.symbol, None)
+        self.paper_bar_checked.pop(position.symbol, None)
         if close_decision_id and self.decision_log and isinstance(result, dict):
             self.decision_log.link_order(
                 close_decision_id,
@@ -2009,9 +2659,9 @@ class TradingEngine:
         # an artifact of the rule that granted it — so this one is recorded per
         # trade from the start, not reconstructed later.
         self.logger.info(
-            "CLOSE %s %s pnl=%.2f banked=%.2f fees=%.4f reason=%s strategy=%s exit=%s",
+            "CLOSE %s %s pnl=%.2f banked=%.2f fees=%.4f funding=%.4f reason=%s strategy=%s exit=%s",
             position.symbol, position.side.value, pnl,
-            position.realized_pnl, fees, reason, position.strategy,
+            position.realized_pnl, fees, funding, reason, position.strategy,
             "maker" if isinstance(result, dict) and result.get("maker") else "taker",
         )
         self._persist_state()
@@ -2046,14 +2696,17 @@ class TradingEngine:
                     "last_trade_time": lt,
                     # Survives restart so an open position keeps its provenance.
                     "position_decisions": self.position_decisions,
-                    # Ditto for the conviction it was opened at, without which a
-                    # restart would silently disarm the swap guard.
+                    # Ditto for the conviction it was opened at, preserving the
+                    # original decision evidence across restarts.
                     "position_conviction": self.position_conviction,
+                    "position_policy_ids": self.position_policy_ids,
+                    "paper_bar_checked": self.paper_bar_checked,
                     # Resting maker entries: restored on start, then reconciled
                     # against the venue by the first pending-management pass.
                     "pending_entries": self.pending_entries,
                     "cycle_count": self.cycle_count,
                     "bot_version": "v8.5",
+                    "policy_id": getattr(self, "policy_id", ""),
                     "mode": self.config.get("trading", {}).get("mode", "paper"),
                 },
             )
@@ -2163,7 +2816,7 @@ class TradingEngine:
 
 
 def main():
-    console.print("[bold green]WEEX AI Wars II — Trading Bot v8.5[/]")
+    console.print("[bold green]WEEX Competition Rehearsal - Trading Bot v8.5[/]")
     console.print("[dim]Press Ctrl+C to stop[/]\n")
     engine = TradingEngine()
     engine.run()

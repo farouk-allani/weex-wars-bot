@@ -1,4 +1,4 @@
-"""WEEX AI Wars II Trading Bot — Data Models"""
+"""WEEX competition-rehearsal trading bot data models."""
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -185,6 +185,12 @@ class TradeResult:
     # credited it at scale-out time don't count it twice.
     banked_pnl: float = 0.0
     fees: float = 0.0
+    # Positive means the position paid funding (a cost), negative means it received
+    # funding. ``pnl`` is net of this amount so reported expectancy matches equity.
+    funding: float = 0.0
+    # Explicit forward-test cohort. Readiness must never pool trades produced by
+    # different prompts, fee assumptions, fill models, exits, or risk policy.
+    policy_id: str = ""
 
 
 @dataclass

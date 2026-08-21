@@ -1,15 +1,16 @@
-"""Append-only AI decision log — the competition submission artifact.
+"""Append-only AI decision log for competition rehearsal.
 
-WEEX requires "complete AI decision logs including OrderId matching, decision
-reasoning, and strategy documentation", and treats >8h of inactivity *without
-valid AI logs* as non-compliant. So every cycle is logged, including the cycles
-where the model decides to do nothing — a reasoned HOLD is a valid log entry and
-is what keeps the heartbeat alive between trades.
+The historical WEEX Season 1 workflow required complete AI decision logs with
+matching OrderIds and continued no-trade logs during inactivity. Every cycle is
+therefore retained locally as a conservative rehearsal artifact. This module does
+not claim that local HOLD records satisfy a current competition's upload rules;
+the current rulebook and enrollment must be verified separately.
 
 JSONL, one decision per line, fsync'd on write: a crash must never cost us the
 record of a decision the exchange already acted on.
 """
 
+import copy
 import json
 import logging
 import os
@@ -138,14 +139,19 @@ class DecisionLog:
             return entry
         return self._read_decision(decision_id)
 
+    def get_decision(self, decision_id: str) -> Optional[dict]:
+        """Return a read-only copy of the decision behind an open position."""
+        entry = self._lookup(str(decision_id or ""))
+        return copy.deepcopy(entry) if entry is not None else None
+
     def _read_decision(self, decision_id: str) -> Optional[dict]:
         """Recover a decision record from the log file.
 
         `_recent` is process memory, but a maker entry rests for up to
         execution.entry_ttl_minutes and can therefore fill *after* a restart or a
-        deploy. Without this fallback that order's ai-log was never written and the
-        order shipped non-compliant — silently, because the emit path swallowed the
-        miss. Measured 2026-07-27: 7 of 18 orders had no ai-log file.
+        deploy. Without this fallback that order's ai-log was never written —
+        silently, because the emit path swallowed the miss. Measured 2026-07-27:
+        7 of 18 orders had no ai-log file.
         """
         if not self.path.exists():
             return None
@@ -172,9 +178,9 @@ class DecisionLog:
         """Write the WEEX-schema ai-log for an order.
 
         Never raises — the trade is already live by the time this runs. But a
-        failure is recorded and logged at ERROR: an order without an ai-log is
-        non-compliant, and the previous silent `except: pass` is exactly why that
-        went unnoticed for six days.
+        failure is recorded and logged at ERROR: a missing order log failed the
+        historical rehearsal workflow, and the previous silent `except: pass` is
+        exactly why that went unnoticed for six days.
         """
         try:
             from . import wars_log
@@ -342,7 +348,7 @@ class DecisionLog:
                 os.fsync(f.fileno())
 
     def last_decision_at(self) -> Optional[datetime]:
-        """Most recent logged decision — used to enforce the 8h activity rule."""
+        """Most recent local decision, used for rehearsal cadence health."""
         if not self.path.exists():
             return None
         last = None

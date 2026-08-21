@@ -1,4 +1,4 @@
-"""WEEX AI Wars II — Edge Strategies v8
+"""WEEX competition-rehearsal edge strategies v8
 
 Improvements:
 1. Realistic funding extremes (configurable, default ~0.03%)

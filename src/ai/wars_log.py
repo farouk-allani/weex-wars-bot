@@ -1,22 +1,26 @@
-"""WEEX AI Wars ai-log emitter.
+"""WEEX ``UploadAiLog`` payload builder and durable uploader.
 
-The competition verifies Team AI trades by requiring an AI decision log per
-AI-driven order, uploaded via the official trader skill's `--ai-log @file.json`
-flow. Schema (weex-agent-skills-ai-wars/skills/weex-trader-skill/references/
-ai-log-schema.md):
+The current public WEEX API page declares ``POST /capi/v3/order/uploadAiLog``
+with this top-level schema:
 
-  stage        non-empty string
-  model        EXACT provider-returned model id (no aliases/marketing names)
-  input        complete original request: message array + market context,
-               unsummarized, unflattened, unredacted
-  output       ONLY the concrete action with the parameters that must match
-               the final trade request (symbol/side/positionSide/type/
-               quantity/price)
-  explanation  <=1000 chars, tied to specific facts in input
+  orderId      optional Long returned by the WEEX order API
+  stage        required String describing where AI participated
+  model        required String naming the AI model/version
+  input        required JSON containing the model prompt/query/input
+  output       required JSON containing the generated prediction or decision;
+               WEEX asks inference models to show their inference process
+  explanation  required natural-language summary, at most 1000 characters
 
-This module builds and saves those files at order time (data/ai_logs/), so
-when live rounds start the upload step just points at ready-made files.
-Emission must never break trading: callers wrap in try/except.
+That page also says only approved UIDs on the official allowlist may submit.
+The one-minute order-log workflow and continuing no-trade logs are published
+Season-1 rules used here only as rehearsal context. No current public Season-2
+rulebook has been verified, and this module does not claim current competition
+eligibility. The order-action ``output`` shape built below is the repository's
+existing rehearsal representation and must be reconciled with the applicable
+round's official rules before live participation.
+
+Payloads are saved at order time under ``data/ai_logs`` before upload. Emission
+must never make an already-submitted trading order run twice.
 """
 
 import base64
@@ -37,10 +41,11 @@ ALLOWLIST_STATUS_PATH = Path("data/ai_log_allowlist_status.json")
 DEFAULT_UPLOAD_BASE = "https://api-contract.weex.com"
 UPLOAD_PATH = "/capi/v3/order/uploadAiLog"
 SUCCESS_CODES = {"0", "00000"}
+ALLOWLIST_BINDING_PREFIX = "sha256-v1:"
 
 
 def build_ai_log(entry: dict, order: dict) -> dict:
-    """entry = the logbook decision record; order = the linked order params."""
+    """Build the repository's order-linked rehearsal payload."""
     side = str(order.get("side", "")).lower()
     intent = str(order.get("intent") or "entry").lower()
     symbol = str(order.get("symbol", "")).replace("/", "").replace(":USDT", "")
@@ -147,12 +152,12 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def validate(payload: dict) -> list[str]:
-    """Schema problems in a built ai-log, worst first. Empty list = usable.
+    """Local payload-policy problems, worst first. Empty list = locally usable.
 
-    Presence of a file is a weaker guarantee than a usable log, and only the
-    stricter one is worth anything at review time: a log whose `input` has no
-    message array does not carry "the complete original request" the schema asks
-    for, however well-formed the rest of it looks.
+    WEEX requires ``input`` and ``output`` JSON. This repository deliberately adds
+    stricter rehearsal checks for the verbatim message array and market context so
+    a local file remains auditable; those nested keys are not asserted to be the
+    current official competition schema.
     """
     problems: list[str] = []
     if not str(payload.get("stage") or "").strip():
@@ -213,6 +218,8 @@ class WeexAILogUploader:
     The order is already real when this runs, so a failed upload is persisted and
     retried; it must never cause the trading engine to retry the order itself.
     New entries can use ``readiness()`` to fail closed while any upload is pending.
+    Readiness proves delivery configuration for the bound key/base, not eligibility
+    for an unverified competition round.
     """
 
     def __init__(
@@ -232,6 +239,17 @@ class WeexAILogUploader:
         self.api_key = os.getenv("WEEX_API_KEY", "")
         self.api_secret = os.getenv("WEEX_API_SECRET", "")
         self.passphrase = os.getenv("WEEX_API_PASSPHRASE") or os.getenv("WEEX_PASSPHRASE") or ""
+
+    def _allowlist_binding_fingerprint(self) -> str:
+        """Non-secret identity for the API-key identifier and normalized base URL."""
+        material = json.dumps(
+            {"api_key": self.api_key, "base_url": self.base_url},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        digest = hashlib.sha256(b"weex-upload-ai-log-allowlist-v1\0" + material).hexdigest()
+        return ALLOWLIST_BINDING_PREFIX + digest
 
     def _configuration_error(self) -> Optional[str]:
         if not self.enabled:
@@ -332,15 +350,16 @@ class WeexAILogUploader:
         return True, http_status, None
 
     def probe_allowlist(self, decision: dict) -> dict:
-        """Prove AI-Wars allowlisting with an authentic no-order decision log.
+        """Probe UploadAiLog access with an authentic no-order decision log.
 
-        WEEX explicitly permits ``orderId: null``.  This writes a compliance log
-        but cannot create/cancel an order or move funds.  A successful probe is
-        persisted and becomes a prerequisite for live uploader readiness, so the
-        first real order is never used to discover a missing UID allowlist entry.
+        The official schema makes ``orderId`` optional and its examples use null.
+        This cannot create/cancel an order or move funds. A successful result is
+        persisted only for the current API-key identifier and base URL; it does not
+        prove eligibility for a future or otherwise unverified competition round.
         """
         status = {
             "verified": False,
+            "binding_fingerprint": self._allowlist_binding_fingerprint(),
             "last_attempt": datetime.now(timezone.utc).isoformat(),
             "http_status": None,
             "last_error": None,
@@ -398,15 +417,41 @@ class WeexAILogUploader:
         if not self.enabled:
             return {"required": False, "verified": True, "last_error": None}
         row = self._read_json(self.allowlist_status_path)
+        stored_binding = row.get("binding_fingerprint")
+        current_binding = self._allowlist_binding_fingerprint()
+        binding_matches = (
+            isinstance(stored_binding, str)
+            and hmac.compare_digest(stored_binding, current_binding)
+        )
+        persisted_verified = bool(row.get("verified"))
+        verified = persisted_verified and binding_matches
+
+        if persisted_verified and not stored_binding:
+            last_error = (
+                "stored UploadAiLog allowlist verification predates credential binding; "
+                "re-probe with the current API key and base URL"
+            )
+        elif stored_binding and not binding_matches:
+            last_error = (
+                "stored UploadAiLog allowlist verification does not match the current "
+                "API key and base URL; re-probe required"
+            )
+        elif not persisted_verified:
+            last_error = row.get("last_error") or (
+                "UploadAiLog UID allowlist has not been verified for the current "
+                "API key and base URL"
+            )
+        else:
+            last_error = None
+
         return {
             "required": True,
-            "verified": bool(row.get("verified")),
+            "verified": verified,
+            "binding_matches": binding_matches,
             "last_attempt": row.get("last_attempt"),
             "verified_at": row.get("verified_at"),
             "http_status": row.get("http_status"),
-            "last_error": row.get("last_error") or (
-                None if row.get("verified") else "AI-Wars allowlist has not been verified"
-            ),
+            "last_error": last_error,
         }
 
     def upload(self, ai_log_path: str | Path) -> dict:
@@ -500,6 +545,6 @@ class WeexAILogUploader:
         if not status.get("allowlist_verified"):
             return False, str(
                 (status.get("allowlist") or {}).get("last_error")
-                or "AI-Wars allowlist has not been verified"
+                or "UploadAiLog UID allowlist has not been verified"
             )
         return False, f"{status['pending']} WEEX AI-log upload(s) pending"
